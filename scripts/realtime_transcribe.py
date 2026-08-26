@@ -232,16 +232,17 @@ def drain_segments(vad, sample_rate: int, asr: RoutedASR, stats: SessionStats,
             speaker = speaker_labeler.label(samples, sample_rate) + "|"
 
         stats.segments += 1
+        line_id = f"final-{stats.segments}"
         stats.latencies_ms.append(latency_ms)
         printer.clear()
         if printer.server is not None:
             printer.server.final(result["text"], result["lang"], speaker.rstrip("|"),
-                                 latency_ms, result.get("tier", ""))
+                                 latency_ms, result.get("tier", ""), line_id=line_id)
         print(f"[{speaker}{result['lang']}/{result.get('tier', '?')}] {result['text']}  "
               f"(seg={seg_s:.1f}s, lid={result['lid_ms']:.0f}ms, "
               f"decode={result['decode_ms']:.0f}ms, latency={latency_ms:.0f}ms)")
-        if translator_worker is not None and result["lang"] == "ja" and result["text"].strip():
-            translator_worker.submit(result["text"])
+        if translator_worker is not None and result["text"].strip():
+            translator_worker.submit(result["text"], result["lang"], line_id=line_id)
         if spans_out is not None:
             spans_out.append((seg_start, seg_end, result["lang"], result["text"],
                               speaker.rstrip("|")))
@@ -275,7 +276,7 @@ def safe_translate(translator, text: str) -> str:
 
 def translate_by_sentence(translator, text: str) -> str:
     """The MT models are trained on single sentences; feed one at a time."""
-    sentences = [s for s in _re.split(r"(?<=[。！？!?])\s*", text) if s.strip()]
+    sentences = [s for s in _re.split(r"(?<=[。！？!?])\s*|(?<=\.)\s+", text) if s.strip()]
     out = []
     for s in sentences:
         en = safe_translate(translator, s)
@@ -284,44 +285,73 @@ def translate_by_sentence(translator, text: str) -> str:
     return " ".join(out)
 
 
+SUPPORTED_TRANSLATION_TARGETS = ("en", "zh", "ko", "ja")
+
+
+def parse_translation_targets(langs: str) -> list[str]:
+    """Parse and validate --translate while preserving the requested order."""
+    targets = list(dict.fromkeys(x.strip() for x in langs.split(",") if x.strip()))
+    invalid = [lang for lang in targets if lang not in SUPPORTED_TRANSLATION_TARGETS]
+    if invalid:
+        raise ValueError(
+            f"unsupported translation target(s): {', '.join(invalid)} "
+            f"(supported: {','.join(SUPPORTED_TRANSLATION_TARGETS)})"
+        )
+    return targets
+
+
+def translators_for_source(translators: dict, source_lang: str):
+    """Yield only translators whose configured source matches a finalized line."""
+    for target_lang, translator in translators.items():
+        if getattr(translator, "source_lang", "ja") == source_lang:
+            yield target_lang, translator
+
+
 def build_translators(langs: str) -> dict:
-    """"en,zh,ko" -> {lang: translator}. en uses FuguMT; zh/ko use M2M-100."""
+    """Build target translators while preserving the existing Japanese routes."""
     out = {}
-    for lang in [x.strip() for x in langs.split(",") if x.strip()]:
+    for lang in parse_translation_targets(langs):
         if lang == "en":
             from translate_ja_en import TranslatorJaEn
 
             out["en"] = TranslatorJaEn()
-        elif lang in ("zh", "ko"):
+        elif lang in ("zh", "ko", "ja"):
             from translate_m2m import TranslatorM2M
 
-            out[lang] = TranslatorM2M(lang)
-        else:
-            print(f"unsupported translation target: {lang}", file=sys.stderr)
+            source_lang = "en" if lang == "ja" else "ja"
+            out[lang] = TranslatorM2M(target_lang=lang, source_lang=source_lang)
     return out
 
 
 class TranslationWorker:
-    """Async ja->target translation of finalized lines (console display)."""
+    """Asynchronously translate finalized lines on configured local routes."""
 
     def __init__(self, translators: dict, server=None):
         self._translators = translators
         self._server = server
-        self._q: "queue.Queue[str]" = queue.Queue()
+        self._q: "queue.Queue[tuple[str, str, str]]" = queue.Queue()
         threading.Thread(target=self._run, daemon=True).start()
 
-    def submit(self, text: str):
-        self._q.put(text)
+    def submit(self, text: str, source_lang: str, line_id: str = ""):
+        self._q.put((text, source_lang, line_id))
+
+    def wait(self):
+        """Wait until all submitted translations have been emitted."""
+        self._q.join()
 
     def _run(self):
         while True:
-            text = self._q.get()
-            for lang, tr in self._translators.items():
-                out = safe_translate(tr, text)
-                if out != text:  # fallback returns the source: nothing worth showing
-                    print(f"[→{lang}] {out}")
-                    if self._server is not None:
-                        self._server.publish({"type": "translation", "lang": lang, "text": out})
+            text, source_lang, line_id = self._q.get()
+            try:
+                for lang, tr in translators_for_source(self._translators, source_lang):
+                    out = safe_translate(tr, text)
+                    if out != text:  # fallback returns the source: nothing worth showing
+                        print(f"[→{lang}] {out}")
+                        if self._server is not None:
+                            self._server.publish({"type": "translation", "lang": lang, "text": out,
+                                                  "source_lang": source_lang, "line_id": line_id})
+            finally:
+                self._q.task_done()
 
 
 from asr_engine import script_corrected_lang  # shared with the engine's live correction
@@ -345,7 +375,7 @@ class Refiner:
         self.history = history
         self.sr = sample_rate
         self.printer = printer
-        self.translators = translators or {}  # ja->target, synchronous per refine
+        self.translators = translators or {}  # source-filtered targets, synchronous per refine
         self.spans: list[tuple[int, int, str, str, str]] = []
         self._transcript = open(transcript_path, "a", encoding="utf-8") if transcript_path else None
         self._worker_lock = threading.Lock()  # serialize refine decodes off the hot path
@@ -401,12 +431,12 @@ class Refiner:
                     self.printer.server.publish({"type": "refine", "text": text, "lang": lang,
                                                  "speaker": speaker})
                 outs = []
-                if self.translators and lang == "ja":
+                if self.translators:
                     # synchronous here (we're already off the hot path) so the
                     # transcript keeps source and translations adjacent, in
                     # order. The MT models degrade on multi-sentence input,
                     # so translate sentence by sentence.
-                    for tlang, tr in self.translators.items():
+                    for tlang, tr in translators_for_source(self.translators, lang):
                         out = translate_by_sentence(tr, text)
                         if out and out != text:
                             print(f"[refine→{tlang}] {out}")
@@ -473,7 +503,7 @@ def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStat
             refiner.maybe_refine(int(audio_pos * sample_rate))
 
 
-def main():
+def build_arg_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wav", help="wav file to simulate streaming from (16kHz mono s16)")
     ap.add_argument("--no-realtime", action="store_true", help="don't sleep between chunks in --wav mode")
@@ -507,8 +537,9 @@ def main():
     ap.add_argument("--speakers", action="store_true",
                     help="label utterances with speaker ids (S1, S2, ...)")
     ap.add_argument("--translate", nargs="?", const="en", default=None, metavar="LANGS",
-                    help="translate Japanese lines to these languages, comma-separated "
-                         "(en/zh/ko; default en). en=FuguMT, zh/ko=M2M-100")
+                    help="translate finalized lines to these languages, comma-separated "
+                         "(en/zh/ko from Japanese, ja from English; default en). "
+                         "en=FuguMT, ja/zh/ko=M2M-100")
     ap.add_argument("--input", choices=["mic", "wav", "ws"], default=None,
                     help="audio source; default is mic, or wav if --wav is given")
     ap.add_argument("--ws-host", default="0.0.0.0", metavar="HOST",
@@ -516,7 +547,17 @@ def main():
                          "on the LAN can reach it; use 127.0.0.1 to restrict to localhost)")
     ap.add_argument("--ws-port", type=int, default=8766, metavar="PORT",
                     help="port for the --input ws /ingest endpoint (default 8766)")
+    return ap
+
+
+def main():
+    ap = build_arg_parser()
     args = ap.parse_args()
+    if args.translate:
+        try:
+            parse_translation_targets(args.translate)
+        except ValueError as exc:
+            ap.error(str(exc))
 
     server = None
     if args.serve:
@@ -563,6 +604,8 @@ def main():
                        speaker_labeler=speaker_labeler)
         if refiner is not None:
             refiner.maybe_refine(0, force=True)
+        if translator_worker is not None:
+            translator_worker.wait()
 
     input_mode = args.input or ("wav" if args.wav else "mic")
 

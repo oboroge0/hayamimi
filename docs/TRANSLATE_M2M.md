@@ -1,20 +1,22 @@
-# Japanese -> Chinese / Korean (/ English) Subtitle Translation (M2M-100)
+# Japanese -> Chinese / Korean and English -> Japanese Translation (M2M-100)
 
-`scripts/translate_m2m.py` provides `TranslatorM2M(target_lang)`, a small
+`scripts/translate_m2m.py` provides `TranslatorM2M(target_lang, source_lang)`, a small
 wrapper around a CTranslate2-converted M2M-100 418M multilingual model for
 translating live subtitle lines from Japanese into Chinese (`zh`), Korean
 (`ko`), or English (`en`, included for completeness/comparison against
-`translate_ja_en.py`'s dedicated FuguMT module).
+`translate_ja_en.py`'s dedicated FuguMT module), and from English (`en`) to
+Japanese (`ja`).
 
-Not yet wired into `asr_engine.py` / `realtime_transcribe.py` /
-`subtitle_server.py` -- integration is a separate step.
+The live pipeline uses this model for `--translate ja`, `--translate zh`, and
+`--translate ko`. Translation runs only for matching finalized source lines;
+partial ASR output remains in the recognized language.
 
 ## Model
 
 - **Base model**: [`facebook/m2m100_418M`](https://huggingface.co/facebook/m2m100_418M)
   (Meta AI, Fan et al., "Beyond English-Centric Multilingual Machine
   Translation"). A single multilingual model covering ~100 languages, used
-  here only for ja->{zh,ko,en}.
+  here only for ja->{zh,ko,en} and en->ja.
 - **CTranslate2 conversion used**:
   [`ishiki-emo/mojicast-m2m100-ct2`](https://huggingface.co/ishiki-emo/mojicast-m2m100-ct2) --
   the conversion published by the Mojicast project. Confirmed to exist and
@@ -44,8 +46,8 @@ SentencePiece tokenization *and* explicit source/target language tokens
 (this differs from the ja-en FuguMT module, which is a single-language-pair
 model with no language tokens):
 
-1. Encode source Japanese text with `sentencepiece.model` -> token pieces.
-2. Prepend the source language token `__ja__` and append the end-of-sentence
+1. Encode source text with `sentencepiece.model` -> token pieces.
+2. Prepend the source language token (`__ja__` or `__en__`) and append the end-of-sentence
    token `</s>` to the piece list -- this mirrors what the original
    `transformers` `M2M100Tokenizer` does automatically when `src_lang="ja"`
    is set and `.encode()` is called (`config.json`'s `add_source_bos` /
@@ -53,7 +55,7 @@ model with no language tokens):
    these automatically -- they must be added by the caller).
 3. Call `translator.translate_batch(..., target_prefix=[["__<lang>__"]])`
    to force the first decoded token to be the target language token,
-   selecting the output language (`__zh__`, `__ko__`, or `__en__`).
+   selecting the output language (`__ja__`, `__zh__`, `__ko__`, or `__en__`).
 4. The returned hypothesis starts with that same target-language token --
    it is stripped (along with a trailing `</s>` if present) before
    detokenizing with `sentencepiece.model`.
@@ -129,7 +131,7 @@ for non-empty input:
 
 - Empty / whitespace-only input is returned unchanged.
 - Any exception during tokenization, translation, or detokenization is
-  caught and the original Japanese text is returned unchanged.
+  caught and the original source text is returned unchanged.
 - Empty tokenization, an empty hypothesis, or empty/whitespace-only
   translation output falls back to the original text.
 
@@ -163,6 +165,22 @@ configuration, no per-call CTranslate2 tuning (`inter_threads`/
 `intra_threads`) applied yet, and this machine simply being slower per-call
 than Mojicast's reference hardware. Worth revisiting with `inter_threads`
 tuning when this is wired into the realtime pipeline.
+
+### English -> Japanese on Apple Silicon
+
+The `en->ja` route uses `beam_size=4` and the same repetition/length guards.
+On an Apple M2 Max with Python 3.11 and CTranslate2 4.8.1, the model loaded in
+about 209 ms. Three direct translations took 265-382 ms each:
+
+| English input | Latency | Japanese output |
+|---|---:|---|
+| Hello, thank you for joining us today. | 382 ms | こんにちは、今日私たちに加わってくれてありがとう。 |
+| The meeting starts at three in the afternoon. | 265 ms | 会議は午後3時から始まります。 |
+| This translation runs completely on this Mac. | 278 ms | この翻訳はこのMacで完全に実行されます。 |
+
+A 5.5-second locally synthesized English WAV also completed the live pipeline
+on the same machine: Parakeet produced the English final, and `--translate ja`
+emitted the corresponding Japanese line without any cloud API.
 
 ## Known limitations
 

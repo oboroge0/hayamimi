@@ -5,8 +5,10 @@ No ASR/MT models are loaded; these guard the plumbing that past iterations
 broke or nearly broke (preroll bleed, replacement parsing, digit guard,
 routing table consistency).
 """
+import json
 import os
 import sys
+import types
 
 import numpy as np
 import pytest
@@ -14,7 +16,11 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
 from realtime_transcribe import (AudioHistory, PREROLL_S, digits_consistent,
-                                 translate_by_sentence)
+                                 build_arg_parser, build_translators,
+                                 parse_translation_targets, translate_by_sentence,
+                                 TranslationWorker, translators_for_source)
+from subtitle_server import DASHBOARD_HTML, SubtitleServer
+from translate_m2m import TranslatorM2M
 import asr_engine
 
 
@@ -60,6 +66,114 @@ def test_translate_by_sentence_number_guard_falls_back():
     tr = FakeTranslator({"500万円です。": "It costs 5 pounds."})
     # mangled number -> per-sentence fallback -> treated as untranslated
     assert translate_by_sentence(tr, "500万円です。") == ""
+
+
+def test_translate_by_sentence_splits_english_periods():
+    tr = FakeTranslator({"Hello world.": "こんにちは世界。", "How are you?": "お元気ですか？"})
+    assert translate_by_sentence(tr, "Hello world. How are you?") == "こんにちは世界。 お元気ですか？"
+    assert tr.calls == ["Hello world.", "How are you?"]
+
+
+# ---- translation routing / CLI --------------------------------------------
+
+def test_translate_ja_cli_is_accepted_without_changing_default():
+    parser = build_arg_parser()
+    assert parser.parse_args([]).translate is None
+    assert parser.parse_args(["--translate", "ja"]).translate == "ja"
+    assert parser.parse_args(["--translate"]).translate == "en"
+
+
+def test_parse_translation_targets_keeps_existing_routes_and_rejects_unknown():
+    assert parse_translation_targets("en,zh,ko,ja,en") == ["en", "zh", "ko", "ja"]
+    with pytest.raises(ValueError, match="unsupported translation target"):
+        parse_translation_targets("fr")
+
+
+def test_build_translators_routes_english_to_japanese_through_m2m(monkeypatch):
+    class FakeM2M:
+        def __init__(self, target_lang, source_lang="ja"):
+            self.target_lang = target_lang
+            self.source_lang = source_lang
+
+    class FakeJaEn:
+        source_lang = "ja"
+        target_lang = "en"
+
+    monkeypatch.setitem(sys.modules, "translate_m2m", types.SimpleNamespace(TranslatorM2M=FakeM2M))
+    monkeypatch.setitem(sys.modules, "translate_ja_en", types.SimpleNamespace(TranslatorJaEn=FakeJaEn))
+    translators = build_translators("ja,en,zh,ko")
+    assert (translators["ja"].source_lang, translators["ja"].target_lang) == ("en", "ja")
+    assert (translators["en"].source_lang, translators["en"].target_lang) == ("ja", "en")
+    assert [lang for lang, _ in translators_for_source(translators, "ja")] == ["en", "zh", "ko"]
+    assert [lang for lang, _ in translators_for_source(translators, "en")] == ["ja"]
+
+
+def test_m2m_english_to_japanese_uses_language_tokens():
+    calls = []
+
+    class FakeSentencePiece:
+        def encode(self, text, out_type):
+            assert (text, out_type) == ("Hello world.", str)
+            return ["▁Hello", "▁world", "."]
+
+        def decode(self, tokens):
+            assert tokens == ["▁こんにちは", "▁世界"]
+            return "こんにちは世界。"
+
+    class FakeResult:
+        hypotheses = [["__ja__", "▁こんにちは", "▁世界", "</s>"]]
+
+    class FakeCTranslate2:
+        def translate_batch(self, source, **kwargs):
+            calls.append((source, kwargs))
+            return [FakeResult()]
+
+    tr = TranslatorM2M.__new__(TranslatorM2M)
+    tr.source_lang = "en"
+    tr.target_lang = "ja"
+    tr._source_token = "__en__"
+    tr._target_token = "__ja__"
+    tr._beam_size = 4
+    tr._sp = FakeSentencePiece()
+    tr._translator = FakeCTranslate2()
+
+    assert tr.translate("Hello world.") == "こんにちは世界。"
+    assert calls[0][0] == [["__en__", "▁Hello", "▁world", ".", "</s>"]]
+    assert calls[0][1]["target_prefix"] == [["__ja__"]]
+
+
+def test_dashboard_and_final_events_bind_translation_by_line_id():
+    assert "cardsById.set(ev.line_id, card)" in DASHBOARD_HTML
+    assert "cardsById.get(ev.line_id)" in DASHBOARD_HTML
+    server = SubtitleServer()
+    q = server.subscribe()
+    server.final("Hello", lang="en", line_id="final-7")
+    event = json.loads(q.get_nowait())
+    assert event["line_id"] == "final-7"
+
+
+def test_translation_worker_filters_source_and_preserves_line_id():
+    class RecordingServer:
+        def __init__(self):
+            self.events = []
+
+        def publish(self, event):
+            self.events.append(event)
+
+    en_ja = FakeTranslator({"Hello": "こんにちは"})
+    en_ja.source_lang = "en"
+    ja_en = FakeTranslator({"Hello": "wrong route"})
+    ja_en.source_lang = "ja"
+    server = RecordingServer()
+    worker = TranslationWorker({"ja": en_ja, "en": ja_en}, server=server)
+    worker.submit("Hello", "en", line_id="final-9")
+    worker.wait()
+    assert en_ja.calls == ["Hello"]
+    assert ja_en.calls == []
+    assert server.events == [{
+        "type": "translation", "lang": "ja", "text": "こんにちは",
+        "source_lang": "en", "line_id": "final-9",
+    }]
 
 
 # ---- AudioHistory / preroll -----------------------------------------------

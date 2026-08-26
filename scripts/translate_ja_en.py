@@ -40,6 +40,8 @@ class TranslatorJaEn:
     """Loads the FuguMT ja->en CTranslate2 model once and translates lines."""
 
     def __init__(self, model_dir: str = _MODEL_DIR, device: str = "cpu", compute_type: str = "int8"):
+        self.source_lang = "ja"
+        self.target_lang = "en"
         self.model_dir = model_dir
 
         source_spm_path = os.path.join(model_dir, "source.spm")

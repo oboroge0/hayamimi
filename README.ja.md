@@ -30,7 +30,7 @@ CPUだけでリアルタイム音声認識をやろうとすると、普通はWh
 | 高速確定 | 話し終えてから約100msで確定文が出る（日本語。他言語は`docs/GOALS.md`参照） |
 | 二段パス補正 | 2秒の無音後、直近の発話群を一括再デコードし高精度な「清書」トランスクリプトを生成（実放送ja CER 15.5%→12.0%） |
 | 話者ラベル | `--speakers`でCAM++話者埋め込みを使いS1/S2/...とタグ付け（ターンテイキング方式、フル話者分離ではない） |
-| 翻訳 | `--translate en,zh,ko`で日本語行をリアルタイム翻訳（en=FuguMT、zh/ko=M2M-100） |
+| 翻訳 | `--translate ja`で英語の確定行を日本語へ翻訳。既存の`--translate en,zh,ko`による日本語→英/中/韓翻訳も維持（en=FuguMT、ja/zh/ko=M2M-100） |
 | ホットワード/置換辞書 | `--hotwords`で固有名詞認識を強化（現状jaルートには効果なし。既知の制限を参照）、`--replace`は事後の検索置換でどのルートでも有効 |
 | OBSオーバーレイ+ダッシュボード | `--serve`でローカルHTTPサーバーを起動、ブラウザソースオーバーレイとライブダッシュボードを提供 |
 | ネットワーク音声入力 | `--input ws`でWebSocket経由のマイク音声（スマホ、ESP32/スタックチャン等）を受け付け、`--serve`のダッシュボード/オーバーレイにもそのまま流れる |
@@ -75,8 +75,8 @@ CPUだけでリアルタイム音声認識をやろうとすると、普通はWh
 ## 動作環境
 
 Python 3.10以上と、PATHの通ったffmpegが必要です。開発と検証は**Windows 11**で行いました。
-使っているランタイムはどれもクロスプラットフォームなのでmacOS/Linuxでも動くはずですが、
-実機での通し確認はまだできていません。動いた・動かなかったの報告を歓迎します。
+固定済み依存関係の導入と、英語WAV→英語ASR→日本語翻訳のスモークテストは
+**Apple M2 Max + Python 3.11**でも確認済みです。マイクを含む通し試験はまだCI化されていません。
 
 ## クイックスタート
 
@@ -98,11 +98,22 @@ python -m venv .venv
 # ダッシュボード + OBSオーバーレイ付き
 .venv/Scripts/python scripts/realtime_transcribe.py --serve
 # -> ブラウザで http://localhost:8833/dashboard を開く
+
+# 英語音声 -> 英語原文 + 日本語訳（macOS/Linux）
+.venv/bin/python scripts/realtime_transcribe.py --translate ja --serve
+```
+
+Apple Silicon Macで前提ツールがない場合は先に導入します。
+
+```bash
+brew install git python@3.11 ffmpeg
+python3.11 -m venv .venv
 ```
 
 `scripts/download_models.py`は約3.1GB分のモデルを`models/`（git管理外）にダウンロードします。
 `--minimal`を付けると日本語と英語だけの約1.1GB構成になります。
-各モデルのライセンスは`THIRD_PARTY_NOTICES.md`にまとめてあります。
+各モデルのライセンスは`THIRD_PARTY_NOTICES.md`にまとめてあります。既定のダウンロードには
+`--translate ja`で使うM2M-100が含まれますが、`--minimal`には翻訳モデルが含まれません。
 
 ## CLIリファレンス
 
@@ -128,7 +139,7 @@ python -m venv .venv
 | `--lang-switch-guard SEC` | 2.0 | この秒数未満の新言語判定はノイズとみなす：スイッチ確定（`--lid-switch-confirm`参照）には一切カウントされず、空デコード時のomnilingualフォールバックも抑制する（`0`で無効） |
 | `--lid-switch-confirm N` | 2 | セッション言語を実際に切り替えるのに必要な、連続した新言語判定の回数（各判定は`--lang-switch-guard`秒以上）。大きくするほど切り替えが粘る |
 | `--speakers` | オフ | 発話に話者ID（S1, S2, ...）をラベル付け |
-| `--translate [LANGS]` | オフ、`en` | 日本語行をカンマ区切りの言語（`en`/`zh`/`ko`）に翻訳 |
+| `--translate [LANGS]` | オフ、`en` | 確定行をカンマ区切りの対象へ翻訳。英語入力には`ja`、日本語入力には従来どおり`en`/`zh`/`ko`を指定 |
 
 ## アーキテクチャ
 
@@ -229,7 +240,7 @@ python -m venv .venv
 1つだけ注意が必要なモデルがあります。日→英翻訳モデル（`mojicast-fugumt-ja-en-ct2`、
 `--translate en`で使用）は**CC BY-SA 4.0**です。このモデルの重みを再配布するときは
 クレジット表示と同ライセンスでの公開が必要になります。hayamimi本体のコードや、
-`--translate zh,ko`で使うM2M-100（MIT）には影響しません。
+`--translate ja,zh,ko`で使うM2M-100（MIT）には影響しません。
 
 ## クレジット
 

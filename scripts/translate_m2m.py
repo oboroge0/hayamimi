@@ -1,4 +1,4 @@
-"""Japanese -> multilingual (zh / ko / en) subtitle translation module.
+"""M2M-100 subtitle translation for the supported local language routes.
 
 Uses M2M-100 418M (facebook/m2m100_418M), converted to CTranslate2 int8 by
 the Mojicast project (ishiki-emo/mojicast-m2m100-ct2, MIT license).
@@ -6,7 +6,7 @@ See docs/TRANSLATE_M2M.md for model source, license, and measured latency.
 
 Design notes (mirroring scripts/translate_ja_en.py):
 - M2M-100 is a multilingual model: the source SentencePiece tokens must be
-  prefixed with the source language token (__ja__) and suffixed with the
+  prefixed with the source language token (__<source>__) and suffixed with the
   end-of-sentence token (</s>), and translate_batch is called with
   target_prefix=[["__<lang>__"]] to select the output language. The decoded
   hypothesis starts with that same target-language token, which is stripped
@@ -21,7 +21,7 @@ Design notes (mirroring scripts/translate_ja_en.py):
   beam_size=4 -- matching Mojicast's reported configuration, which held up
   in measurement here (see docs/TRANSLATE_M2M.md).
 - Any exception, or empty/garbage output, falls back to returning the
-  original Japanese text unchanged -- a subtitle line must never go blank.
+  original source text unchanged -- a subtitle line must never go blank.
 """
 
 from __future__ import annotations
@@ -34,17 +34,18 @@ import sentencepiece as spm
 
 _MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "mojicast-m2m100-ct2")
 
-SOURCE_LANG_TOKEN = "__ja__"
 EOS_TOKEN = "</s>"
 
 # Per-target settings, matching Mojicast's reported configuration (zh:
 # greedy, ko: beam_size=4). See docs/TRANSLATE_M2M.md for the measurements
 # that confirmed these hold up on this specific model conversion.
 BEAM_SIZE_BY_TARGET = {
+    "ja": 4,
     "zh": 1,
     "ko": 4,
     "en": 1,
 }
+SUPPORTED_SOURCE_LANGS = {"ja", "en"}
 # NOTE: Mojicast's report says no_repeat_ngram_size=3 "eliminated" repetition
 # loops for their conversion. Re-measured here on filler-heavy casual lines
 # (e.g. "そうそう、そうなんだよね。" and a longer hesitation-filled line):
@@ -63,20 +64,27 @@ MAX_DECODING_LENGTH_BASE = 20
 
 
 class TranslatorM2M:
-    """Loads the M2M-100 CTranslate2 model once and translates ja->target_lang lines."""
+    """Load M2M-100 once and translate a supported source/target route."""
 
     def __init__(
         self,
         target_lang: str,
+        source_lang: str = "ja",
         model_dir: str = _MODEL_DIR,
         device: str = "cpu",
         compute_type: str = "int8",
     ):
         if target_lang not in BEAM_SIZE_BY_TARGET:
             raise ValueError(f"Unsupported target_lang: {target_lang!r} (supported: {sorted(BEAM_SIZE_BY_TARGET)})")
+        if source_lang not in SUPPORTED_SOURCE_LANGS:
+            raise ValueError(f"Unsupported source_lang: {source_lang!r} (supported: {sorted(SUPPORTED_SOURCE_LANGS)})")
+        if source_lang == target_lang:
+            raise ValueError("source_lang and target_lang must differ")
 
+        self.source_lang = source_lang
         self.target_lang = target_lang
         self.model_dir = model_dir
+        self._source_token = f"__{source_lang}__"
         self._target_token = f"__{target_lang}__"
         self._beam_size = BEAM_SIZE_BY_TARGET[target_lang]
 
@@ -86,7 +94,7 @@ class TranslatorM2M:
         self._translator = ctranslate2.Translator(model_dir, device=device, compute_type=compute_type)
 
     def translate(self, text: str) -> str:
-        """Translate a single line of Japanese text to self.target_lang.
+        """Translate a source-language line to self.target_lang.
 
         Returns the original text unchanged (never raises, never blanks
         the line) if input is empty/whitespace-only, or if translation
@@ -104,7 +112,7 @@ class TranslatorM2M:
             if not pieces:
                 return text
 
-            source_tokens = [SOURCE_LANG_TOKEN] + pieces + [EOS_TOKEN]
+            source_tokens = [self._source_token] + pieces + [EOS_TOKEN]
 
             # Cap decode length relative to the source length. Without this,
             # a degenerate hypothesis can run all the way to a large fixed

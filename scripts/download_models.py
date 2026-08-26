@@ -9,7 +9,8 @@ Two model sets:
               fallback via VAD), Silero VAD, Japanese punctuation. ~1.1 GB.
   (default)   Everything the runtime routing in asr_engine.py can reach:
               minimal + zh/ko/yue/multilingual-EU/1600-language-fallback ASR,
-              speaker embeddings, and ja->en/zh/ko translation. ~3.1 GB.
+              speaker embeddings, and ja->en/zh/ko plus en->ja translation.
+              ~3.1 GB.
 
 Add --eval-baselines to additionally fetch two extra models that are only
 used as comparison baselines by scripts/eval_accuracy.py and
@@ -233,7 +234,7 @@ def main():
     download_hf_repo(
         "ishiki-emo/mojicast-m2m100-ct2",
         "mojicast-m2m100-ct2",
-        "M2M-100 418M CTranslate2 (ja->zh/ko translation, MIT)")
+        "M2M-100 418M CTranslate2 (ja->zh/ko and en->ja translation, MIT)")
 
     download_hf_repo(
         "ishiki-emo/mojicast-fugumt-ja-en-ct2",

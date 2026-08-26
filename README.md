@@ -33,7 +33,7 @@ same clips, while running at 10-50x realtime on a 6-core desktop CPU.
 | Fast finals | a finalized line typically lands ~100ms after you stop talking (ja; see `docs/GOALS.md` for other languages) |
 | Two-pass refinement | after 2s of silence, recent utterances are batch re-decoded for a higher-accuracy "clean" transcript (ja real-broadcast CER 15.5% -> 12.0%) |
 | Speaker labels | `--speakers` tags each utterance S1/S2/... using CAM++ speaker embeddings (turn-taking, not full diarization) |
-| Translation | `--translate en,zh,ko` translates Japanese lines live (en via FuguMT, zh/ko via M2M-100) |
+| Translation | `--translate ja` translates finalized English lines to Japanese; `--translate en,zh,ko` keeps the existing Japanese-source routes (en via FuguMT, zh/ko via M2M-100) |
 | Hotwords / user dictionary | `--hotwords` biases decoding toward proper nouns (currently has no effect on the ja tier -- see Limitations); `--replace` does post-hoc find/replace and works everywhere |
 | OBS overlay + dashboard | `--serve` starts a local HTTP server with a browser-source overlay and a live dashboard |
 | Network audio input | `--input ws` accepts mic audio over a WebSocket (phone, ESP32/stackchan) and feeds it through the same pipeline, including `--serve`'s dashboard/overlay |
@@ -79,9 +79,10 @@ that doubles as a template for a phone/ESP32 implementation.
 
 ## Requirements
 
-Python 3.10+ and ffmpeg on PATH. Developed and tested on **Windows 11**;
-macOS/Linux are expected to work (all runtimes are cross-platform) but are
-not yet CI-tested end to end — reports welcome.
+Python 3.10+ and ffmpeg on PATH. Developed and tested on **Windows 11**. The
+pinned dependencies and an English-WAV -> English ASR -> Japanese translation
+smoke test have also been verified on an **Apple M2 Max with Python 3.11**;
+microphone and full-model end-to-end coverage are not yet in CI.
 
 ## Quickstart
 
@@ -103,12 +104,25 @@ python -m venv .venv
 # With the dashboard + OBS overlay
 .venv/Scripts/python scripts/realtime_transcribe.py --serve
 # -> open http://localhost:8833/dashboard in a browser
+
+# English speech -> English transcript + Japanese translation (macOS/Linux)
+.venv/bin/python scripts/realtime_transcribe.py --translate ja --serve
+```
+
+On a new Apple Silicon Mac, install the prerequisites first if they are
+missing:
+
+```bash
+brew install git python@3.11 ffmpeg
+python3.11 -m venv .venv
 ```
 
 `scripts/download_models.py` pulls ~3.1GB of pretrained models into
 `models/` (git-ignored). Pass `--minimal` for a ~1.1GB ja/en-only install
 (ReazonSpeech, whisper-tiny, Silero VAD, Japanese punctuation). See
-`THIRD_PARTY_NOTICES.md` for what each model's license commits you to.
+`THIRD_PARTY_NOTICES.md` for what each model's license commits you to. The
+default download includes the M2M-100 model used by `--translate ja`;
+`--minimal` does not include translation models.
 
 ## CLI reference
 
@@ -134,7 +148,7 @@ All flags are on `scripts/realtime_transcribe.py`:
 | `--lang-switch-guard SEC` | 2.0 | treat a new-language detection shorter than this as noise: it can never count toward confirming a switch (see `--lid-switch-confirm`) and it suppresses the omnilingual fallback on an empty decode (`0` disables) |
 | `--lid-switch-confirm N` | 2 | consecutive new-language detections (each >= `--lang-switch-guard` long) required before the session actually switches language; raise for stickier single-language sessions |
 | `--speakers` | off | label utterances with speaker ids (S1, S2, ...) |
-| `--translate [LANGS]` | off, `en` | translate Japanese lines to these comma-separated languages (`en`/`zh`/`ko`) |
+| `--translate [LANGS]` | off, `en` | translate finalized lines to comma-separated targets: English input to `ja`, or Japanese input to `en`/`zh`/`ko` |
 
 ## Architecture
 
@@ -235,7 +249,7 @@ Headline numbers from that log:
   nearest-centroid assignment), not true diarization -- simultaneous speech
   gets one label.
 - **Translation quality has a real ceiling**, not just a tuning one.
-  FuguMT (ja->en) and M2M-100 (ja->zh/ko) are small models; repetition loops
+  FuguMT (ja->en) and M2M-100 (ja->zh/ko, en->ja) are small models; repetition loops
   are suppressed but not eliminated, and numeric values are not reliably
   preserved in ja->zh/ko translation (see `docs/TRANSLATE.md` and
   `docs/TRANSLATE_M2M.md` for measured failure cases before you rely on this
@@ -256,7 +270,7 @@ license (`THIRD_PARTY_NOTICES.md` has the full table).
 **CC BY-SA 4.0 (share-alike)**. If you redistribute that model's weights,
 you must keep attribution and license any redistribution under CC BY-SA 4.0
 too. This does not affect hayamimi's own code license, and does not affect
-`--translate zh,ko` (M2M-100, MIT).
+`--translate ja,zh,ko` (M2M-100, MIT).
 
 ## Credits
 

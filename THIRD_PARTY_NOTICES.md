@@ -25,7 +25,7 @@ weights** -- one of them is share-alike, not permissive.
 | Model (dir under `models/`) | Publisher | License | Source |
 |---|---|---|---|
 | `mojicast-punct-onnx` (Japanese punctuation restoration) | Base models: Tohoku NLP + bobfromjapan; ONNX export: Mojicast (ishiki-emo) | Apache-2.0 | [tohoku-nlp/bert-base-japanese-char-v3](https://huggingface.co/tohoku-nlp/bert-base-japanese-char-v3), [bobfromjapan/bert_japanese_punctuation](https://huggingface.co/bobfromjapan/bert_japanese_punctuation), export: [ishiki-emo/mojicast-punct-onnx](https://huggingface.co/ishiki-emo/mojicast-punct-onnx) |
-| `mojicast-m2m100-ct2` (M2M-100 418M, ja->zh/ko translation) | Meta AI (base model); CTranslate2 conversion: Mojicast (ishiki-emo) | MIT | [facebook/m2m100_418M](https://huggingface.co/facebook/m2m100_418M), conversion: [ishiki-emo/mojicast-m2m100-ct2](https://huggingface.co/ishiki-emo/mojicast-m2m100-ct2) |
+| `mojicast-m2m100-ct2` (M2M-100 418M, ja->zh/ko and en->ja translation) | Meta AI (base model); CTranslate2 conversion: Mojicast (ishiki-emo) | MIT | [facebook/m2m100_418M](https://huggingface.co/facebook/m2m100_418M), conversion: [ishiki-emo/mojicast-m2m100-ct2](https://huggingface.co/ishiki-emo/mojicast-m2m100-ct2) |
 | `mojicast-fugumt-ja-en-ct2` (FuguMT, ja->en translation) | staka (base model); CTranslate2 conversion: Mojicast (ishiki-emo) | **CC BY-SA 4.0 (share-alike)** | [staka/fugumt-ja-en](https://huggingface.co/staka/fugumt-ja-en), conversion: [ishiki-emo/mojicast-fugumt-ja-en-ct2](https://huggingface.co/ishiki-emo/mojicast-fugumt-ja-en-ct2) |
 
 > **CC BY-SA 4.0 flag:** `mojicast-fugumt-ja-en-ct2` (used for `--translate en`)
