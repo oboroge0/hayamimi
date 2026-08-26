@@ -1,7 +1,7 @@
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:hayamimi_mobile/remote/remote_handshake.dart';
+import 'package:hayamimi_core/remote/remote_handshake.dart';
 
 void main() {
   group('buildIngestHandshakeJson', () {

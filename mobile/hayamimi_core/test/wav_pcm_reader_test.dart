@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:hayamimi_mobile/remote/wav_pcm_reader.dart';
+import 'package:hayamimi_core/remote/wav_pcm_reader.dart';
 
 /// Builds a minimal canonical 16-bit PCM WAV file's bytes, for testing
 /// [parseWavPcm16] without touching disk.

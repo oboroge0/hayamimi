@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:hayamimi_mobile/remote/remote_event.dart';
+import 'package:hayamimi_core/remote/remote_event.dart';
 
 void main() {
   group('parseRemoteEvent', () {

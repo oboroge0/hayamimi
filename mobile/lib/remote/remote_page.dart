@@ -3,11 +3,8 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:hayamimi_core/hayamimi_core.dart';
 import 'package:path_provider/path_provider.dart';
-
-import 'remote_connection_state.dart';
-import 'remote_event.dart';
-import 'remote_transcriber.dart';
 
 /// One line shown in the finals list: a [RemoteFinalEvent] plus the local
 /// wall-clock time it arrived, and any [RemoteTranslationEvent] that
