@@ -239,8 +239,9 @@ def drain_segments(vad, sample_rate: int, asr: RoutedASR, stats: SessionStats,
         if printer.server is not None:
             printer.server.final(result["text"], result["lang"], speaker.rstrip("|"),
                                  latency_ms, result.get("tier", ""))
+        probe_part = f", probe={result['probe_ms']:.0f}ms" if result.get("probe_ms") else ""
         print(f"[{speaker}{result['lang']}/{result.get('tier', '?')}] {result['text']}  "
-              f"(seg={seg_s:.1f}s, lid={result['lid_ms']:.0f}ms, "
+              f"(seg={seg_s:.1f}s, lid={result['lid_ms']:.0f}ms{probe_part}, "
               f"decode={result['decode_ms']:.0f}ms, latency={latency_ms:.0f}ms)", flush=True)
         if translator_worker is not None and result["lang"] == "ja" and result["text"].strip():
             translator_worker.submit(result["text"])
