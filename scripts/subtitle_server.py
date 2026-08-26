@@ -19,20 +19,26 @@ OVERLAY_HTML = """<!doctype html>
     font-size: 5vh; line-height: 1.4; color: #fff;
     text-shadow: 0 0 8px #000, 0 0 4px #000, 2px 2px 2px #000;
   }
-  #partial { opacity: 0.75; font-style: italic; }
+  #final-line, #partial-line { display: block; min-height: 1.4em; }
+  #partial-line { opacity: 0.75; font-style: italic; font-size: 0.8em; }
 </style>
-<div id="box"><span id="final"></span> <span id="partial"></span></div>
+<div id="box"><span id="final-line"></span><span id="partial-line"></span></div>
 <script>
-  const fin = document.getElementById("final");
-  const par = document.getElementById("partial");
+  // ?show=final / ?show=partial renders only that row, so OBS can place the
+  // confirmed line and the in-progress line as two independent sources.
+  const mode = new URLSearchParams(location.search).get("show") || "both";
+  const fin = document.getElementById("final-line");
+  const par = document.getElementById("partial-line");
+  if (mode === "final") par.style.display = "none";
+  if (mode === "partial") fin.style.display = "none";
   let clearTimer = null;
   const es = new EventSource("/events");
   es.onmessage = (e) => {
     const ev = JSON.parse(e.data);
-    if (clearTimer) { clearTimeout(clearTimer); clearTimer = null; }
     if (ev.type === "partial") {
       par.textContent = ev.text;
     } else if (ev.type === "final") {
+      if (clearTimer) { clearTimeout(clearTimer); clearTimer = null; }
       fin.textContent = ev.text;
       par.textContent = "";
       clearTimer = setTimeout(() => { fin.textContent = ""; }, 6000);

@@ -49,7 +49,10 @@ same clips, while running at 10-50x realtime on a 6-core desktop CPU.
   chips, and per-line latency, inline translations under each line, and a
   second column with the refined (two-pass) transcript as it lands.
 - **`http://localhost:8833/`** -- a minimal OBS browser-source overlay
-  (add this URL as a Browser Source in OBS for stream captions).
+  (add this URL as a Browser Source in OBS for stream captions). The
+  confirmed line and the in-progress line are separate rows; append
+  `?show=final` or `?show=partial` to render only one of them, so each
+  can be placed and styled as its own OBS source.
 - **`http://localhost:8833/transcript`** -- plain scrolling transcript
   history.
 
