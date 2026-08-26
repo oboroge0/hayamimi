@@ -584,6 +584,76 @@ SenseVoice CER range (0.000-0.242) for the same models on the fuller
   subsection above. A larger on-device run (the full `eval_real`/
   `eval_real_zhko` sets, ~54 clips total) would tighten these numbers.
 
+## UI-path integration smoke test (Live screen + broadcast server + 清書)
+
+The batch eval above (`RoutedRecognizerSet` fed directly from a manifest)
+only exercises the decode path. This pass instead drives the actual UI
+surfaces a user touches: the Live screen's routing dropdown and Start
+listening flow, the 配信サーバー (broadcast server) `/events` SSE feed, and
+the 清書 (refine) button — with `RoutingProfile.jaSenseVoice` selected, on
+`hayamimi_test` (emulator).
+
+| # | Check | Result |
+|---|---|---|
+| 1 | Select `ja + SenseVoice (en/zh/ko/yue)`, Start listening → model load + stable "Listening..." | Pass |
+| 2 | Debug wav test (ja/en clips) → confirmed lines carry the correct language badge | Pass (see below) |
+| 3 | 配信サーバー ON, `adb forward` + `curl /events` → `final` events carry a language field matching the routed language | Pass |
+| 4 | 清書 button doesn't crash under routing | Pass |
+| 5 | Bugs found | 2 found, both fixed (below) |
+
+**Two bugs found and fixed** (both mobile-only, `mobile/lib/live/live_page.dart`
+and `mobile/hayamimi_core/lib/live/live_transcriber.dart`):
+
+1. **配信サーバー always tagged every final event `lang: "ja"`**, even under
+   `jaSenseVoice` routing — `_broadcastLang` in `live_page.dart` was a
+   hard-coded constant from before routing existed, and `_onEntry` never
+   read the segment's actual `LiveTranscriptEntry.lang`. A LAN subscriber
+   (OBS, a browser overlay) would have shown every non-ja routed line
+   mislabeled "ja". Fixed: `_onEntry` now sends `entry.lang ?? _broadcastLang`,
+   falling back to "ja" only for a plain `jaOnly` session (which has no
+   `lang` to report).
+2. **The "wavから清書テスト" debug button — the only way to exercise the
+   live decode pipeline on an emulator, which has no usable microphone —
+   never supported routing at all.** It always built a plain ja-only
+   `OfflineRecognizer` regardless of the selected `RoutingProfile`, so
+   there was no way to check the routing badge or the broadcast lang fix
+   above without a real device. Fixed: `LiveTranscriber.runDebugWavRefineTest`
+   now takes the same `routingProfile`/`senseVoiceModelDir`/`lidModelDir`
+   parameters as `start()` and routes through `RoutedRecognizerSet` when
+   `dualConfirmed`; `DebugRefineTestResult` carries a language per decode
+   now, and `live_page.dart` displays each with the same `_LangBadge` the
+   Live screen's transcript uses. As a second-order fix, the debug test's
+   results are now also fed through `_onEntry`/`_onRefineEntry` — the
+   normal live-session callbacks — so they land in the transcript list and
+   the broadcast server exactly like a real segment would, which is what
+   made check #3 above possible to verify on an emulator at all.
+
+**Reproduction / evidence** (`eval_routed/ja_01.wav`, `eval_routed/en_01.wav`
+from the prior batch-eval push, model dirs already on-device — see the
+"Reproduction" steps above for how those got there):
+
+- ja_01.wav, split into two halves by the debug test (an arbitrary
+  midpoint cut, not VAD-aligned — the first half lands mid-word and
+  misroutes to `ko` as a result, illustrating that the debug test's split
+  is a rougher LID input than a real VAD segment, not a routing bug):
+  `個別1: お 싸워요. [KO]` / `個別2: 大変でしたか [JA]` / 清書 (結合):
+  `大橋さんはやっぱり大変でしたか [JA]`.
+- `/events` SSE stream during that run: `{"type":"final","text":"お
+  싸워요.","lang":"ko",...}` then `{"type":"final","text":"大変でしたか",
+  "lang":"ja",...}` — confirms the lang field now really does vary with
+  the routed language rather than always reading "ja".
+- en_01.wav: both halves and the combined 清書 all tag `EN`, text intact
+  ("He was in a fevered state of mind..." / "...cast upon his entire
+  future."); `/events` shows both as `"lang":"en"`.
+- All 101 `hayamimi_core` unit tests plus `flutter analyze` (both `mobile/`
+  and `mobile/hayamimi_core/`) pass after these changes.
+
+**Not covered by this pass**: a real multi-segment live session with
+mid-conversation language switches (still blocked on the emulator's
+missing microphone, same limitation noted above); the manual 清書 button's
+UI path (only the debug test's routed refine call was exercised — the two
+share the same `RoutedRecognizerSet.decode` call, so this is a light gap).
+
 ## Next steps for a mobile profile
 
 - Load + accuracy validated on an Android emulator via `sherpa_onnx.dart`
