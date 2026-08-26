@@ -424,30 +424,145 @@ task — see "Open items" below).
   per-language CER can be scored. `mobile/lib/main.dart`'s Bench tab gained
   a matching "Routed multilingual manifest eval" debug panel.
 
-### Accuracy — not yet measured on-device
+### Accuracy — measured on-device
 
-Unlike the ja-only INT8 quantization work earlier in this document (which
-has full on-emulator CER numbers), **this routing feature has not yet been
-run on the `hayamimi_test` AVD**: `flutter analyze` is clean and all 101
-`hayamimi_core` unit tests pass (including the 21 new dual-LID/sticky-LID
-tests mirroring `tests/test_units.py`), but the actual multilingual
-manifest eval (`testdata/eval_real` ja+en, `testdata/eval_real_zhko` zh+ko)
-through `ManifestEvalRunner.runRouted` on the emulator — the step that
-would produce a routing-accuracy-and-CER comparison table against
-`docs/SCORECARD.md` — was not completed in this task. To reproduce it:
+Run on the `hayamimi_test` AVD (Android emulator, x86_64) via
+`ManifestEvalRunner.runRouted` through the Bench tab's "Routed
+multilingual manifest eval" panel, driven with `adb shell input tap`
+(button coordinates found by scanning the screenshot for the Material
+button color, since the Flutter surface exposes no accessibility tree to
+`uiautomator`). Same speed caveat as "On-emulator accuracy parity" above:
+the emulator's CPU is the host PC's CPU under virtualization, so RTF is
+informational only — only the routing decision and the decoded text are
+meaningful here.
 
-1. Start `hayamimi_test` (`cmd //c "H:\dev\emu_start.bat"`).
-2. Push the three model directories (ReazonSpeech ja int8, SenseVoice int8,
-   whisper-tiny int8) and `testdata/eval_real{,_zhko}/` to
-   `/data/local/tmp`, then `run-as` copy them into the app's
-   `getApplicationDocumentsDirectory()` (same procedure as "On-emulator
-   accuracy parity" above — `MSYS_NO_PATHCONV=1` needed for the `adb`
-   calls on this shell).
-3. Launch the app, open the Bench tab's "Routed multilingual manifest eval"
-   panel, point the three model-directory fields and the manifest/WAV-dir
-   fields at the pushed paths, and run it once per manifest.
-4. `adb pull` the output JSON (has `detected_lang` per clip) and score CER
-   per language with `scripts/eval_accuracy.py`.
+**Sample**: 20 clips — the first 5 of each language from `testdata/eval_real`
+(ja, en) and `testdata/eval_real_zhko` (zh, ko), 127.8s of audio total. This
+is a **quarter to a third** of the 12-15-clip-per-language samples
+`docs/SCORECARD.md`'s PC numbers use, so treat deltas as indicative, not
+conclusive — the task's own reproduction budget capped it at ~20 clips
+rather than the full 54-clip PC set.
+
+Scored with the same functions the PC pipeline uses:
+`scripts/eval_accuracy.py`'s `cer_ja` (NFKC-normalized, punctuation/
+whitespace-stripped, character-level Levenshtein) for ja/zh/ko, `wer_en`
+(word-level, `jiwer`) for en — the same split `docs/SCORECARD.md` and
+`docs/EVAL_REAL_ZHKO.md` use.
+
+| lang | clips | LID正解 (mobile) | mean err (mobile) | mean err (PC, `docs/SCORECARD.md`) | mean RTF (mobile, informational) |
+|---|---|---|---|---|---|
+| ja | 5 | 4/5 | 0.320 (CER) | 0.075 (CER) | 0.093 |
+| en | 5 | 5/5 | 0.017 (WER) | 0.023 (WER) | 0.062 |
+| zh | 5 | 5/5 | 0.110 (CER) | 0.053 (CER) | 0.065 |
+| ko | 5 | 5/5 | 0.108 (CER) | 0.081 (CER) | 0.062 |
+
+**Overall language-routing accuracy: 19/20 (95.0%)** — one misroute, all
+other 19 clips resolved to the manifest's ground-truth language.
+
+Full raw results (`wav`, `lang`, `ref`, `hyp`, `detected_lang`, `rtf` per
+clip) are in the eval JSON pulled off-device during this run; the numbers
+above are the aggregates from it.
+
+#### ja: the one misroute, and why the mean CER looks worse than PC's
+
+`ja_02.wav`'s reference is `「ピカピカブ！ピカピカブ！」` — a short
+onomatopoeia-only exclamation (Pikachu's cry), no ordinary words. Both
+whisper-tiny and SenseVoice's own LID agreed on "zh" for this clip
+(`resolveDualConfirm` requires agreement to switch, and got it — the dual
+-LID policy did exactly what it's designed to do given two wrong-but
+-agreeing signals), so the session routed to SenseVoice and decoded
+Chinese-script garbage (`飞卡皮卡追卡。`) against the ja CER scorer, i.e.
+CER 1.0 for that one clip. `docs/LID.md`'s own curves already show ja as
+one of the two languages (with ko) that whisper-tiny-alone LID never
+reaches 95% accuracy on within the 7s window; this is a live instance of
+that documented weak spot, on an utterance that's unusually
+script-ambiguous even for a human reader (an all-katakana, no-kanji
+exclamation carries very little LID signal in either model). Excluding
+this one misroute, the other 4 ja clips' mean CER is **0.151** (`ja_04`'s
+0.385 is a full-width-digit ITN mismatch — reference `１００ｍ` vs
+ReazonSpeech's `百M`, not a decode error — and `ja_05`'s 0.217 is the
+same "敦賀さん→駿河さん" ambiguous name clip flagged as already-hard in
+the INT8 quantization section above). The routing feature's own accuracy
+number (19/20 language-correct) already reflects this misroute; reporting
+CER separately here so a single bad-LID clip doesn't get double-counted as
+"the ASR got worse," when what actually happened is "the ASR decoded the
+wrong language's model, correctly, given what both LIDs agreed on."
+
+#### en: not worse than PC despite dropping the dedicated tier — read this with the sample-size caveat
+
+The task brief expected mobile's en number to come in **worse** than
+`docs/SCORECARD.md`'s PC value (WER 2.3%, `v3`/Parakeet-TDT-v3 tier),
+since mobile drops that dedicated tier and routes en through SenseVoice
+instead (see the model-catalog decision above). On this 5-clip sample it
+did not: mobile's SenseVoice-routed en scored WER **1.7%**, nominally
+*better* than PC's v3 tier. Two things temper that:
+
+- **n=5 vs PC's n=15** — a single clip is worth 20pp of WER at this sample
+  size (`en_03.wav` alone accounts for all the error, at 8.3% WER on a
+  transcription that only dropped one letter — "Hstwood" for
+  "Hurstwood"). This is not a statistically meaningful comparison; it
+  would take a much larger en sample to say with confidence whether
+  SenseVoice-routed en is truly competitive with the dedicated v3 tier.
+- **These are read-speech LibriVox clips** (`testdata/eval_real`'s en
+  source), the easiest case for any ASR system — SenseVoice's own ITN
+  already capitalizes/punctuates cleanly on this material (see the `hyp`
+  strings above: proper sentence-initial caps, no all-lowercase/no-punct
+  output). The casing/punctuation gap `scripts/asr_engine.py`'s own
+  comments cite as v3's advantage over other tiers may be more visible on
+  harder, more conversational audio than it is here.
+
+**Known trade-off, stated plainly**: dropping the dedicated en tier is a
+deliberate mobile-profile compromise made for the size budget (see model
+-catalog decision above), not a discovery that it's accuracy-neutral. This
+5-clip result doesn't contradict that it's a real trade-off — it's too
+small a sample to establish either way. Treat "no measured regression on
+this run" as exactly that, not as "the trade-off is free."
+
+#### zh / ko: both routed and decoded correctly on every clip, mean CER somewhat above PC
+
+Both languages hit 5/5 LID accuracy. Mean CER (zh 0.110, ko 0.108) runs
+above the PC scorecard's zh 0.053 (dedicated Paraformer-zh tier — mobile
+has no such tier, SenseVoice decodes zh directly, see model-catalog
+decision above) and ko 0.081 (PC's ko is *also* SenseVoice, same model as
+mobile — so this delta isn't a tier difference, just sample variance:
+n=5 vs PC's n=12, plus this 5-clip subset happening to include two
+harder items, `ko_04`'s Latin-script name "Gibson" mixed into Korean text
+and `ko_05`'s off-by-one-syllable start). No clip decoded garbled or
+wrong-language text; every error is an ordinary ASR substitution/
+insertion/deletion, consistent with `docs/EVAL_REAL_ZHKO.md`'s per-clip
+SenseVoice CER range (0.000-0.242) for the same models on the fuller
+12-clip set.
+
+#### Reproduction
+
+1. Start `hayamimi_test` (`cmd //c "H:\dev\emu_start.bat"`), `adb
+   wait-for-device shell` until `getprop sys.boot_completed` is non-empty.
+2. `flutter build apk --debug` + `adb install -r`.
+3. Stage a manifest+wav subset on the PC (any subset of
+   `testdata/eval_real{,_zhko}/`'s clips + a matching `manifest.json`),
+   push the three model directories and the subset to `/data/local/tmp`
+   with `adb push`.
+4. `adb shell run-as <pkg> cp -r /data/local/tmp/<name> app_flutter/<name>`
+   for each of the model dirs and the eval subset — **the correct
+   destination is `app_flutter/` directly under the app's private data
+   dir (`/data/data/<pkg>/app_flutter`, what `path_provider`'s
+   `getApplicationDocumentsDirectory()` actually resolves to on Android),
+   not `files/app_flutter/`** — this tripped up the first attempt in this
+   session (a `files/app_flutter/` copy sat unused while the app looked in
+   `app_flutter/` and reported "Manifest file not found"). `adb shell
+   run-as <pkg> ls app_flutter` is the fastest way to confirm placement
+   before poking the UI.
+5. Launch the app (`adb shell am start -n <pkg>/.MainActivity`), open the
+   Bench tab, scroll to "Routed multilingual manifest eval", edit the
+   three model-directory fields and the manifest/WAV-dir fields to point
+   at the pushed paths (`adb shell input tap` + `input text` +
+   `input keyevent KEYCODE_DEL` repeated to clear a field — there is no
+   select-all-then-type shortcut over `adb shell input`), tap "Run routed
+   manifest eval", and poll with `adb shell screencap` until the summary
+   text appears.
+6. `adb shell run-as <pkg> cat app_flutter/routed_manifest_eval_result.json`
+   to pull the results (has `detected_lang` per clip), then score with
+   `scripts/eval_accuracy.py`'s `cer_ja`/`wer_en` on the PC.
 
 ### Open items
 
@@ -457,10 +572,17 @@ would produce a routing-accuracy-and-CER comparison table against
   pipeline (see architecture note above) — it's there for a future tier
   beyond SenseVoice's 5 languages, not exercised by `jaSenseVoice` today.
 - The emulator has no usable microphone, so the routed live-mic path
-  (as opposed to the routed *manifest* eval, which doesn't need a mic) is
-  exercised only through `LiveTranscriber.runDebugWavRefineTest`'s existing
-  wav-based debug path and the manifest eval above — not through an actual
-  multi-segment live session with real language switches mid-conversation.
+  (as opposed to the routed *manifest* eval, which doesn't need a mic and
+  is now measured above) is exercised only through
+  `LiveTranscriber.runDebugWavRefineTest`'s existing wav-based debug path
+  — not through an actual multi-segment live session with real language
+  switches mid-conversation.
+- The 20-clip on-device sample above (5 per language) is a quarter to a
+  third of `docs/SCORECARD.md`'s 12-15-clip-per-language PC sample; the
+  en result in particular (mobile nominally *beating* PC's dedicated v3
+  tier) should not be read as "dropping the v3 tier is free" — see the en
+  subsection above. A larger on-device run (the full `eval_real`/
+  `eval_real_zhko` sets, ~54 clips total) would tighten these numbers.
 
 ## Next steps for a mobile profile
 
