@@ -33,6 +33,7 @@ CPUだけでリアルタイム音声認識をやろうとすると、普通はWh
 | 翻訳 | `--translate en,zh,ko`で日本語行をリアルタイム翻訳（en=FuguMT、zh/ko=M2M-100） |
 | ホットワード/置換辞書 | `--hotwords`で固有名詞認識を強化、`--replace`で事後の検索置換 |
 | OBSオーバーレイ+ダッシュボード | `--serve`でローカルHTTPサーバーを起動、ブラウザソースオーバーレイとライブダッシュボードを提供 |
+| ネットワーク音声入力 | `--input ws`でWebSocket経由のマイク音声（スマホ、ESP32/スタックチャン等）を受け付け、`--serve`のダッシュボード/オーバーレイにもそのまま流れる |
 | メモリ上限管理 | LRUモデル退避で常駐モデルを上限内（既定<2GB）に制御 |
 | CPUのみ | すべてのモデルがsherpa-onnx経由の量子化ONNXとして動作。GPU・PyTorch不要 |
 
@@ -40,16 +41,36 @@ CPUだけでリアルタイム音声認識をやろうとすると、普通はWh
 
 `--serve`を付けるとローカルサーバーが立ち、ブラウザから3つのページを開けます。
 
-- **`http://localhost:8765/dashboard`**: ライブダッシュボード。発話中のテキスト、
+- **`http://localhost:8833/dashboard`**: ライブダッシュボード。発話中のテキスト、
   確定した行（言語バッジと話者、行ごとの応答時間つき）、その下に翻訳、右側に清書版の
   トランスクリプトが流れます。
-- **`http://localhost:8765/`**: OBS用のシンプルなオーバーレイ。OBSのブラウザソースに
+- **`http://localhost:8833/`**: OBS用のシンプルなオーバーレイ。OBSのブラウザソースに
   このURLを入れると配信画面に字幕が載ります。
-- **`http://localhost:8765/transcript`**: 清書トランスクリプトだけを流すページ。
+- **`http://localhost:8833/transcript`**: 清書トランスクリプトだけを流すページ。
 
 ![dashboard](docs/images/dashboard.png)
 
 🎬 **[デモ動画を見る](https://github.com/oboroge0/hayamimi/releases/download/v0.1.0/hayamimi_demo.mp4)**: 実際の4言語音声（日英韓中）を文字起こししたときの記録を、そのまま再生した動画です。
+
+## ネットワーク音声入力
+
+`--input ws`を付けると、ローカルマイクの代わりにWebSocket経由で音声を受け付ける
+モードになります。スマホやESP32ベースのスタックチャンからマイク音声をLAN越しに
+送って、hayamimiの通常パイプラインでそのまま文字起こしできます。
+
+```bash
+.venv/Scripts/python scripts/realtime_transcribe.py --input ws --serve
+# -> ws://<host>:8766/ingest が音声を受け付け、http://localhost:8833/dashboard に結果が出る
+```
+
+プロトコル: `/ingest`に接続し、最初にJSONテキストフレームを1通送ります
+（`{"sr": 16000, "format": "pcm_s16le", "channels": 1}`）。以降は生の
+`pcm_s16le`音声をバイナリフレームで連続送信します。16kHz以外はサーバー側で
+リサンプリングし、ダッシュボードのSSEストリームと同じpartial/final/translation/refine
+のJSONイベントを返すので、クライアント側で独自に字幕表示することもできます。
+音声を送るクライアントは同時に1本だけ受け付けます。`scripts/ws_mic_client.py`は
+外部ライブラリ不要の参照クライアント（wavファイルを実時間ペースで送信）で、
+スマホ/ESP32クライアントを作るときのテンプレートにもなります。
 
 ## 動作環境
 
@@ -76,7 +97,7 @@ python -m venv .venv
 
 # ダッシュボード + OBSオーバーレイ付き
 .venv/Scripts/python scripts/realtime_transcribe.py --serve
-# -> ブラウザで http://localhost:8765/dashboard を開く
+# -> ブラウザで http://localhost:8833/dashboard を開く
 ```
 
 `scripts/download_models.py`は約3.1GB分のモデルを`models/`（git管理外）にダウンロードします。
@@ -91,12 +112,15 @@ python -m venv .venv
 |---|---|---|
 | `--wav PATH` | マイク入力 | マイクの代わりに16kHzモノラルWAVファイルからのストリーミングをシミュレート |
 | `--no-realtime` | オフ | `--wav`使用時、チャンク間でスリープしない（高速バッチ処理） |
+| `--input {mic,wav,ws}` | mic、`--wav`指定時はwav | 音声入力元。`ws`はネットワーク経由で音声を受け付ける（上記参照） |
+| `--ws-host HOST` | `0.0.0.0` | `--input ws`の`/ingest`エンドポイントのバインドホスト |
+| `--ws-port PORT` | 8766 | `--input ws`の`/ingest`エンドポイントのポート |
 | `--threads N` | 4 | モデルごとの推論スレッド数 |
 | `--no-partial` | オフ | 発話中の速報字幕を無効化 |
 | `--min-silence SEC` | 0.35 | 発話終了とみなす無音時間。小さいほど確定が速くなるが分割も増える |
 | `--max-speech SEC` | 12.0 | 連続発話がこの秒数を超えたら強制的に確定させる |
 | `--max-resident N` | 3 | tier0以外で常駐させるモデル数の上限（LRU退避）。`0`以下で無制限 |
-| `--serve [PORT]` | オフ、8765 | `http://localhost:PORT`でダッシュボード+OBSオーバーレイを配信 |
+| `--serve [PORT]` | オフ、8833 | `http://localhost:PORT`でダッシュボード+OBSオーバーレイを配信 |
 | `--no-refine` | オフ | 発話群の二段パス再デコードを無効化 |
 | `--transcript PATH` | なし | 清書済みトランスクリプト行をこのファイルに追記 |
 | `--hotwords PATH` | なし | 日本語デコードを固有名詞側に寄せるホットワード一覧（1行1語） |

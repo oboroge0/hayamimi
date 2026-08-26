@@ -74,7 +74,7 @@ DASHBOARD_HTML = '<!doctype html>\n<html lang="ja">\n<meta charset="utf-8">\n<me
 class SubtitleServer:
     """Fan-out of subtitle events to any number of SSE clients."""
 
-    def __init__(self, port: int = 8765):
+    def __init__(self, port: int = 8833):
         self.port = port
         self._clients: list[queue.Queue] = []
         self._refines: list[str] = []  # recent refine events, replayed to new clients
@@ -98,6 +98,24 @@ class SubtitleServer:
         self.publish({"type": "final", "text": text, "lang": lang,
                       "speaker": speaker, "latency_ms": latency_ms, "tier": tier})
 
+    def subscribe(self) -> queue.Queue:
+        """Register a new consumer; past `refine` events are replayed first.
+
+        Used by the /events SSE handler and by ws_ingest.py to mirror the
+        same broadcast onto a WebSocket ingest client.
+        """
+        q: queue.Queue = queue.Queue()
+        with self._lock:
+            for past in self._refines:
+                q.put(past)
+            self._clients.append(q)
+        return q
+
+    def unsubscribe(self, q: queue.Queue):
+        with self._lock:
+            if q in self._clients:
+                self._clients.remove(q)
+
     def start(self):
         server = self
 
@@ -112,11 +130,7 @@ class SubtitleServer:
                     self.send_header("Cache-Control", "no-cache")
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
-                    q: queue.Queue = queue.Queue()
-                    with server._lock:
-                        for past in server._refines:  # replay history to newcomers
-                            q.put(past)
-                        server._clients.append(q)
+                    q = server.subscribe()
                     try:
                         while True:
                             data = q.get()
@@ -125,9 +139,7 @@ class SubtitleServer:
                     except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
                         pass
                     finally:
-                        with server._lock:
-                            if q in server._clients:
-                                server._clients.remove(q)
+                        server.unsubscribe(q)
                 elif self.path == "/dashboard":
                     body = DASHBOARD_HTML.encode("utf-8")
                     self.send_response(200)

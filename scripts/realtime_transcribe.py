@@ -21,21 +21,12 @@ import numpy as np
 import sherpa_onnx
 
 from asr_engine import RoutedASR
+from audio_utils import resample_linear
 
 SAMPLE_RATE = 16000
 WINDOW_SIZE = 512  # samples per VAD chunk, ~32ms @ 16kHz
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
 VAD_MODEL = os.path.join(MODELS_DIR, "silero_vad.onnx")
-
-
-def resample_linear(samples: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
-    if src_rate == dst_rate:
-        return samples
-    duration = len(samples) / src_rate
-    dst_n = int(round(duration * dst_rate))
-    src_x = np.arange(len(samples)) / src_rate
-    dst_x = np.arange(dst_n) / dst_rate
-    return np.interp(dst_x, src_x, samples).astype(np.float32)
 
 
 def read_wave(path: str, target_rate: int = SAMPLE_RATE):
@@ -103,6 +94,35 @@ def mic_chunks():
                          blocksize=WINDOW_SIZE, callback=callback):
         while True:
             yield q.get()
+
+
+def ws_chunks(ingest):
+    """Re-chunk a ws_ingest.IngestServer's variable-sized network reads into
+    fixed WINDOW_SIZE frames, the shape the VAD expects.
+
+    Blocks on ingest.audio_q, same as mic_chunks() blocks on sounddevice's
+    queue -- if the client disconnects, this just idles until the next one
+    connects and starts pushing audio again; the pipeline stays alive.
+
+    ingest.audio_q can also carry a non-ndarray "flush" sentinel (see
+    ws_ingest.FLUSH), pushed when a streaming client disconnects. It is
+    passed straight through to run_stream(), which treats any non-ndarray
+    item as "flush the in-progress VAD segment now" -- otherwise a segment
+    left open when the client vanishes would sit unfinalized forever.
+    """
+    leftover = np.zeros(0, dtype=np.float32)
+    while True:
+        item = ingest.audio_q.get()
+        if not isinstance(item, np.ndarray):
+            if len(leftover):
+                yield np.pad(leftover, (0, WINDOW_SIZE - len(leftover)))
+                leftover = np.zeros(0, dtype=np.float32)
+            yield item
+            continue
+        leftover = np.concatenate([leftover, item])
+        while len(leftover) >= WINDOW_SIZE:
+            yield leftover[:WINDOW_SIZE]
+            leftover = leftover[WINDOW_SIZE:]
 
 
 PARTIAL_EVERY_S = 0.5   # decode a draft this often (in audio time) during speech
@@ -415,6 +435,20 @@ def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStat
     if history is None:
         history = AudioHistory(sample_rate)
     for chunk in chunks:
+        if not isinstance(chunk, np.ndarray):
+            # non-ndarray = a "flush now" signal (ws_ingest.FLUSH on client
+            # disconnect): finalize whatever the VAD has in progress instead
+            # of waiting for silence that may never arrive.
+            vad.flush()
+            if drain_segments(vad, sample_rate, asr, stats, printer, history, early_lang,
+                              spans_out=refiner.spans if refiner else None,
+                              translator_worker=translator_worker,
+                              speaker_labeler=speaker_labeler):
+                early_lang = None
+            if refiner is not None:
+                refiner.maybe_refine(int(audio_pos * sample_rate), force=True)
+            continue
+
         vad.accept_waveform(chunk)
         history.push(chunk)
         audio_pos += len(chunk) / sample_rate
@@ -451,8 +485,8 @@ def main():
                     help="force-finalize an utterance after this many seconds of continuous speech")
     ap.add_argument("--max-resident", type=int, default=3,
                     help="max non-tier0 models kept in memory (LRU eviction); 0 or less = unlimited")
-    ap.add_argument("--serve", type=int, nargs="?", const=8765, default=None, metavar="PORT",
-                    help="serve an OBS browser-source overlay at http://localhost:PORT (default 8765)")
+    ap.add_argument("--serve", type=int, nargs="?", const=8833, default=None, metavar="PORT",
+                    help="serve an OBS browser-source overlay at http://localhost:PORT (default 8833)")
     ap.add_argument("--no-refine", action="store_true",
                     help="disable the second-pass re-decode of utterance groups")
     ap.add_argument("--transcript", metavar="PATH",
@@ -469,6 +503,13 @@ def main():
     ap.add_argument("--translate", nargs="?", const="en", default=None, metavar="LANGS",
                     help="translate Japanese lines to these languages, comma-separated "
                          "(en/zh/ko; default en). en=FuguMT, zh/ko=M2M-100")
+    ap.add_argument("--input", choices=["mic", "wav", "ws"], default=None,
+                    help="audio source; default is mic, or wav if --wav is given")
+    ap.add_argument("--ws-host", default="0.0.0.0", metavar="HOST",
+                    help="bind host for --input ws (default 0.0.0.0, so an ESP32/phone "
+                         "on the LAN can reach it; use 127.0.0.1 to restrict to localhost)")
+    ap.add_argument("--ws-port", type=int, default=8766, metavar="PORT",
+                    help="port for the --input ws /ingest endpoint (default 8766)")
     args = ap.parse_args()
 
     server = None
@@ -516,15 +557,28 @@ def main():
         if refiner is not None:
             refiner.maybe_refine(0, force=True)
 
+    input_mode = args.input or ("wav" if args.wav else "mic")
+
     try:
         if server is not None:
             server.publish({"type": "session_start"})
-        if args.wav:
+        if input_mode == "wav":
+            if not args.wav:
+                ap.error("--input wav requires --wav PATH")
             samples, sr = read_wave(args.wav)  # resampled to SAMPLE_RATE if needed
             run_stream(wav_chunks(samples, sr, realtime=not args.no_realtime),
                        vad, sr, asr, stats, printer, refiner, history, translator_worker,
                        speaker_labeler)
             finish(sr)
+        elif input_mode == "ws":
+            from ws_ingest import INGEST_PATH, IngestServer
+
+            ingest = IngestServer(args.ws_host, args.ws_port, sample_rate=SAMPLE_RATE,
+                                  subtitle_server=server).start()
+            print(f"ws ingest: ws://{args.ws_host}:{args.ws_port}{INGEST_PATH}  "
+                  f"(JSON handshake, then binary pcm_s16le frames)", file=sys.stderr)
+            run_stream(ws_chunks(ingest), vad, SAMPLE_RATE, asr, stats, printer, refiner,
+                       history, translator_worker, speaker_labeler)
         else:
             run_stream(mic_chunks(), vad, SAMPLE_RATE, asr, stats, printer, refiner, history,
                        translator_worker, speaker_labeler)

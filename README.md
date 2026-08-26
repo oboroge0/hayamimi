@@ -36,6 +36,7 @@ same clips, while running at 10-50x realtime on a 6-core desktop CPU.
 | Translation | `--translate en,zh,ko` translates Japanese lines live (en via FuguMT, zh/ko via M2M-100) |
 | Hotwords / user dictionary | `--hotwords` biases decoding toward proper nouns; `--replace` does post-hoc find/replace |
 | OBS overlay + dashboard | `--serve` starts a local HTTP server with a browser-source overlay and a live dashboard |
+| Network audio input | `--input ws` accepts mic audio over a WebSocket (phone, ESP32/stackchan) and feeds it through the same pipeline, including `--serve`'s dashboard/overlay |
 | Memory-bounded | LRU model eviction keeps resident models under a configurable cap (default: <2GB total) |
 | CPU-only | every model runs as quantized ONNX via sherpa-onnx; no GPU or PyTorch required |
 
@@ -43,18 +44,38 @@ same clips, while running at 10-50x realtime on a 6-core desktop CPU.
 
 `--serve` starts a local server exposing three views:
 
-- **`http://localhost:8765/dashboard`** -- the live dashboard: a partial-text
+- **`http://localhost:8833/dashboard`** -- the live dashboard: a partial-text
   strip for in-progress speech, a finals feed with language badges, speaker
   chips, and per-line latency, inline translations under each line, and a
   second column with the refined (two-pass) transcript as it lands.
-- **`http://localhost:8765/`** -- a minimal OBS browser-source overlay
+- **`http://localhost:8833/`** -- a minimal OBS browser-source overlay
   (add this URL as a Browser Source in OBS for stream captions).
-- **`http://localhost:8765/transcript`** -- plain scrolling transcript
+- **`http://localhost:8833/transcript`** -- plain scrolling transcript
   history.
 
 ![dashboard](docs/images/dashboard.png)
 
 🎬 **[Watch the demo video](https://github.com/oboroge0/hayamimi/releases/download/v0.1.0/hayamimi_demo.mp4)** — real 4-language audio (ja/en/ko/zh) transcribed live, replayed frame-accurately from a captured session.
+
+## Network audio input
+
+`--input ws` runs a WebSocket ingest endpoint instead of reading the local
+microphone, so a phone or a stackchan-class ESP32 board can stream mic audio
+over the LAN and get it transcribed through hayamimi's normal pipeline:
+
+```bash
+.venv/Scripts/python scripts/realtime_transcribe.py --input ws --serve
+# -> ws://<host>:8766/ingest accepts audio; http://localhost:8833/dashboard shows the results
+```
+
+Protocol: connect to `/ingest`, send one JSON text frame
+(`{"sr": 16000, "format": "pcm_s16le", "channels": 1}`), then stream raw
+`pcm_s16le` audio as binary frames. The server resamples non-16kHz audio and
+replies with the same partial/final/translation/refine JSON events the
+dashboard's SSE stream carries, so a client can show its own subtitles too.
+Only one audio-producing client is accepted at a time; `scripts/ws_mic_client.py`
+is a dependency-free reference client (streams a wav file at real-time pace)
+that doubles as a template for a phone/ESP32 implementation.
 
 ## Requirements
 
@@ -81,7 +102,7 @@ python -m venv .venv
 
 # With the dashboard + OBS overlay
 .venv/Scripts/python scripts/realtime_transcribe.py --serve
-# -> open http://localhost:8765/dashboard in a browser
+# -> open http://localhost:8833/dashboard in a browser
 ```
 
 `scripts/download_models.py` pulls ~3.1GB of pretrained models into
@@ -97,12 +118,15 @@ All flags are on `scripts/realtime_transcribe.py`:
 |---|---|---|
 | `--wav PATH` | mic input | simulate streaming from a 16kHz mono WAV file instead of the microphone |
 | `--no-realtime` | off | with `--wav`, don't sleep between chunks (fast batch processing) |
+| `--input {mic,wav,ws}` | mic, or wav if `--wav` is given | audio source; `ws` accepts audio over the network (see below) |
+| `--ws-host HOST` | `0.0.0.0` | bind host for `--input ws`'s `/ingest` endpoint |
+| `--ws-port PORT` | 8766 | port for `--input ws`'s `/ingest` endpoint |
 | `--threads N` | 4 | inference threads per model |
 | `--no-partial` | off | disable in-progress draft subtitles |
 | `--min-silence SEC` | 0.35 | silence duration that ends an utterance; lower = snappier finals, more splits |
 | `--max-speech SEC` | 12.0 | force-finalize an utterance after this many seconds of continuous speech |
 | `--max-resident N` | 3 | max non-tier0 models kept resident (LRU eviction); `<=0` = unlimited |
-| `--serve [PORT]` | off, 8765 | serve the dashboard + OBS overlay at `http://localhost:PORT` |
+| `--serve [PORT]` | off, 8833 | serve the dashboard + OBS overlay at `http://localhost:PORT` |
 | `--no-refine` | off | disable the second-pass re-decode of utterance groups |
 | `--transcript PATH` | none | append refined transcript lines to this file |
 | `--hotwords PATH` | none | hotword list (one per line) to bias Japanese decoding toward proper nouns |
