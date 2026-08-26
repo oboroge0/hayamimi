@@ -1,0 +1,31 @@
+name: hayamimi_core
+description: >-
+  Reusable CPU real-time speech recognition core extracted from hayamimi:
+  on-device live transcription (sherpa-onnx + Silero VAD), a thin client for
+  a remote hayamimi server (--input ws --serve), and a LAN subtitle
+  broadcast server compatible with the desktop hayamimi overlay/SSE format.
+version: 0.1.0
+homepage: https://github.com/oboroge0/hayamimi
+repository: https://github.com/oboroge0/hayamimi
+topics:
+  - speech-recognition
+  - subtitles
+  - asr
+  - realtime
+
+environment:
+  sdk: ^3.13.1
+  flutter: ">=1.17.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  sherpa_onnx: ^1.13.6
+  record: ^6.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:

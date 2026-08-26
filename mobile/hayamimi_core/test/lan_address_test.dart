@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:hayamimi_mobile/server/lan_address.dart';
+import 'package:hayamimi_core/server/lan_address.dart';
 
 void main() {
   group('pickLanAddress', () {

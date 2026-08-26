@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:hayamimi_mobile/bench/model_file_resolver.dart';
+import 'package:hayamimi_core/bench/model_file_resolver.dart';
 
 void main() {
   group('resolveZipformerTransducerFiles', () {

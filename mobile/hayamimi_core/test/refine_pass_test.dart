@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:hayamimi_mobile/live/refine_pass.dart';
+import 'package:hayamimi_core/live/refine_pass.dart';
 
 RefineSegment _segment({
   required double seconds,

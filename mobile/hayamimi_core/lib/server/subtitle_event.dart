@@ -61,3 +61,53 @@ class FinalSubtitleEvent extends SubtitleEvent {
     'latency_ms': latencyMs,
   };
 }
+
+/// A machine translation of the most recent final line.
+class TranslationSubtitleEvent extends SubtitleEvent {
+  const TranslationSubtitleEvent({required this.lang, required this.text});
+
+  final String lang;
+  final String text;
+
+  @override
+  Map<String, dynamic> toJson() => {
+    'type': 'translation',
+    'lang': lang,
+    'text': text,
+  };
+}
+
+/// A second-pass, re-decoded and cleaned-up version of a group of finals
+/// (the mobile app's two-pass "清書" — see `HayamimiLive.refineNow`).
+class RefineSubtitleEvent extends SubtitleEvent {
+  const RefineSubtitleEvent({
+    required this.text,
+    this.lang = '',
+    this.speaker = '',
+    this.latencyMs,
+  });
+
+  final String text;
+  final String lang;
+  final String speaker;
+  final double? latencyMs;
+
+  @override
+  Map<String, dynamic> toJson() => {
+    'type': 'refine',
+    'text': text,
+    'lang': lang,
+    'speaker': speaker,
+    'latency_ms': latencyMs,
+  };
+}
+
+/// A reported error, e.g. a rejected handshake or a connection failure.
+class ErrorSubtitleEvent extends SubtitleEvent {
+  const ErrorSubtitleEvent({required this.message});
+
+  final String message;
+
+  @override
+  Map<String, dynamic> toJson() => {'type': 'error', 'message': message};
+}

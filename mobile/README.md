@@ -1,7 +1,12 @@
 # hayamimi mobile (RTF bench + live transcription)
 
 Flutter app (Android + iOS, shared codebase) for prototyping hayamimi's
-speech recognition on phones. It has three screens:
+speech recognition on phones. The recognition logic itself lives in the
+sibling [`hayamimi_core`](hayamimi_core/) package (path dependency, see
+`pubspec.yaml`) so other apps — e.g. a smart-glasses companion app — can
+embed the same live/remote transcription pipeline without this demo UI. See
+[`hayamimi_core/README.md`](hayamimi_core/README.md) for the embedding API.
+This app has three screens:
 
 - **Bench** — runs a [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
   offline ASR model against a WAV file and reports the RTF (real-time
@@ -33,79 +38,24 @@ speech recognition on phones. It has three screens:
 
 ## Code layout
 
-- `lib/bench/model_kind.dart` — enum of supported ASR model families.
-- `lib/bench/model_file_resolver.dart` — pure logic that picks
-  encoder/decoder/joiner/tokens files out of a model directory listing
-  (prefers int8 variants when both are present). Unit tested, no FFI.
-- `lib/bench/bench_result.dart` — result value type + RTF calculation.
-- `lib/bench/bench_runner.dart` — glues the above to the `sherpa_onnx`
-  package: loads the model, decodes the WAV, times it with a `Stopwatch`.
-- `lib/live/pcm_frame_buffer.dart` — pure logic: converts PCM16 mic bytes to
-  normalized `Float32List` samples, and re-slices arbitrary-size mic chunks
-  into the fixed-size frames Silero VAD requires. Unit tested, no FFI.
-- `lib/live/speech_segment_filter.dart` — pure logic: decides whether a
-  VAD-emitted speech segment is long enough to bother decoding. Unit
-  tested.
-- `lib/live/live_transcript_entry.dart` — one finalized transcript line
-  (text + timestamp).
-- `lib/live/refine_pass.dart` — pure logic for the two-pass "refine" (清書)
-  feature: `RefineBuffer` (a duration-capped ring buffer of finalized
-  segments awaiting a refine), `combineSegmentSamples`/
-  `combineSegmentFastText` (merging a group's audio/text),
-  `isRefineTextTooShort` (the "don't let a refine lose content" guard), and
-  `isAutoRefineDue` (the silence-gap/max-buffered due check for auto mode).
-  Mirrors the shape of the desktop pipeline's `Refiner` class
-  (`scripts/realtime_transcribe.py`) with phone-tuned defaults. Unit
-  tested, no FFI. See [Two-pass refine](#two-pass-refine-清書) below.
-- `lib/live/live_transcriber.dart` — orchestrates the `record` mic stream,
-  sherpa-onnx's `VoiceActivityDetector`, and the same `OfflineRecognizer`
-  the bench uses; also owns the refine pass (`refineNow`,
-  `autoRefineEnabled`, built from `refine_pass.dart`) and the debug-only
-  `runDebugWavRefineTest` helper. Not unit tested itself (needs a real mic
-  + native libs); built from the pure pieces above so most of its logic is
-  covered indirectly.
+Recognition logic (models, live/remote transcription, the broadcast server)
+lives in [`hayamimi_core/`](hayamimi_core/) — see that package's README for
+its full layout. This directory now holds only the demo UI:
+
 - `lib/live/live_page.dart` — the live transcription screen UI: the
   transcript list, the "清書" (refine) section with its manual button and
   "自動清書" toggle, the "配信サーバー" (broadcast server) toggle, and (debug
-  builds only) the "wavから清書テスト" card.
-- `lib/server/subtitle_event.dart` — pure logic: the `partial`/`final`
-  event value types and their JSON/SSE-frame encoding, wire-compatible with
-  the desktop `scripts/subtitle_server.py`. Unit tested, no I/O.
-- `lib/server/overlay_html.dart` — the transparent OBS overlay page, ported
-  from `scripts/subtitle_server.py`'s `OVERLAY_HTML`.
-- `lib/server/lan_address.dart` — picks a LAN-reachable IPv4 address to show
-  the user; the selection logic (`pickLanAddress`) is pure and unit tested,
-  `currentLanAddress()` wires it to `NetworkInterface.list`.
-- `lib/server/subtitle_broadcast_server.dart` — the actual `dart:io`
-  `HttpServer`: serves the overlay at `/` and an SSE stream at `/events`.
-  Covered by an integration test that binds a real ephemeral port.
-- `lib/remote/remote_event.dart` — pure logic: parses the JSON events a
-  hayamimi `/ingest` WebSocket sends back (`partial`/`final`/`translation`/
-  `refine`/`ready`/`error`/...) into typed values, wire-compatible with
-  `scripts/subtitle_server.py`. Unit tested, no I/O.
-- `lib/remote/remote_handshake.dart` — pure logic: builds the JSON
-  handshake frame `/ingest` expects as the first WebSocket message. Unit
-  tested.
-- `lib/remote/wav_pcm_reader.dart` — pure logic: parses a 16-bit PCM `.wav`
-  file's bytes (sample rate, channels, raw PCM) without touching disk. Unit
-  tested. Used by the debug test-wav sender.
-- `lib/remote/remote_connection_state.dart` — the connection lifecycle enum
-  the Remote screen displays.
-- `lib/remote/remote_transcriber.dart` — orchestrates the `record` mic
-  stream and a `dart:io` `WebSocket` connection to `/ingest`: sends the
-  handshake, streams PCM16 binary frames, parses incoming JSON events, and
-  auto-reconnects with a fixed backoff if the connection drops. Also
-  provides `sendTestWavFile`, a debug helper that streams a `.wav` file at
-  real-time pace over its own one-shot connection (mirrors
-  `scripts/ws_mic_client.py`) for testing without a real microphone. Not
-  unit tested itself (needs a real mic/socket); built from the pure pieces
-  above.
+  builds only) the "wavから清書テスト" card. Built on `HayamimiLive` /
+  `LiveTranscriber` / `SubtitleBroadcastServer` from `hayamimi_core`.
 - `lib/remote/remote_page.dart` — the Remote screen UI: server URL field,
   connect/disconnect, partial text strip, finals list with language badge
-  and latency, and a debug-build-only "send test wav" card.
+  and latency, and a debug-build-only "send test wav" card. Built on
+  `RemoteTranscriber` from `hayamimi_core`.
 - `lib/main.dart` — top-level app shell with the Bench/Live/Remote tab
-  switcher.
-- `test/` — unit tests for the pure logic (`flutter test`).
+  switcher; the Bench screen is built directly on `hayamimi_core`'s
+  `BenchRunner`/`ModelKind`/`BenchResult`.
+- `test/` — currently empty; the pure-logic tests moved to
+  `hayamimi_core/test/` along with the code they cover.
 
 ## Building on Windows (Android)
 

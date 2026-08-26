@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:hayamimi_mobile/live/pcm_frame_buffer.dart';
+import 'package:hayamimi_core/live/pcm_frame_buffer.dart';
 
 void main() {
   group('pcm16BytesToFloat32', () {

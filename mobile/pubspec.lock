@@ -112,6 +112,13 @@ packages:
     description: flutter
     source: sdk
     version: "0.0.0"
+  hayamimi_core:
+    dependency: "direct main"
+    description:
+      path: hayamimi_core
+      relative: true
+    source: path
+    version: "0.1.0"
   hooks:
     dependency: transitive
     description:
@@ -305,7 +312,7 @@ packages:
     source: hosted
     version: "2.2.0"
   record:
-    dependency: "direct main"
+    dependency: transitive
     description:
       name: record
       sha256: "10911465138fafacef459a780564e883e01bd48eabf87ab20543684884492870"

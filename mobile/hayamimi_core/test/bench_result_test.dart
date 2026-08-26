@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:hayamimi_mobile/bench/bench_result.dart';
+import 'package:hayamimi_core/bench/bench_result.dart';
 
 void main() {
   group('BenchResult.rtf', () {

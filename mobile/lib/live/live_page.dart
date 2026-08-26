@@ -3,14 +3,8 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:hayamimi_core/hayamimi_core.dart';
 import 'package:path_provider/path_provider.dart';
-
-import '../bench/model_kind.dart';
-import '../server/lan_address.dart';
-import '../server/subtitle_broadcast_server.dart';
-import '../server/subtitle_event.dart';
-import 'live_transcript_entry.dart';
-import 'live_transcriber.dart';
 
 /// Live mic transcription screen: start/stop capture, see the model in use,
 /// and watch finalized transcript lines accumulate as speech is detected.

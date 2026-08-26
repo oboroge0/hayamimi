@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:hayamimi_mobile/server/subtitle_event.dart';
+import 'package:hayamimi_core/server/subtitle_event.dart';
 
 void main() {
   group('PartialSubtitleEvent', () {

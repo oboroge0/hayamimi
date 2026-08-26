@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:hayamimi_mobile/live/speech_segment_filter.dart';
+import 'package:hayamimi_core/live/speech_segment_filter.dart';
 import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa_onnx;
 
 sherpa_onnx.SpeechSegment _segmentOfDuration(
