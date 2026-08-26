@@ -7,6 +7,8 @@ import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa_onnx;
 
 import '../bench/model_file_resolver.dart';
 import '../bench/model_kind.dart';
+import '../routing/routed_recognizer.dart';
+import '../routing/routing_profile.dart';
 import 'live_transcript_entry.dart';
 import 'pcm_frame_buffer.dart';
 import 'refine_pass.dart';
@@ -48,6 +50,7 @@ class LiveTranscriber {
 
   sherpa_onnx.VoiceActivityDetector? _vad;
   sherpa_onnx.OfflineRecognizer? _recognizer;
+  RoutedRecognizerSet? _routed;
   StreamSubscription<Uint8List>? _micSubscription;
   PcmFrameBuffer? _frameBuffer;
 
@@ -78,6 +81,11 @@ class LiveTranscriber {
 
   bool get isRunning => _micSubscription != null;
 
+  /// The session's current language when running with
+  /// [RoutingProfile.jaSenseVoice] (`null` before the first segment
+  /// resolves one, and always `null` for a plain single-model session).
+  String? get currentLang => _routed?.currentLang;
+
   /// Total audio currently buffered for the next refine pass, in seconds.
   double get refineBufferedSeconds => _refineBuffer.totalDurationSeconds;
 
@@ -100,12 +108,24 @@ class LiveTranscriber {
   /// Starts capturing mic audio and transcribing it.
   ///
   /// [modelDir] must contain a zipformer transducer model (see
-  /// `resolveZipformerTransducerFiles`). [vadModelPath] must point at a
-  /// Silero VAD onnx model file (e.g. `silero_vad.onnx`).
+  /// `resolveZipformerTransducerFiles`) -- this is the ja tier model dir
+  /// even when [routingProfile] is [RoutingProfile.jaSenseVoice].
+  /// [vadModelPath] must point at a Silero VAD onnx model file (e.g.
+  /// `silero_vad.onnx`).
+  ///
+  /// When [routingProfile] is [RoutingProfile.jaSenseVoice],
+  /// [senseVoiceModelDir] and [lidModelDir] are also required: each VAD
+  /// segment is then routed to ReazonSpeech (ja) or SenseVoice
+  /// (en/zh/ko/yue) per the dual-LID policy in
+  /// `../routing/lang_routing.dart`, and emitted [LiveTranscriptEntry]s
+  /// carry [LiveTranscriptEntry.lang].
   Future<void> start({
     required ModelKind modelKind,
     required String modelDir,
     required String vadModelPath,
+    RoutingProfile routingProfile = RoutingProfile.jaOnly,
+    String? senseVoiceModelDir,
+    String? lidModelDir,
   }) async {
     if (isRunning) {
       return;
@@ -133,35 +153,53 @@ class LiveTranscriber {
       throw LiveTranscriberException('Microphone permission was not granted.');
     }
 
-    final filenames = await dir
-        .list()
-        .where((e) => e is File)
-        .map((e) => e.uri.pathSegments.last)
-        .toList();
+    if (routingProfile.dualConfirmed) {
+      if (senseVoiceModelDir == null || lidModelDir == null) {
+        throw LiveTranscriberException(
+          '${routingProfile.label} requires senseVoiceModelDir and '
+          'lidModelDir.',
+        );
+      }
+      try {
+        _routed = await RoutedRecognizerSet.build(
+          reazonModelDir: modelDir,
+          senseVoiceModelDir: senseVoiceModelDir,
+          lidModelDir: lidModelDir,
+        );
+      } on RoutedRecognizerException catch (e) {
+        throw LiveTranscriberException(e.message);
+      }
+    } else {
+      final filenames = await dir
+          .list()
+          .where((e) => e is File)
+          .map((e) => e.uri.pathSegments.last)
+          .toList();
 
-    final ResolvedModelFiles resolved;
-    try {
-      resolved = resolveZipformerTransducerFiles(filenames);
-    } on ModelFileResolutionException catch (e) {
-      throw LiveTranscriberException(e.message);
-    }
+      final ResolvedModelFiles resolved;
+      try {
+        resolved = resolveZipformerTransducerFiles(filenames);
+      } on ModelFileResolutionException catch (e) {
+        throw LiveTranscriberException(e.message);
+      }
 
-    final sep = Platform.pathSeparator;
-    _recognizer = sherpa_onnx.OfflineRecognizer(
-      sherpa_onnx.OfflineRecognizerConfig(
-        model: sherpa_onnx.OfflineModelConfig(
-          transducer: sherpa_onnx.OfflineTransducerModelConfig(
-            encoder: '$modelDir$sep${resolved.encoder}',
-            decoder: '$modelDir$sep${resolved.decoder}',
-            joiner: '$modelDir$sep${resolved.joiner}',
+      final sep = Platform.pathSeparator;
+      _recognizer = sherpa_onnx.OfflineRecognizer(
+        sherpa_onnx.OfflineRecognizerConfig(
+          model: sherpa_onnx.OfflineModelConfig(
+            transducer: sherpa_onnx.OfflineTransducerModelConfig(
+              encoder: '$modelDir$sep${resolved.encoder}',
+              decoder: '$modelDir$sep${resolved.decoder}',
+              joiner: '$modelDir$sep${resolved.joiner}',
+            ),
+            tokens: '$modelDir$sep${resolved.tokens}',
+            numThreads: 2,
+            debug: false,
+            provider: 'cpu',
           ),
-          tokens: '$modelDir$sep${resolved.tokens}',
-          numThreads: 2,
-          debug: false,
-          provider: 'cpu',
         ),
-      ),
-    );
+      );
+    }
 
     final vadConfig = sherpa_onnx.VadModelConfig(
       sileroVad: sherpa_onnx.SileroVadModelConfig(model: vadModelPath),
@@ -238,9 +276,17 @@ class LiveTranscriber {
   }
 
   void _decodeSegment(sherpa_onnx.SpeechSegment segment) {
+    if (!isSegmentWorthDecoding(segment, sampleRate: sampleRate)) {
+      return;
+    }
+    final routed = _routed;
+    if (routed != null) {
+      _decodeSegmentRouted(routed, segment);
+      return;
+    }
+
     final recognizer = _recognizer;
-    if (recognizer == null ||
-        !isSegmentWorthDecoding(segment, sampleRate: sampleRate)) {
+    if (recognizer == null) {
       return;
     }
 
@@ -273,6 +319,36 @@ class LiveTranscriber {
     }
   }
 
+  void _decodeSegmentRouted(
+    RoutedRecognizerSet routed,
+    sherpa_onnx.SpeechSegment segment,
+  ) {
+    _decodingController.add(true);
+    final stopwatch = Stopwatch()..start();
+    try {
+      final result = routed.decode(segment.samples);
+      stopwatch.stop();
+      final text = result.text.trim();
+      if (text.isNotEmpty) {
+        final now = DateTime.now();
+        _entriesController.add(
+          LiveTranscriptEntry(
+            text: text,
+            timestamp: now,
+            latencyMs: stopwatch.elapsedMicroseconds / 1000,
+            lang: result.lang,
+          ),
+        );
+        _lastSegmentAt = now;
+        _refineBuffer.add(
+          RefineSegment(samples: segment.samples, text: text, capturedAt: now),
+        );
+      }
+    } finally {
+      _decodingController.add(false);
+    }
+  }
+
   /// Runs a refine pass over everything currently buffered: combines the
   /// buffered segments' audio and re-decodes it as one utterance, using the
   /// same recognizer the fast per-segment path uses. Emits nothing if the
@@ -286,7 +362,8 @@ class LiveTranscriber {
   /// own recognizer.
   Future<void> refineNow() async {
     final recognizer = _recognizer;
-    if (recognizer == null || _refineBuffer.isEmpty) {
+    final routed = _routed;
+    if ((recognizer == null && routed == null) || _refineBuffer.isEmpty) {
       return;
     }
     final segments = _refineBuffer.takeAll();
@@ -298,11 +375,27 @@ class LiveTranscriber {
 
     _decodingController.add(true);
     final stopwatch = Stopwatch()..start();
-    final stream = recognizer.createStream();
     try {
-      stream.acceptWaveform(samples: combined, sampleRate: sampleRate);
-      recognizer.decode(stream);
-      var text = recognizer.getResult(stream).text.trim();
+      var text = '';
+      String? lang;
+      if (routed != null) {
+        // Re-runs LID on the merged group audio too, same as the desktop
+        // refine pass's re-judgment (docs/LID.md's REFINE_MIN_REGROUP_S
+        // rationale: a longer merged group is a better LID input than any
+        // single segment).
+        final result = routed.decode(combined);
+        text = result.text.trim();
+        lang = result.lang;
+      } else if (recognizer != null) {
+        final stream = recognizer.createStream();
+        try {
+          stream.acceptWaveform(samples: combined, sampleRate: sampleRate);
+          recognizer.decode(stream);
+          text = recognizer.getResult(stream).text.trim();
+        } finally {
+          stream.free();
+        }
+      }
       stopwatch.stop();
       // A merged re-decode must never LOSE content: if it comes back much
       // shorter than the fast finals combined, trust those instead (mirrors
@@ -316,11 +409,11 @@ class LiveTranscriber {
             text: text,
             timestamp: DateTime.now(),
             latencyMs: stopwatch.elapsedMicroseconds / 1000,
+            lang: lang,
           ),
         );
       }
     } finally {
-      stream.free();
       _decodingController.add(false);
     }
   }
@@ -357,6 +450,8 @@ class LiveTranscriber {
     _vad = null;
     _recognizer?.free();
     _recognizer = null;
+    _routed?.free();
+    _routed = null;
     _frameBuffer = null;
   }
 

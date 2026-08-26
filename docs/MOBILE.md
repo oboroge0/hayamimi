@@ -325,6 +325,143 @@ committed) and a `scratch_quantize_punct_results.json` summary at repo root
 (also not committed, scratch artifact). Pass `--skip-quantize` to re-run
 just the evaluation against an already-produced int8 file.
 
+## Multi-language routing on mobile
+
+Ports the desktop pipeline's dual-LID routing policy (`docs/LID.md`,
+`scripts/asr_engine.py`'s `resolve_dual_confirm`/`resolve_sticky_lang`/
+`sv_lid_tag`) to Dart, so the mobile Live screen can switch between
+languages per VAD segment instead of running a single fixed-language model
+for the whole session (the prior mobile behavior).
+
+### Model catalog decision: ja + SenseVoice only, no dedicated en/EU tier
+
+The desktop pipeline has 4 tiers (ja → ReazonSpeech, zh → Paraformer,
+ko/yue → SenseVoice, en+24 EU langs → Parakeet-TDT-0.6B-v3). Parakeet-TDT
+-0.6B-v3-int8 is **641 MB** on disk (`models/sherpa-onnx-nemo-parakeet-tdt
+-0.6b-v3-int8/`) — well over the >300MB threshold this task set for
+starting a "ja+en+SV" profile, and on its own bigger than every other model
+this profile needs combined. So mobile ships **2 tiers**:
+
+- **ja** → ReazonSpeech k2 zipformer (`RoutingProfile.jaSenseVoice`'s
+  `reazonModelDir`), same model/decoding config as the existing single-model
+  path (`modified_beam_search`, matches `scripts/asr_engine.py::_build_reazon`).
+- **en/zh/ko/yue** → SenseVoice small, which already covers all four in one
+  model (its own internal LID arbitrates between them at decode time). No
+  dedicated Paraformer-zh tier either — the desktop docs/EVAL_REAL_ZHKO.md
+  win for zh (Paraformer 5.6% CER vs SenseVoice 7.5%) doesn't justify a
+  third model on a phone; SenseVoice's zh output is used as-is.
+
+This means `RoutingProfile` has no separate profile for "ja+en+SV" distinct
+from "ja+SV": SenseVoice already covers en, so they're the same two models.
+See `mobile/hayamimi_core/lib/routing/routing_profile.dart`.
+
+### Model sizes (int8, the files this profile loads)
+
+| model | role | size |
+|---|---|---|
+| ReazonSpeech ja (encoder+decoder+joiner, int8) | ja tier | 69.8 MB |
+| SenseVoice small (int8) | en/zh/ko/yue tier | 228.2 MB |
+| whisper-tiny (encoder+decoder, int8) | LID probe | 98.0 MB |
+| **total** | | **396.0 MB** |
+
+(Silero VAD, already required by the existing single-model path, is a few
+MB more and unchanged.) All three int8 files are loaded simultaneously —
+no LRU eviction is implemented (the mobile task's memory-management step
+was descoped to "report the total" rather than build unload logic, since
+396MB of model weights plus onnxruntime's working-set overhead is a large
+but plausibly device-resident footprint for a phone with several GB of RAM;
+an actual peak-RSS measurement on-device is a follow-up, not done in this
+task — see "Open items" below).
+
+### Architecture
+
+- `mobile/hayamimi_core/lib/routing/lang_routing.dart` — pure, unit-tested
+  port of the desktop's `resolve_dual_confirm`, `resolve_sticky_lang`, and
+  `sv_lid_tag` (`mobile/hayamimi_core/test/routing/lang_routing_test.dart`
+  mirrors every case in `tests/test_units.py`'s dual-LID and sticky-LID
+  sections). `resolve_sticky_lang` is ported for completeness/fidelity even
+  though nothing calls it yet — mobile has no third tier for languages
+  outside SenseVoice's coverage (see catalog decision above), so only the
+  dual-confirm path is wired into the live pipeline today.
+- `mobile/hayamimi_core/lib/routing/routed_recognizer.dart` —
+  `RoutedRecognizerSet` owns the three native model handles (ReazonSpeech,
+  SenseVoice, whisper-tiny LID) and implements the per-segment routing
+  decision: run whisper-tiny LID (truncated to 4s, matching the desktop's
+  `LID_MAX_SECONDS`); if the candidate matches the session's current
+  language, decode directly (no SenseVoice probe needed, mirroring the
+  desktop's `lang == last_lang` fast path); otherwise, when the candidate is
+  one of the 5 SenseVoice-covered languages, decode via SenseVoice to get
+  both a transcript AND its own LID tag on the same audio in one call, then
+  arbitrate with `resolveDualConfirm` — reusing that decode's text when the
+  resolved language isn't "ja" (no double decode), or re-decoding via
+  ReazonSpeech when it is. A whisper-tiny candidate outside SenseVoice's
+  5-language coverage (e.g. "fr", "ru") has no specialist tier loaded here,
+  so the segment holds at the session's current language (or defaults to
+  "ja" at bootstrap) — this is mobile's simplification of the desktop's
+  4-tier fallback chain down to 2 tiers.
+- `mobile/hayamimi_core/lib/live/live_transcriber.dart` — `start()` gained
+  `routingProfile`/`senseVoiceModelDir`/`lidModelDir` parameters; when
+  `routingProfile.dualConfirmed`, segments go through `RoutedRecognizerSet`
+  instead of a single `OfflineRecognizer`, and emitted
+  `LiveTranscriptEntry`s carry a `lang` field. The refine ("清書") pass
+  re-runs the same routed `decode()` over the merged group audio, which
+  re-judges LID on the (usually longer) combined audio — the same idea as
+  the desktop's `resolve_refine_lang`, simplified to reuse `decode()`
+  directly rather of porting `REFINE_MIN_REGROUP_S`'s separate gate.
+- `mobile/lib/live/live_page.dart` — a "Language routing" dropdown
+  (`RoutingProfile.jaOnly` default, unchanged prior behavior, vs
+  `RoutingProfile.jaSenseVoice`) plus SenseVoice/LID model directory
+  fields shown only when routing is on, and a small language badge (e.g.
+  "JA", "EN") on each transcript line when the session used routing.
+- `mobile/hayamimi_core/lib/bench/manifest_eval_runner.dart` —
+  `ManifestEvalRunner.runRouted` batch-decodes a multilingual
+  `manifest.json` through `RoutedRecognizerSet`, treating each clip as an
+  independent bootstrap "session" (manifest clips are isolated recordings,
+  not a continuous conversation, so this measures the harder bootstrap
+  dual-LID path specifically — `docs/LID.md` table 3's "一致時正解率" is
+  the relevant comparison). Each result gains a `detectedLang` field
+  alongside the existing `hyp`/`ref`, so both language-routing accuracy and
+  per-language CER can be scored. `mobile/lib/main.dart`'s Bench tab gained
+  a matching "Routed multilingual manifest eval" debug panel.
+
+### Accuracy — not yet measured on-device
+
+Unlike the ja-only INT8 quantization work earlier in this document (which
+has full on-emulator CER numbers), **this routing feature has not yet been
+run on the `hayamimi_test` AVD**: `flutter analyze` is clean and all 101
+`hayamimi_core` unit tests pass (including the 21 new dual-LID/sticky-LID
+tests mirroring `tests/test_units.py`), but the actual multilingual
+manifest eval (`testdata/eval_real` ja+en, `testdata/eval_real_zhko` zh+ko)
+through `ManifestEvalRunner.runRouted` on the emulator — the step that
+would produce a routing-accuracy-and-CER comparison table against
+`docs/SCORECARD.md` — was not completed in this task. To reproduce it:
+
+1. Start `hayamimi_test` (`cmd //c "H:\dev\emu_start.bat"`).
+2. Push the three model directories (ReazonSpeech ja int8, SenseVoice int8,
+   whisper-tiny int8) and `testdata/eval_real{,_zhko}/` to
+   `/data/local/tmp`, then `run-as` copy them into the app's
+   `getApplicationDocumentsDirectory()` (same procedure as "On-emulator
+   accuracy parity" above — `MSYS_NO_PATHCONV=1` needed for the `adb`
+   calls on this shell).
+3. Launch the app, open the Bench tab's "Routed multilingual manifest eval"
+   panel, point the three model-directory fields and the manifest/WAV-dir
+   fields at the pushed paths, and run it once per manifest.
+4. `adb pull` the output JSON (has `detected_lang` per clip) and score CER
+   per language with `scripts/eval_accuracy.py`.
+
+### Open items
+
+- On-device peak memory for three simultaneously-loaded models is an
+  estimate (see model sizes above), not a measured RSS number.
+- `resolve_sticky_lang` is ported and tested but unused by the live
+  pipeline (see architecture note above) — it's there for a future tier
+  beyond SenseVoice's 5 languages, not exercised by `jaSenseVoice` today.
+- The emulator has no usable microphone, so the routed live-mic path
+  (as opposed to the routed *manifest* eval, which doesn't need a mic) is
+  exercised only through `LiveTranscriber.runDebugWavRefineTest`'s existing
+  wav-based debug path and the manifest eval above — not through an actual
+  multi-segment live session with real language switches mid-conversation.
+
 ## Next steps for a mobile profile
 
 - Load + accuracy validated on an Android emulator via `sherpa_onnx.dart`

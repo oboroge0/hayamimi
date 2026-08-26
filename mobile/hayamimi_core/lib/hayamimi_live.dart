@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'bench/model_kind.dart';
 import 'live/live_transcriber.dart';
+import 'routing/routing_profile.dart';
 import 'server/subtitle_event.dart';
 
 /// On-device live transcription, packaged as a single [SubtitleEvent]
@@ -31,7 +32,7 @@ class HayamimiLive {
       _eventsController.add(
         FinalSubtitleEvent(
           text: entry.text,
-          lang: lang,
+          lang: entry.lang ?? lang,
           latencyMs: entry.latencyMs,
         ),
       );
@@ -40,7 +41,7 @@ class HayamimiLive {
       _eventsController.add(
         RefineSubtitleEvent(
           text: entry.text,
-          lang: lang,
+          lang: entry.lang ?? lang,
           latencyMs: entry.latencyMs,
         ),
       );
@@ -57,10 +58,17 @@ class HayamimiLive {
   late final StreamSubscription _refineEntriesSubscription;
   late final StreamSubscription _decodingSubscription;
 
-  /// BCP-47-ish language tag stamped on every emitted event. The live
-  /// pipeline runs a single model per session (no per-utterance language
-  /// routing), so this is a simple constant a host app can set once.
+  /// BCP-47-ish language tag stamped on every emitted event that doesn't
+  /// carry its own (i.e. a plain single-model session, or a routed
+  /// session's very first segment before any language has resolved yet —
+  /// see [currentLang]). With [RoutingProfile.jaSenseVoice], each event's
+  /// language instead comes from the segment that produced it.
   String lang = '';
+
+  /// The routed session's current language (`null` for a plain
+  /// single-model session, or before a routed session's first segment
+  /// resolves one). Mirrors [LiveTranscriber.currentLang].
+  String? get currentLang => _transcriber.currentLang;
 
   /// Finalized transcript lines ([FinalSubtitleEvent]) and two-pass
   /// "refine" results ([RefineSubtitleEvent]), in arrival order.
@@ -90,11 +98,17 @@ class HayamimiLive {
     required String modelDir,
     required String vadModelPath,
     ModelKind modelKind = ModelKind.zipformerTransducer,
+    RoutingProfile routingProfile = RoutingProfile.jaOnly,
+    String? senseVoiceModelDir,
+    String? lidModelDir,
   }) {
     return _transcriber.start(
       modelKind: modelKind,
       modelDir: modelDir,
       vadModelPath: vadModelPath,
+      routingProfile: routingProfile,
+      senseVoiceModelDir: senseVoiceModelDir,
+      lidModelDir: lidModelDir,
     );
   }
 

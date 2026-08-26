@@ -75,6 +75,21 @@ class _BenchPageState extends State<BenchPage> {
   String? _manifestError;
   String? _manifestSummary;
 
+  // Routed (multilingual) manifest batch-eval controls (kDebugMode only):
+  // same idea as the manifest eval above, but through RoutingProfile
+  // .jaSenseVoice (ja + SenseVoice en/zh/ko/yue) instead of one recognizer,
+  // so a mixed-language manifest's routing accuracy can be measured. See
+  // docs/MOBILE.md "Multi-language routing on mobile".
+  final _routedReazonDirController = TextEditingController();
+  final _routedSenseVoiceDirController = TextEditingController();
+  final _routedLidDirController = TextEditingController();
+  final _routedManifestPathController = TextEditingController();
+  final _routedWavDirController = TextEditingController();
+  final _routedOutputController = TextEditingController();
+  bool _routedRunning = false;
+  String? _routedError;
+  String? _routedSummary;
+
   ModelKind _modelKind = ModelKind.zipformerTransducer;
   bool _isRunning = false;
   String? _errorText;
@@ -102,6 +117,15 @@ class _BenchPageState extends State<BenchPage> {
       _manifestWavDirController.text = '${docsDir.path}$sep' 'eval_real';
       _manifestOutputController.text =
           '${docsDir.path}${sep}manifest_eval_result.json';
+      _routedReazonDirController.text = '${docsDir.path}$sep' 'model';
+      _routedSenseVoiceDirController.text =
+          '${docsDir.path}$sep' 'sense_voice';
+      _routedLidDirController.text = '${docsDir.path}$sep' 'lid';
+      _routedManifestPathController.text =
+          '${docsDir.path}${sep}eval_real_zhko${sep}manifest.json';
+      _routedWavDirController.text = '${docsDir.path}$sep' 'eval_real_zhko';
+      _routedOutputController.text =
+          '${docsDir.path}${sep}routed_manifest_eval_result.json';
     });
   }
 
@@ -113,6 +137,12 @@ class _BenchPageState extends State<BenchPage> {
     _manifestPathController.dispose();
     _manifestWavDirController.dispose();
     _manifestOutputController.dispose();
+    _routedReazonDirController.dispose();
+    _routedSenseVoiceDirController.dispose();
+    _routedLidDirController.dispose();
+    _routedManifestPathController.dispose();
+    _routedWavDirController.dispose();
+    _routedOutputController.dispose();
     super.dispose();
   }
 
@@ -150,6 +180,48 @@ class _BenchPageState extends State<BenchPage> {
       setState(() => _manifestError = e.toString());
     } finally {
       setState(() => _manifestRunning = false);
+    }
+  }
+
+  Future<void> _runRoutedManifestEval() async {
+    setState(() {
+      _routedRunning = true;
+      _routedError = null;
+      _routedSummary = null;
+    });
+
+    try {
+      final results = await ManifestEvalRunner.runRouted(
+        reazonModelDir: _routedReazonDirController.text.trim(),
+        senseVoiceModelDir: _routedSenseVoiceDirController.text.trim(),
+        lidModelDir: _routedLidDirController.text.trim(),
+        manifestPath: _routedManifestPathController.text.trim(),
+        wavDir: _routedWavDirController.text.trim(),
+      );
+
+      final outputPath = _routedOutputController.text.trim();
+      await File(outputPath).writeAsString(ManifestEvalRunner.toJson(results));
+
+      final langCorrect = results
+          .where((r) => r.detectedLang == r.lang)
+          .length;
+      final langAccuracy = results.isEmpty
+          ? 0.0
+          : langCorrect / results.length * 100;
+      setState(() {
+        _routedSummary =
+            'Decoded ${results.length} clips through ja+SenseVoice '
+            'routing.\n'
+            'Language routing accuracy: $langCorrect/${results.length} '
+            '(${langAccuracy.toStringAsFixed(1)}%)\n'
+            'Wrote results to: $outputPath\n'
+            '(pull with: adb pull $outputPath, then score CER per-language '
+            'with scripts/eval_accuracy.py)';
+      });
+    } catch (e) {
+      setState(() => _routedError = e.toString());
+    } finally {
+      setState(() => _routedRunning = false);
     }
   }
 
@@ -292,6 +364,89 @@ class _BenchPageState extends State<BenchPage> {
                 style: TextStyle(color: Theme.of(context).colorScheme.error),
               ),
             if (_manifestSummary != null) Text(_manifestSummary!),
+            const SizedBox(height: 32),
+            const Divider(),
+            const SizedBox(height: 8),
+            Text(
+              'Routed multilingual manifest eval (debug only)',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const Text(
+              'Decodes every clip in a manifest.json through ja+SenseVoice '
+              'routing (RoutingProfile.jaSenseVoice): each clip is routed '
+              'independently to ReazonSpeech (ja) or SenseVoice '
+              '(en/zh/ko/yue) by the same dual-LID policy the live pipeline '
+              'uses. Reports language-routing accuracy against the '
+              'manifest\'s ground-truth "lang" field; writes a JSON results '
+              'file (with a per-clip "detected_lang") for CER scoring on '
+              'the PC.',
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _routedReazonDirController,
+              decoration: const InputDecoration(
+                labelText: 'ja model directory (ReazonSpeech)',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _routedSenseVoiceDirController,
+              decoration: const InputDecoration(
+                labelText: 'SenseVoice model directory',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _routedLidDirController,
+              decoration: const InputDecoration(
+                labelText: 'whisper-tiny LID model directory',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _routedManifestPathController,
+              decoration: const InputDecoration(
+                labelText: 'manifest.json path (multilingual)',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _routedWavDirController,
+              decoration: const InputDecoration(
+                labelText: 'WAV directory',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _routedOutputController,
+              decoration: const InputDecoration(
+                labelText: 'Output JSON path',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            FilledButton(
+              onPressed: _routedRunning ? null : _runRoutedManifestEval,
+              child: _routedRunning
+                  ? const SizedBox(
+                      height: 20,
+                      width: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Text('Run routed manifest eval'),
+            ),
+            const SizedBox(height: 16),
+            if (_routedError != null)
+              Text(
+                _routedError!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            if (_routedSummary != null) Text(_routedSummary!),
           ],
         ],
       ),

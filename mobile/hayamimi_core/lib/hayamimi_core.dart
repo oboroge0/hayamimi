@@ -29,5 +29,8 @@ export 'live/speech_segment_filter.dart' show isSegmentWorthDecoding;
 export 'remote/remote_handshake.dart';
 export 'remote/remote_transcriber.dart';
 export 'remote/wav_pcm_reader.dart';
+export 'routing/lang_routing.dart';
+export 'routing/routed_recognizer.dart';
+export 'routing/routing_profile.dart';
 export 'server/lan_address.dart';
 export 'server/subtitle_broadcast_server.dart';

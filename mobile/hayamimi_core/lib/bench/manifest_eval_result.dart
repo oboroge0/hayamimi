@@ -12,6 +12,7 @@ class ManifestEvalResult {
     required this.hyp,
     required this.audioDurationSeconds,
     required this.decodeSeconds,
+    this.detectedLang,
   });
 
   final String wav;
@@ -20,6 +21,12 @@ class ManifestEvalResult {
   final String hyp;
   final double audioDurationSeconds;
   final double decodeSeconds;
+
+  /// The language [RoutingProfile.jaSenseVoice] routing resolved this clip
+  /// to, for scoring language-routing accuracy against the manifest's
+  /// ground-truth `lang` field. `null` for a plain (non-routed) manifest
+  /// eval run, where only one model/language was ever in play.
+  final String? detectedLang;
 
   /// Real-time factor for this clip. Not meaningful across devices — see
   /// docs/MOBILE.md's on-emulator accuracy parity note — but useful for
@@ -35,6 +42,7 @@ class ManifestEvalResult {
     'audio_s': audioDurationSeconds,
     'decode_s': decodeSeconds,
     'rtf': rtf,
+    if (detectedLang != null) 'detected_lang': detectedLang,
   };
 
   factory ManifestEvalResult.fromJson(Map<String, Object?> json) {
@@ -45,6 +53,7 @@ class ManifestEvalResult {
       hyp: json['hyp'] as String,
       audioDurationSeconds: (json['audio_s'] as num).toDouble(),
       decodeSeconds: (json['decode_s'] as num).toDouble(),
+      detectedLang: json['detected_lang'] as String?,
     );
   }
 }
