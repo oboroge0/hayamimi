@@ -8,6 +8,9 @@ speech recognition on phones. It has two screens:
   factor — processing time divided by audio duration).
 - **Live** — streams mic audio, cuts it into speech segments with Silero
   VAD, decodes each segment as it finalizes, and shows a running transcript.
+  It can also broadcast that transcript to other apps on the same LAN (see
+  [Other app integration](#other-app-integration-broadcasting-subtitles)
+  below).
 
 ## Status
 
@@ -41,7 +44,19 @@ speech recognition on phones. It has two screens:
   sherpa-onnx's `VoiceActivityDetector`, and the same `OfflineRecognizer`
   the bench uses. Not unit tested (needs a real mic + native libs); built
   from the pure pieces above so most of its logic is covered indirectly.
-- `lib/live/live_page.dart` — the live transcription screen UI.
+- `lib/live/live_page.dart` — the live transcription screen UI, including
+  the "配信サーバー" (broadcast server) toggle.
+- `lib/server/subtitle_event.dart` — pure logic: the `partial`/`final`
+  event value types and their JSON/SSE-frame encoding, wire-compatible with
+  the desktop `scripts/subtitle_server.py`. Unit tested, no I/O.
+- `lib/server/overlay_html.dart` — the transparent OBS overlay page, ported
+  from `scripts/subtitle_server.py`'s `OVERLAY_HTML`.
+- `lib/server/lan_address.dart` — picks a LAN-reachable IPv4 address to show
+  the user; the selection logic (`pickLanAddress`) is pure and unit tested,
+  `currentLanAddress()` wires it to `NetworkInterface.list`.
+- `lib/server/subtitle_broadcast_server.dart` — the actual `dart:io`
+  `HttpServer`: serves the overlay at `/` and an SSE stream at `/events`.
+  Covered by an integration test that binds a real ephemeral port.
 - `lib/main.dart` — top-level app shell with a Bench/Live tab switcher.
 - `test/` — unit tests for the pure logic (`flutter test`).
 
@@ -122,6 +137,50 @@ On Android, first run will prompt for the `RECORD_AUDIO` permission
 `NSMicrophoneUsageDescription` is set in `ios/Runner/Info.plist`; no other
 iOS-specific setup is needed beyond what's already documented above for
 building on macOS.
+
+## Other app integration: broadcasting subtitles
+
+The Live screen can run a small in-app HTTP server so other apps on the
+same Wi-Fi network — an OBS browser source, a browser tab — can subscribe
+to this phone's live transcript. It speaks the exact same protocol as the
+desktop app's `scripts/subtitle_server.py`, so anything that already works
+against the desktop subtitle server works against the phone too:
+
+- `GET /events` — an SSE (`text/event-stream`) feed of JSON events, one
+  `final` event per finalized transcript line:
+  `{"type": "final", "text": ..., "lang": "ja", "speaker": "", "latency_ms": ...}`.
+  (The mobile pipeline decodes whole VAD segments rather than streaming
+  incrementally, so it has no true `partial` events the way the desktop
+  does — see `lib/server/subtitle_event.dart` for the `PartialSubtitleEvent`
+  type kept ready for if/when that changes.)
+- `GET /` — a transparent-background overlay page, drop-in usable as an OBS
+  browser source, identical to the desktop server's `/`.
+
+To use it:
+
+1. Open the **Live** tab and start listening as usual.
+2. Toggle **配信サーバー** on. The app requests no extra permission for
+   this on iOS; on Android it needs `INTERNET`, already declared in the
+   manifest. Once started, the card shows this phone's LAN URL, e.g.
+   `http://192.168.1.42:8833/`.
+3. On another device on the *same* Wi-Fi network: add that URL as an OBS
+   browser source (with a transparent background), or just open it in a
+   browser tab.
+
+Notes and limitations:
+
+- The server binds `0.0.0.0:8833` and only runs while the app is in the
+  foreground with the screen on — there's no Android foreground service
+  backing it, so it stops (along with mic capture) if the app is
+  backgrounded or the screen locks. Fine for the "phone on a tripod next to
+  the streaming PC" use case this targets; a real background service would
+  be a follow-up if always-on capture is ever needed.
+- No auth — anyone on the LAN who has (or guesses) the URL can watch the
+  transcript. Treat it like the desktop server: fine on a trusted home/event
+  network, not something to expose beyond that.
+- `lang` is currently a fixed `"ja"` on every event, since the mobile
+  pipeline runs one model per session rather than the desktop's
+  per-utterance language routing.
 
 ### Getting files onto an Android device/emulator
 
