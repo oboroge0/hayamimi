@@ -285,19 +285,28 @@ def translate_by_sentence(translator, text: str) -> str:
 
 
 def build_translators(langs: str) -> dict:
-    """"en,zh,ko,es" -> {lang: translator}. en uses FuguMT; zh/ko/es use M2M-100."""
+    """"en,zh,ko,es,..." -> {lang: translator}.
+
+    en uses the dedicated FuguMT module; any other target is accepted if
+    M2M-100's vocabulary has a token for it (see
+    translate_m2m.is_supported_target()). Only a subset of those targets have
+    measured translation quality (translate_m2m.VALIDATED_TARGETS) --
+    constructing a translator for an unvalidated target prints a note to
+    stderr but still works.
+    """
     out = {}
     for lang in [x.strip() for x in langs.split(",") if x.strip()]:
         if lang == "en":
             from translate_ja_en import TranslatorJaEn
 
             out["en"] = TranslatorJaEn()
-        elif lang in ("zh", "ko", "es"):
-            from translate_m2m import TranslatorM2M
-
-            out[lang] = TranslatorM2M(lang)
         else:
-            print(f"unsupported translation target: {lang}", file=sys.stderr)
+            from translate_m2m import TranslatorM2M, is_supported_target
+
+            if not is_supported_target(lang):
+                print(f"unsupported translation target: {lang}", file=sys.stderr)
+                continue
+            out[lang] = TranslatorM2M(lang)
     return out
 
 
@@ -508,7 +517,11 @@ def main():
                     help="label utterances with speaker ids (S1, S2, ...)")
     ap.add_argument("--translate", nargs="?", const="en", default=None, metavar="LANGS",
                     help="translate Japanese lines to these languages, comma-separated "
-                         "(en/zh/ko/es; default en). en=FuguMT, zh/ko/es=M2M-100")
+                         "(default en). en=FuguMT; any other M2M-100 target code "
+                         "(zh, ko, es, fr, de, ...) is accepted if the model's vocabulary "
+                         "supports it. Only zh/ko have measured translation quality so far "
+                         "-- other targets print an 'unvalidated' note to stderr, see "
+                         "docs/TRANSLATE_M2M.md")
     ap.add_argument("--input", choices=["mic", "wav", "ws"], default=None,
                     help="audio source; default is mic, or wav if --wav is given")
     ap.add_argument("--ws-host", default="0.0.0.0", metavar="HOST",

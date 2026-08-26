@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from realtime_transcribe import (AudioHistory, PREROLL_S, digits_consistent,
                                  translate_by_sentence)
 import asr_engine
+import translate_m2m
 
 
 class FakeTranslator:
@@ -130,6 +131,50 @@ def test_check_hotwords_encodable_some_found(tmp_path):
 
 def test_check_hotwords_encodable_empty_path():
     assert asr_engine.check_hotwords_encodable("", "tokens.txt") == (0, 0)
+
+
+# ---- M2M-100 target acceptance / validation tiers ---------------------------
+
+def test_is_supported_target_accepts_known_m2m100_codes():
+    # __zh__ / __ko__ / __es__ / __fr__ all exist in the model's own vocabulary.
+    assert translate_m2m.is_supported_target("zh")
+    assert translate_m2m.is_supported_target("ko")
+    assert translate_m2m.is_supported_target("es")
+    assert translate_m2m.is_supported_target("fr")
+
+
+def test_is_supported_target_rejects_unknown_code():
+    assert not translate_m2m.is_supported_target("xx")
+    assert not translate_m2m.is_supported_target("not-a-lang-code")
+
+
+def test_is_supported_target_missing_model_dir_returns_false():
+    # A bad model_dir must fail closed (no vocab file to check against), not raise.
+    assert not translate_m2m.is_supported_target("zh", model_dir="/no/such/dir")
+
+
+def test_validated_targets_are_a_subset_of_supported():
+    for lang in translate_m2m.VALIDATED_TARGETS:
+        assert translate_m2m.is_supported_target(lang), f"{lang} is VALIDATED but not accepted by the model"
+
+
+def test_validated_targets_tier_matches_measured_set():
+    # zh/ko/es have measured chrF (docs/TRANSLATE_M2M.md); an arbitrary M2M-100
+    # target with no measurement (e.g. fr) must stay out of the validated tier.
+    assert {"zh", "ko", "es"} <= translate_m2m.VALIDATED_TARGETS
+    assert "fr" not in translate_m2m.VALIDATED_TARGETS
+
+
+def test_translator_rejects_unsupported_target_before_loading_model():
+    with pytest.raises(ValueError):
+        translate_m2m.TranslatorM2M("xx")
+
+
+def test_default_beam_size_used_for_unvalidated_targets():
+    # es/fr etc. have no dedicated entry in BEAM_SIZE_BY_TARGET; they must fall
+    # back to DEFAULT_BEAM_SIZE rather than KeyError.
+    assert translate_m2m.BEAM_SIZE_BY_TARGET.get("fr", translate_m2m.DEFAULT_BEAM_SIZE) == translate_m2m.DEFAULT_BEAM_SIZE
+    assert "es" not in translate_m2m.BEAM_SIZE_BY_TARGET  # measured via the fallback, not a dedicated tuning
 
 
 # ---- routing table consistency --------------------------------------------

@@ -1,8 +1,21 @@
-"""Japanese -> multilingual (zh / ko / en / es) subtitle translation module.
+"""Japanese -> multilingual (any M2M-100 target) subtitle translation module.
 
 Uses M2M-100 418M (facebook/m2m100_418M), converted to CTranslate2 int8 by
 the Mojicast project (ishiki-emo/mojicast-m2m100-ct2, MIT license).
 See docs/TRANSLATE_M2M.md for model source, license, and measured latency.
+
+Target acceptance and validation tiers:
+- Any target language present in the model's own vocabulary (i.e. one with an
+  `__<lang>__` token in `shared_vocabulary.json`) is accepted --
+  `is_supported_target()` checks this directly against the model files rather
+  than a hardcoded allowlist, so this module works for any of M2M-100's ~100
+  languages without code changes.
+- Only a subset of those targets have been *measured* for translation
+  quality against a reference (see `scripts/eval_translate.py` and
+  docs/TRANSLATE_M2M.md's "Validation tiers" section). `VALIDATED_TARGETS`
+  tracks that subset. Constructing a `TranslatorM2M` for a target outside
+  `VALIDATED_TARGETS` prints a one-line note to stderr -- it still works
+  (M2M-100 is trained on all these languages), just with unmeasured quality.
 
 Design notes (mirroring scripts/translate_ja_en.py):
 - M2M-100 is a multilingual model: the source SentencePiece tokens must be
@@ -26,7 +39,9 @@ Design notes (mirroring scripts/translate_ja_en.py):
 
 from __future__ import annotations
 
+import json
 import os
+import sys
 import time
 
 import ctranslate2
@@ -37,15 +52,56 @@ _MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 SOURCE_LANG_TOKEN = "__ja__"
 EOS_TOKEN = "</s>"
 
+# Targets with a *measured* chrF score against a FLEURS reference (see
+# scripts/eval_translate.py and docs/TRANSLATE_M2M.md's "Validation tiers"
+# section). Any other M2M-100 target is still accepted (see
+# is_supported_target() below) but its quality has not been checked.
+VALIDATED_TARGETS = {"zh", "ko", "es"}
+
 # Per-target settings, matching Mojicast's reported configuration (zh:
 # greedy, ko: beam_size=4). See docs/TRANSLATE_M2M.md for the measurements
-# that confirmed these hold up on this specific model conversion.
+# that confirmed these hold up on this specific model conversion. Targets not
+# listed here fall back to DEFAULT_BEAM_SIZE (untuned).
 BEAM_SIZE_BY_TARGET = {
     "zh": 1,
     "ko": 4,
     "en": 1,
-    "es": 1,
 }
+# Fallback beam size for a target not in BEAM_SIZE_BY_TARGET. Matches ko's
+# beam_size=4 (the more cautious of the two measured settings) rather than
+# zh's greedy beam_size=1, since it has not been re-measured per-target --
+# see docs/TRANSLATE_M2M.md.
+DEFAULT_BEAM_SIZE = 4
+
+_vocab_cache: "dict[str, set[str]]" = {}
+
+
+def _load_vocab(model_dir: str = _MODEL_DIR) -> "set[str]":
+    """Load (and cache) the set of token strings in the model's CTranslate2 vocabulary."""
+    if model_dir not in _vocab_cache:
+        vocab_path = os.path.join(model_dir, "shared_vocabulary.json")
+        with open(vocab_path, "r", encoding="utf-8") as f:
+            tokens = json.load(f)
+        _vocab_cache[model_dir] = set(tokens)
+    return _vocab_cache[model_dir]
+
+
+def is_supported_target(lang: str, model_dir: str = _MODEL_DIR) -> bool:
+    """True if the model's vocabulary has a `__<lang>__` target-language token.
+
+    This is a direct check against shared_vocabulary.json rather than a
+    hardcoded allowlist, so any of M2M-100's ~100 target languages that this
+    CTranslate2 conversion actually supports is accepted -- see the module
+    docstring for the distinction between "supported" (accepted here) and
+    "validated" (quality-measured, tracked in VALIDATED_TARGETS).
+    """
+    try:
+        vocab = _load_vocab(model_dir)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return f"__{lang}__" in vocab
+
+
 # NOTE: Mojicast's report says no_repeat_ngram_size=3 "eliminated" repetition
 # loops for their conversion. Re-measured here on filler-heavy casual lines
 # (e.g. "そうそう、そうなんだよね。" and a longer hesitation-filled line):
@@ -73,13 +129,22 @@ class TranslatorM2M:
         device: str = "cpu",
         compute_type: str = "int8",
     ):
-        if target_lang not in BEAM_SIZE_BY_TARGET:
-            raise ValueError(f"Unsupported target_lang: {target_lang!r} (supported: {sorted(BEAM_SIZE_BY_TARGET)})")
+        if not is_supported_target(target_lang, model_dir):
+            raise ValueError(
+                f"Unsupported target_lang: {target_lang!r} "
+                f"(no __{target_lang}__ token in {model_dir}'s shared_vocabulary.json)"
+            )
+        if target_lang not in VALIDATED_TARGETS:
+            print(
+                f"note: {target_lang!r} is an unvalidated translation target "
+                "(quality not yet measured; see docs/TRANSLATE_M2M.md)",
+                file=sys.stderr,
+            )
 
         self.target_lang = target_lang
         self.model_dir = model_dir
         self._target_token = f"__{target_lang}__"
-        self._beam_size = BEAM_SIZE_BY_TARGET[target_lang]
+        self._beam_size = BEAM_SIZE_BY_TARGET.get(target_lang, DEFAULT_BEAM_SIZE)
 
         sp_path = os.path.join(model_dir, "sentencepiece.model")
         self._sp = spm.SentencePieceProcessor(model_file=sp_path)

@@ -1,20 +1,45 @@
-# Japanese -> Chinese / Korean (/ English) Subtitle Translation (M2M-100)
+# Japanese -> Multilingual Subtitle Translation (M2M-100)
 
 `scripts/translate_m2m.py` provides `TranslatorM2M(target_lang)`, a small
 wrapper around a CTranslate2-converted M2M-100 418M multilingual model for
-translating live subtitle lines from Japanese into Chinese (`zh`), Korean
-(`ko`), or English (`en`, included for completeness/comparison against
-`translate_ja_en.py`'s dedicated FuguMT module).
+translating live subtitle lines from Japanese into any of the ~100 target
+languages M2M-100 was trained on (Chinese `zh`, Korean `ko`, Spanish `es`,
+French `fr`, ... -- see below), or English (`en`, included for
+completeness/comparison against `translate_ja_en.py`'s dedicated FuguMT
+module).
 
-Not yet wired into `asr_engine.py` / `realtime_transcribe.py` /
-`subtitle_server.py` -- integration is a separate step.
+Wired into `--translate` in `scripts/realtime_transcribe.py` (`build_translators()`).
+
+## Target acceptance vs. validation
+
+Any target language whose `__<lang>__` token exists in the model's own
+`shared_vocabulary.json` is **accepted** -- `translate_m2m.is_supported_target(lang)`
+checks this directly against the model files (no hardcoded allowlist), so
+`TranslatorM2M(target_lang)` and `--translate LANGS` work for any of
+M2M-100's ~100 languages the moment this model conversion supports them.
+
+Acceptance is not the same as **quality having been measured**. Only a
+subset of targets have a chrF score against a real reference (see
+"Validation tiers" below), tracked in `translate_m2m.VALIDATED_TARGETS`.
+Constructing a `TranslatorM2M` for a target outside that set still works,
+but prints:
+
+```
+note: 'fr' is an unvalidated translation target (quality not yet measured; see docs/TRANSLATE_M2M.md)
+```
+
+to stderr. `BEAM_SIZE_BY_TARGET` similarly only has tuned entries for zh/ko/en;
+any other target falls back to `DEFAULT_BEAM_SIZE` (4, matching ko's more
+cautious setting) rather than a per-language-tuned value.
 
 ## Model
 
 - **Base model**: [`facebook/m2m100_418M`](https://huggingface.co/facebook/m2m100_418M)
   (Meta AI, Fan et al., "Beyond English-Centric Multilingual Machine
-  Translation"). A single multilingual model covering ~100 languages, used
-  here only for ja->{zh,ko,en}.
+  Translation"). A single multilingual model covering ~100 languages; this
+  module accepts ja->any target the model's vocabulary supports (see
+  "Target acceptance vs. validation" above), with zh/ko/en/es exercised and
+  measured so far.
 - **CTranslate2 conversion used**:
   [`ishiki-emo/mojicast-m2m100-ct2`](https://huggingface.co/ishiki-emo/mojicast-m2m100-ct2) --
   the conversion published by the Mojicast project. Confirmed to exist and
@@ -163,6 +188,90 @@ configuration, no per-call CTranslate2 tuning (`inter_threads`/
 `intra_threads`) applied yet, and this machine simply being slower per-call
 than Mojicast's reference hardware. Worth revisiting with `inter_threads`
 tuning when this is wired into the realtime pipeline.
+
+## Validation tiers
+
+`scripts/eval_translate.py` runs an automatic quality check against
+[FLEURS](https://huggingface.co/datasets/google/fleurs) (`google/fleurs`),
+which is **n-way parallel**: the same integer sentence `id` refers to the same
+underlying sentence across every language config in a given split. This makes
+it usable as a translation reference set even though it was built for ASR
+evaluation, not MT: for a candidate target language, pull `ja_jp`'s
+`raw_transcription` and the target config's `raw_transcription` for matching
+ids, run each Japanese sentence through `TranslatorM2M(target_lang)`, and
+score the output against the FLEURS reference with
+[sacrebleu](https://github.com/mjpost/sacrebleu)'s **chrF** (character
+n-gram F-score -- chosen over BLEU because it doesn't depend on
+whitespace-delimited word tokenization, which matters for zh/ko/ja).
+
+### Procedure
+
+```
+python scripts/eval_translate.py --targets zh,ko,es --n 50
+```
+
+- Loads `ja_jp` and the target's FLEURS config (`validation` split) via a
+  **column-projected remote parquet read** (`fsspec` + `pyarrow`, reading only
+  the `id` and `raw_transcription` columns straight off the Hub) rather than
+  the `datasets-server` "rows" API used by `scripts/make_realset_zhko.py`.
+  This was a deliberate substitution: FLEURS parquet shards embed audio
+  arrays, and some configs' shards exceed `datasets-server`'s 300MB
+  per-request scan cap even for a handful of rows -- confirmed here for
+  `es_419` (`Parquet error: Scan size limit exceeded: attempted to read
+  307959544 bytes, limit is 300000000 bytes`) on **every** split (train/
+  validation/test), not just `test` as with zh's Mandarin config in
+  `make_realset_zhko.py`. Reading only the two needed columns sidesteps the
+  cap entirely (a few MB transferred regardless of the file's total size,
+  confirmed by direct measurement: the ~308MB `es_419` validation parquet
+  loaded in ~1s) and works uniformly for every target, so no per-language
+  split workaround is needed and the `datasets` library was not required.
+  `pyarrow` was added to `requirements-dev.txt` for this; `fsspec` /
+  `requests` / `aiohttp` were already present as transitive deps of
+  `huggingface_hub`.
+- Matches ids present in both configs, samples up to `--n` of them
+  (default 50, seeded, deterministic), translates each ja sentence, and
+  reports both per-sentence and corpus-level chrF.
+
+### Measured results (validation split, n=50, seed=0)
+
+| Target | chrF (corpus) | mean latency | Status |
+|---|---|---|---|
+| zh | 20.19 | 664 ms/line | validated (existing) |
+| ko | 25.20 | 963 ms/line | validated (existing) |
+| es | **42.09** | 1013 ms/line | **validated (promoted here)** |
+
+Full command: `python scripts/eval_translate.py --targets zh,ko,es --n 50`.
+
+### Promotion decision: es
+
+`es` scored **higher** than both existing validated targets (42.09 vs. 20.19
+zh / 25.20 ko), not merely "at the same level" -- so it clears the bar for
+promotion into `VALIDATED_TARGETS` (now `{"zh", "ko", "es"}` in
+`scripts/translate_m2m.py`).
+
+Caveat on comparing chrF *across* target languages: chrF is a character
+n-gram overlap metric, and its practical ceiling differs by script and
+typology, independent of translation quality. Spanish uses the same Latin
+alphabet M2M-100's subword vocabulary was heavily trained on and shares much
+more surface-level structure with the source-adjacent English-centric
+training distribution than logographic Chinese or agglutinative Korean do,
+so higher absolute chrF for `es` is expected even for comparable underlying
+translation quality -- it is not proof that `es` translations are "twice as
+good" as `zh`'s in any human-judged sense. What the comparison *does*
+establish is the thing the promotion rule cares about: `es` is not an outlier
+producing garbage output relative to the model's already-shipped targets,
+which is what "same level as existing validated targets" is meant to guard
+against. Spot-checking the printed per-sentence output (see the sample lines
+above the summary table when running the script) confirms the `es` output is
+fluent, mostly faithful full-sentence translation -- consistent with the
+higher chrF, not an artifact of the metric.
+
+### Network access note
+
+`scripts/eval_translate.py` requires network access to
+`huggingface.co` (parquet files, no auth). FLEURS access worked without
+issue in this environment; no alternative corpus (e.g. TED-based parallel
+data) was needed.
 
 ## Known limitations
 
