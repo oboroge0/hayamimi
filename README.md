@@ -107,7 +107,8 @@ All flags are on `scripts/realtime_transcribe.py`:
 | `--transcript PATH` | none | append refined transcript lines to this file |
 | `--hotwords PATH` | none | hotword list (one per line) to bias Japanese decoding toward proper nouns |
 | `--replace PATH` | none | user dictionary: `wrong=right` per line, applied to all output |
-| `--lang-switch-guard SEC` | 2.0 | treat a new-language detection shorter than this as noise and keep the session language (`0` disables) |
+| `--lang-switch-guard SEC` | 2.0 | treat a new-language detection shorter than this as noise: it can never count toward confirming a switch (see `--lid-switch-confirm`) and it suppresses the omnilingual fallback on an empty decode (`0` disables) |
+| `--lid-switch-confirm N` | 2 | consecutive new-language detections (each >= `--lang-switch-guard` long) required before the session actually switches language; raise for stickier single-language sessions |
 | `--speakers` | off | label utterances with speaker ids (S1, S2, ...) |
 | `--translate [LANGS]` | off, `en` | translate Japanese lines to these comma-separated languages (`en`/`zh`/`ko`) |
 
@@ -190,12 +191,12 @@ Headline numbers from that log:
   Utterance-level switching (e.g. an interpreter alternating full sentences)
   works well; word-level switching within one sentence does not.
 - **Very short utterances after a jingle/sting/BGM burst can misroute.**
-  The language-switch guard (`--lang-switch-guard`) mitigates this but a
-  session's very first utterance (before any session language is
-  established) and confidently-wrong LID+decode combinations (where the
-  garbled text happens to match the wrong language's character set) are
-  known blind spots -- see `docs/BENCHMARKS.md`'s iteration #29 for a
-  quantified before/after.
+  The language-switch guard (`--lang-switch-guard`, paired with
+  `--lid-switch-confirm`) mitigates this but a session's very first
+  utterance (before any session language is established) and
+  confidently-wrong LID+decode combinations (where the garbled text happens
+  to match the wrong language's character set) are known blind spots -- see
+  `docs/BENCHMARKS.md`'s iteration #29 for a quantified before/after.
 - **Two overlapping speakers are not separated.** `--speakers` does
   turn-taking speaker labeling (one embedding per finalized VAD segment,
   nearest-centroid assignment), not true diarization -- simultaneous speech

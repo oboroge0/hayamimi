@@ -220,3 +220,64 @@ def test_sticky_switch_confirm_one_disables_hysteresis():
         "en", "ja", 3.0, 2.0, 1, None, 0)
     assert lang == "en"
     assert (pend, cnt) == (None, 0)
+
+
+# ---- --lang-switch-guard actually gates switching (issue #2) ---------------
+
+def test_sticky_short_detection_never_advances_pending_count():
+    # A detection shorter than min_switch_s must not count toward
+    # switch_confirm at all -- otherwise raising --lang-switch-guard would
+    # have no effect on whether the session switches (issue #2).
+    lang, suppress, pend, cnt = asr_engine.resolve_sticky_lang(
+        "zh", "ja", 1.9, 10.0, 2, None, 0)
+    assert lang == "ja"
+    assert suppress is True
+    assert (pend, cnt) == (None, 0)  # no candidate accumulated
+
+
+def test_sticky_short_detections_never_confirm_a_switch():
+    # Reporter's scenario (issue #2): a ja-only session hit by repeated
+    # short zh misfires under a large guard must stay on ja no matter how
+    # many short misfires land in a row, because none of them ever advance
+    # the confirmation counter.
+    lang, pend, cnt = "ja", None, 0
+    for speech_s in (9.1, 1.9, 1.5, 1.5):
+        lang, suppress, pend, cnt = asr_engine.resolve_sticky_lang(
+            "zh", "ja", speech_s, 10.0, 2, pend, cnt)
+        assert lang == "ja"
+        assert suppress is True
+        assert (pend, cnt) == (None, 0)
+
+
+def test_sticky_short_detection_does_not_reset_a_real_candidate():
+    # A long (real) candidate detection starts accumulating...
+    lang1, _, pend1, cnt1 = asr_engine.resolve_sticky_lang(
+        "en", "ja", 3.0, 2.0, 2, None, 0)
+    assert (pend1, cnt1) == ("en", 1)
+
+    # ...and a short, unrelated blip must not wipe it out.
+    lang2, suppress2, pend2, cnt2 = asr_engine.resolve_sticky_lang(
+        "zh", "ja", 0.5, 2.0, 2, pend1, cnt1)
+    assert lang2 == "ja"
+    assert suppress2 is True
+    assert (pend2, cnt2) == ("en", 1)  # unchanged
+
+    # The original candidate can still confirm on its next long detection.
+    lang3, suppress3, pend3, cnt3 = asr_engine.resolve_sticky_lang(
+        "en", "ja", 3.0, 2.0, 2, pend2, cnt2)
+    assert lang3 == "en"
+    assert (pend3, cnt3) == (None, 0)
+
+
+def test_sticky_long_detections_still_confirm_a_switch_under_large_guard():
+    # Detections at or above the guard length behave exactly as before:
+    # switch_confirm consecutive ones confirm a genuine switch.
+    lang1, _, pend1, cnt1 = asr_engine.resolve_sticky_lang(
+        "zh", "ja", 10.0, 10.0, 2, None, 0)
+    assert (pend1, cnt1) == ("zh", 1)
+
+    lang2, suppress2, pend2, cnt2 = asr_engine.resolve_sticky_lang(
+        "zh", "ja", 10.0, 10.0, 2, pend1, cnt1)
+    assert lang2 == "zh"
+    assert suppress2 is False
+    assert (pend2, cnt2) == (None, 0)

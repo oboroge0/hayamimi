@@ -164,10 +164,26 @@ def resolve_sticky_lang(
     the session onto a wrong language). This costs a genuine switch at most
     `switch_confirm - 1` segments of latency.
 
+    `min_switch_s` (--lang-switch-guard) is the noise filter on each
+    individual candidate detection: a new-language segment shorter than this
+    is presumed non-speech (jingle/SFX/misfire) and does NOT advance the
+    switch_confirm counter at all -- it neither starts nor extends a
+    pending candidate, and it doesn't reset one either, since a real
+    candidate already accumulating shouldn't be wiped out by an unrelated
+    short blip. This is what makes --lang-switch-guard actually control
+    switch stickiness (GitHub issue #2): only detections at or above the
+    guard length can ever confirm a switch. It also suppresses the
+    omnilingual fallback for that segment, so a held language's empty
+    decode isn't resurrected by it.
+
     Returns (resolved_lang, suppress_fallback, new_pending_lang, new_pending_count).
     """
     if last_lang is None or lang == last_lang:
         return lang, False, None, 0
+
+    is_short = speech_s is not None and speech_s < min_switch_s
+    if is_short:
+        return last_lang, True, pending_lang, pending_count
 
     if lang == pending_lang:
         pending_count += 1
@@ -175,14 +191,11 @@ def resolve_sticky_lang(
         pending_lang, pending_count = lang, 1
 
     if pending_count < switch_confirm:
-        # Hold the session language for this segment. If it's a
-        # sub-min_switch_s blip, it's presumed non-speech (jingle/SFX): an
-        # empty decode under the held language must not be resurrected by
-        # the omni fallback. A longer hold is presumed genuine speech
-        # merely under the wrong tier's model, so let the omni fallback
-        # have a shot if that specialist draws a blank.
-        is_short = speech_s is not None and speech_s < min_switch_s
-        return last_lang, is_short, pending_lang, pending_count
+        # Hold the session language for this segment; it's a genuine-speech
+        # candidate (>= min_switch_s) merely decoded under the wrong tier's
+        # model, so let the omni fallback have a shot if that specialist
+        # draws a blank.
+        return last_lang, False, pending_lang, pending_count
 
     return lang, False, None, 0
 

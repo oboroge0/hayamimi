@@ -462,8 +462,14 @@ def main():
     ap.add_argument("--replace", metavar="PATH", default="",
                     help="user dictionary: 'wrong=right' per line, applied to all output")
     ap.add_argument("--lang-switch-guard", type=float, default=2.0, metavar="SEC",
-                    help="treat a new-language detection shorter than SEC as noise and keep "
-                         "the session language (0 disables; raise for single-language streams)")
+                    help="treat a new-language detection shorter than SEC as noise: it never "
+                         "counts toward confirming a switch (see --lid-switch-confirm) and it "
+                         "suppresses the omnilingual fallback on an empty decode "
+                         "(0 disables; raise for single-language streams)")
+    ap.add_argument("--lid-switch-confirm", type=int, default=2, metavar="N",
+                    help="consecutive same-language detections (each >= --lang-switch-guard "
+                         "long) required before the session switches to a new language; "
+                         "raise for stickier single-language sessions")
     ap.add_argument("--speakers", action="store_true",
                     help="label utterances with speaker ids (S1, S2, ...)")
     ap.add_argument("--translate", nargs="?", const="en", default=None, metavar="LANGS",
@@ -482,7 +488,8 @@ def main():
     print("loading models...", file=sys.stderr)
     asr = RoutedASR(threads=args.threads,
                     max_resident=args.max_resident if args.max_resident > 0 else None,
-                    hotwords_file=args.hotwords, replace_file=args.replace)
+                    hotwords_file=args.hotwords, replace_file=args.replace,
+                    lid_switch_confirm=max(args.lid_switch_confirm, 1))
     asr.min_switch_s = max(args.lang_switch_guard, 0.0)
     vad = build_vad(args.min_silence, args.max_speech)
     stats = SessionStats()
