@@ -224,6 +224,11 @@ Headline numbers from that log:
   confidently-wrong LID+decode combinations (where the garbled text happens
   to match the wrong language's character set) are known blind spots -- see
   `docs/BENCHMARKS.md`'s iteration #29 for a quantified before/after.
+  `--lid-switch-confirm 1 --lang-switch-guard 0` fully disables the sticky
+  hysteresis (every detection switches the session immediately), trading
+  noise robustness for maximum responsiveness -- useful when validating
+  whether the lock itself, rather than its tuning, is the right call for
+  your setup.
 - **`--hotwords` currently has no effect on the ja (ReazonSpeech) tier.**
   ReazonSpeech's `tokens.txt` is byte-level BPE, incompatible with the
   `modeling_unit=cjkchar` encoding hayamimi uses for hotwords, so every

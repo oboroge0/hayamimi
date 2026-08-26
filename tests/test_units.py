@@ -297,6 +297,27 @@ def test_sticky_switch_confirm_one_disables_hysteresis():
     assert (pend, cnt) == (None, 0)
 
 
+def test_switch_confirm_one_and_guard_zero_fully_disable_the_lock():
+    # --lid-switch-confirm 1 --lang-switch-guard 0: the combination that
+    # should turn the sticky-LID lock fully off. A single misfire to "zh"
+    # (even a very short one -- guard=0 means min_switch_s=0.0, so no
+    # detection is ever "too short" to count) switches immediately, and the
+    # very next detection back to "ja" switches back immediately too. This
+    # is the escape hatch for validating whether the lock -- not just its
+    # tuning -- is the right call for a given setup.
+    lang1, suppress1, pend1, cnt1 = asr_engine.resolve_sticky_lang(
+        "zh", "ja", 0.3, 0.0, 1, None, 0)
+    assert lang1 == "zh"
+    assert suppress1 is False
+    assert (pend1, cnt1) == (None, 0)
+
+    lang2, suppress2, pend2, cnt2 = asr_engine.resolve_sticky_lang(
+        "ja", "zh", 0.3, 0.0, 1, pend1, cnt1)
+    assert lang2 == "ja"
+    assert suppress2 is False
+    assert (pend2, cnt2) == (None, 0)
+
+
 # ---- --lang-switch-guard actually gates switching (issue #2) ---------------
 
 def test_sticky_short_detection_never_advances_pending_count():

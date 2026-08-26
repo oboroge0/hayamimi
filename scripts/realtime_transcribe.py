@@ -148,7 +148,7 @@ class PartialPrinter:
             print("\r~ " + text + " " * pad, end="", flush=True)
             self._last_len = len(text)
         else:
-            print(f"~ {text}")
+            print(f"~ {text}", flush=True)
 
     def clear(self):
         if self.enabled and self._tty and self._last_len:
@@ -239,7 +239,7 @@ def drain_segments(vad, sample_rate: int, asr: RoutedASR, stats: SessionStats,
                                  latency_ms, result.get("tier", ""))
         print(f"[{speaker}{result['lang']}/{result.get('tier', '?')}] {result['text']}  "
               f"(seg={seg_s:.1f}s, lid={result['lid_ms']:.0f}ms, "
-              f"decode={result['decode_ms']:.0f}ms, latency={latency_ms:.0f}ms)")
+              f"decode={result['decode_ms']:.0f}ms, latency={latency_ms:.0f}ms)", flush=True)
         if translator_worker is not None and result["lang"] == "ja" and result["text"].strip():
             translator_worker.submit(result["text"])
         if spans_out is not None:
@@ -328,7 +328,7 @@ class TranslationWorker:
             for lang, tr in self._translators.items():
                 out = safe_translate(tr, text)
                 if out != text:  # fallback returns the source: nothing worth showing
-                    print(f"[→{lang}] {out}")
+                    print(f"[→{lang}] {out}", flush=True)
                     if self._server is not None:
                         self._server.publish({"type": "translation", "lang": lang, "text": out})
 
@@ -405,7 +405,7 @@ class Refiner:
                 if not text.strip():
                     return
                 tag = f"{speaker}|{lang}" if speaker else lang
-                print(f"[refine/{tag}] {text}")
+                print(f"[refine/{tag}] {text}", flush=True)
                 if self.printer.server is not None:
                     self.printer.server.publish({"type": "refine", "text": text, "lang": lang,
                                                  "speaker": speaker})
@@ -418,7 +418,7 @@ class Refiner:
                     for tlang, tr in self.translators.items():
                         out = translate_by_sentence(tr, text)
                         if out and out != text:
-                            print(f"[refine→{tlang}] {out}")
+                            print(f"[refine→{tlang}] {out}", flush=True)
                             outs.append((tlang, out))
                 if self._transcript is not None:
                     prefix = f"{speaker}: " if speaker else ""

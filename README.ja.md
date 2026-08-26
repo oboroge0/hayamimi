@@ -204,7 +204,10 @@ python -m venv .venv
 - **効果音やBGMの直後の短い発話は、言語判定を外すことがあります。** ガード機構
   （`--lang-switch-guard`と`--lid-switch-confirm`の組み合わせ）である程度抑えていますが、
   起動直後の1発話目などは外すことがあります。どの程度外すかは`docs/BENCHMARKS.md`の
-  イテレーション#29に実測があります。
+  イテレーション#29に実測があります。`--lid-switch-confirm 1 --lang-switch-guard 0`で
+  この粘着ヒステリシスを完全に無効化できます（判定ごとに即切り替え）。ノイズ耐性と
+  引き換えに応答性を最大化する設定で、ロック機構自体が自分のセットアップに合っているか
+  検証したいときに使えます。
 - **`--hotwords`は現状jaルート（ReazonSpeech）に効きません。** ReazonSpeechの
   `tokens.txt`はbyte-level BPEで、hayamimiがホットワードのエンコードに使う
   `modeling_unit=cjkchar`と非互換のため、全ホットワードがエンコードに失敗します
