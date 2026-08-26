@@ -10,3 +10,7 @@ session.txt
 Thumbs.db
 .claude/
 .playwright-mcp/
+
+# firmware/stackchan (PlatformIO)
+firmware/stackchan/.pio/
+firmware/stackchan/include/config.h
