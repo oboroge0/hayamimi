@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa_onnx;
 
+import '../routing/routed_recognizer.dart';
 import 'bench_runner.dart';
 import 'manifest_eval_result.dart';
 
@@ -94,6 +95,95 @@ class ManifestEvalRunner {
       }
     } finally {
       recognizer.free();
+    }
+    return results;
+  }
+
+  /// Decodes every entry in [manifestPath] through [RoutingProfile
+  /// .jaSenseVoice] routing (ReazonSpeech ja + SenseVoice en/zh/ko/yue,
+  /// arbitrated per clip by the dual-LID policy in `../routing/`), so a
+  /// multilingual manifest's language-routing accuracy and CER can be
+  /// compared against the PC pipeline's `docs/SCORECARD.md`.
+  ///
+  /// Each entry is treated as its own isolated "session" (bootstrap: no
+  /// prior language) since manifest clips are independent recordings, not
+  /// a continuous conversation — this measures the dual-LID bootstrap path
+  /// specifically, which `docs/LID.md` table 3 shows is the harder case.
+  ///
+  /// Throws [BenchRunException] if the manifest or any model/wav file
+  /// cannot be found/read.
+  static Future<List<ManifestEvalResult>> runRouted({
+    required String reazonModelDir,
+    required String senseVoiceModelDir,
+    required String lidModelDir,
+    required String manifestPath,
+    required String wavDir,
+    int numThreads = 2,
+  }) async {
+    final manifestFile = File(manifestPath);
+    if (!await manifestFile.exists()) {
+      throw BenchRunException('Manifest file not found: $manifestPath');
+    }
+
+    final List<dynamic> raw;
+    try {
+      raw = jsonDecode(await manifestFile.readAsString()) as List<dynamic>;
+    } on FormatException catch (e) {
+      throw BenchRunException('Failed to parse manifest JSON: $e');
+    }
+    final entries = [
+      for (final item in raw)
+        ManifestEntry.fromJson((item as Map).cast<String, Object?>()),
+    ];
+
+    final RoutedRecognizerSet routed;
+    try {
+      routed = await RoutedRecognizerSet.build(
+        reazonModelDir: reazonModelDir,
+        senseVoiceModelDir: senseVoiceModelDir,
+        lidModelDir: lidModelDir,
+        numThreads: numThreads,
+      );
+    } on RoutedRecognizerException catch (e) {
+      throw BenchRunException(e.message);
+    }
+
+    final results = <ManifestEvalResult>[];
+    try {
+      final sep = Platform.pathSeparator;
+      for (final entry in entries) {
+        final wavPath = '$wavDir$sep${entry.wav}';
+        final wave = sherpa_onnx.readWave(wavPath);
+        if (wave.samples.isEmpty) {
+          throw BenchRunException(
+            'Failed to read WAV file (unsupported format, empty, or '
+            'missing): $wavPath',
+          );
+        }
+        final audioDurationSeconds = wave.samples.length / wave.sampleRate;
+
+        // Each manifest clip is its own bootstrap session (see doc comment
+        // above): reset the routed language before every clip.
+        routed.currentLang = null;
+
+        final stopwatch = Stopwatch()..start();
+        final result = routed.decode(wave.samples);
+        stopwatch.stop();
+
+        results.add(
+          ManifestEvalResult(
+            wav: entry.wav,
+            lang: entry.lang,
+            ref: entry.ref,
+            hyp: result.text,
+            audioDurationSeconds: audioDurationSeconds,
+            decodeSeconds: stopwatch.elapsedMicroseconds / 1e6,
+            detectedLang: result.lang,
+          ),
+        );
+      }
+    } finally {
+      routed.free();
     }
     return results;
   }

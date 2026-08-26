@@ -18,6 +18,8 @@ class LivePage extends StatefulWidget {
 class _LivePageState extends State<LivePage> {
   final _modelDirController = TextEditingController();
   final _vadModelPathController = TextEditingController();
+  final _senseVoiceModelDirController = TextEditingController();
+  final _lidModelDirController = TextEditingController();
   final _scrollController = ScrollController();
 
   final _transcriber = LiveTranscriber();
@@ -30,6 +32,11 @@ class _LivePageState extends State<LivePage> {
   bool _isStarting = false;
   bool _isDecoding = false;
   String? _errorText;
+
+  // Multilingual routing (see docs/MOBILE.md "Multi-language routing on
+  // mobile"): off by default (single ja model, unchanged prior behavior).
+  // Switching this needs senseVoiceModelDir/lidModelDir filled in too.
+  RoutingProfile _routingProfile = RoutingProfile.jaOnly;
 
   // Two-pass "refine" (清書): see lib/live/refine_pass.dart for why the
   // trigger conditions and defaults are what they are.
@@ -88,6 +95,9 @@ class _LivePageState extends State<LivePage> {
           '${docsDir.path}$sep'
           'vad$sep'
           'silero_vad.onnx';
+      _senseVoiceModelDirController.text =
+          '${docsDir.path}$sep' 'sense_voice';
+      _lidModelDirController.text = '${docsDir.path}$sep' 'lid';
       _debugWavPathController.text = '${docsDir.path}${sep}test.wav';
     });
   }
@@ -208,6 +218,13 @@ class _LivePageState extends State<LivePage> {
         modelKind: _modelKind,
         modelDir: _modelDirController.text.trim(),
         vadModelPath: _vadModelPathController.text.trim(),
+        routingProfile: _routingProfile,
+        senseVoiceModelDir: _routingProfile.dualConfirmed
+            ? _senseVoiceModelDirController.text.trim()
+            : null,
+        lidModelDir: _routingProfile.dualConfirmed
+            ? _lidModelDirController.text.trim()
+            : null,
       );
     } catch (e) {
       setState(() => _errorText = e.toString());
@@ -227,6 +244,8 @@ class _LivePageState extends State<LivePage> {
     _broadcastServer.stop();
     _modelDirController.dispose();
     _vadModelPathController.dispose();
+    _senseVoiceModelDirController.dispose();
+    _lidModelDirController.dispose();
     _debugWavPathController.dispose();
     _scrollController.dispose();
     super.dispose();
@@ -268,6 +287,42 @@ class _LivePageState extends State<LivePage> {
                 border: OutlineInputBorder(),
               ),
             ),
+            const SizedBox(height: 12),
+            DropdownButtonFormField<RoutingProfile>(
+              initialValue: _routingProfile,
+              decoration: const InputDecoration(
+                labelText: 'Language routing',
+                border: OutlineInputBorder(),
+              ),
+              items: [
+                for (final profile in RoutingProfile.values)
+                  DropdownMenuItem(value: profile, child: Text(profile.label)),
+              ],
+              onChanged: isRunning
+                  ? null
+                  : (profile) =>
+                        setState(() => _routingProfile = profile!),
+            ),
+            if (_routingProfile.dualConfirmed) ...[
+              const SizedBox(height: 12),
+              TextField(
+                controller: _senseVoiceModelDirController,
+                enabled: !isRunning,
+                decoration: const InputDecoration(
+                  labelText: 'SenseVoice model directory',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: _lidModelDirController,
+                enabled: !isRunning,
+                decoration: const InputDecoration(
+                  labelText: 'whisper-tiny LID model directory',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
             const SizedBox(height: 16),
             FilledButton.icon(
               onPressed: _isStarting ? null : _toggle,
@@ -344,6 +399,9 @@ class _LivePageState extends State<LivePage> {
                       itemBuilder: (context, index) {
                         final entry = _entries[index];
                         return ListTile(
+                          leading: entry.lang == null
+                              ? null
+                              : _LangBadge(lang: entry.lang!),
                           title: SelectableText(entry.text),
                           subtitle: Text(_formatTimestamp(entry.timestamp)),
                         );
@@ -363,6 +421,9 @@ class _LivePageState extends State<LivePage> {
                       itemBuilder: (context, index) {
                         final entry = _refineEntries[index];
                         return ListTile(
+                          leading: entry.lang == null
+                              ? null
+                              : _LangBadge(lang: entry.lang!),
                           title: SelectableText(entry.text),
                           subtitle: Text(_formatTimestamp(entry.timestamp)),
                         );
@@ -370,6 +431,33 @@ class _LivePageState extends State<LivePage> {
                     ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Small pill showing a transcript entry's routed language (e.g. "JA",
+/// "EN") — only shown for a [RoutingProfile.jaSenseVoice] session, since a
+/// plain single-model session already knows its one language from context.
+class _LangBadge extends StatelessWidget {
+  const _LangBadge({required this.lang});
+
+  final String lang;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(top: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.secondaryContainer,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Text(
+        lang.toUpperCase(),
+        style: Theme.of(context).textTheme.labelSmall?.copyWith(
+          color: Theme.of(context).colorScheme.onSecondaryContainer,
         ),
       ),
     );
