@@ -36,6 +36,7 @@ dependencies:
   cupertino_icons: ^1.0.8
   sherpa_onnx: ^1.13.6
   path_provider: ^2.1.6
+  record: ^6.0.0
 
 dev_dependencies:
   flutter_test:

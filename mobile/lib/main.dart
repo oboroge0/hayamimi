@@ -7,6 +7,7 @@ import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa_onnx;
 import 'bench/bench_result.dart';
 import 'bench/bench_runner.dart';
 import 'bench/model_kind.dart';
+import 'live/live_page.dart';
 
 void main() {
   sherpa_onnx.initBindings();
@@ -19,9 +20,34 @@ class HayamimiMobileApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'hayamimi RTF bench',
+      title: 'hayamimi',
       theme: ThemeData(primarySwatch: Colors.indigo, useMaterial3: true),
-      home: const BenchPage(),
+      home: const HomeTabs(),
+    );
+  }
+}
+
+/// Top-level tab switcher between the RTF bench screen and the live mic
+/// transcription screen.
+class HomeTabs extends StatelessWidget {
+  const HomeTabs({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('hayamimi'),
+          bottom: const TabBar(
+            tabs: [
+              Tab(text: 'Bench', icon: Icon(Icons.speed)),
+              Tab(text: 'Live', icon: Icon(Icons.mic)),
+            ],
+          ),
+        ),
+        body: const TabBarView(children: [BenchPage(), LivePage()]),
+      ),
     );
   }
 }
@@ -55,8 +81,10 @@ class _BenchPageState extends State<BenchPage> {
     final docsDir = await getApplicationDocumentsDirectory();
     if (!mounted) return;
     setState(() {
-      _modelDirController.text = '${docsDir.path}${Platform.pathSeparator}model';
-      _wavPathController.text = '${docsDir.path}${Platform.pathSeparator}test.wav';
+      _modelDirController.text =
+          '${docsDir.path}${Platform.pathSeparator}model';
+      _wavPathController.text =
+          '${docsDir.path}${Platform.pathSeparator}test.wav';
     });
   }
 
@@ -90,61 +118,58 @@ class _BenchPageState extends State<BenchPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('hayamimi RTF bench')),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            DropdownButtonFormField<ModelKind>(
-              initialValue: _modelKind,
-              decoration: const InputDecoration(
-                labelText: 'Model type',
-                border: OutlineInputBorder(),
-              ),
-              items: [
-                for (final kind in ModelKind.values)
-                  DropdownMenuItem(value: kind, child: Text(kind.label)),
-              ],
-              onChanged: (kind) => setState(() => _modelKind = kind!),
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          DropdownButtonFormField<ModelKind>(
+            initialValue: _modelKind,
+            decoration: const InputDecoration(
+              labelText: 'Model type',
+              border: OutlineInputBorder(),
             ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _modelDirController,
-              decoration: const InputDecoration(
-                labelText: 'Model directory (encoder/decoder/joiner/tokens.txt)',
-                border: OutlineInputBorder(),
-              ),
+            items: [
+              for (final kind in ModelKind.values)
+                DropdownMenuItem(value: kind, child: Text(kind.label)),
+            ],
+            onChanged: (kind) => setState(() => _modelKind = kind!),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _modelDirController,
+            decoration: const InputDecoration(
+              labelText: 'Model directory (encoder/decoder/joiner/tokens.txt)',
+              border: OutlineInputBorder(),
             ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _wavPathController,
-              decoration: const InputDecoration(
-                labelText: 'WAV file path (16kHz mono)',
-                border: OutlineInputBorder(),
-              ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _wavPathController,
+            decoration: const InputDecoration(
+              labelText: 'WAV file path (16kHz mono)',
+              border: OutlineInputBorder(),
             ),
-            const SizedBox(height: 16),
-            FilledButton(
-              onPressed: _isRunning ? null : _runBench,
-              child: _isRunning
-                  ? const SizedBox(
-                      height: 20,
-                      width: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Text('Run'),
+          ),
+          const SizedBox(height: 16),
+          FilledButton(
+            onPressed: _isRunning ? null : _runBench,
+            child: _isRunning
+                ? const SizedBox(
+                    height: 20,
+                    width: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Text('Run'),
+          ),
+          const SizedBox(height: 24),
+          if (_errorText != null)
+            Text(
+              _errorText!,
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
             ),
-            const SizedBox(height: 24),
-            if (_errorText != null)
-              Text(
-                _errorText!,
-                style: TextStyle(color: Theme.of(context).colorScheme.error),
-              ),
-            if (_result != null) _ResultCard(result: _result!),
-          ],
-        ),
+          if (_result != null) _ResultCard(result: _result!),
+        ],
       ),
     );
   }
@@ -168,10 +193,17 @@ class _ResultCard extends StatelessWidget {
               style: Theme.of(context).textTheme.headlineSmall,
             ),
             const SizedBox(height: 8),
-            Text('Audio duration: ${result.audioDurationSeconds.toStringAsFixed(2)} s'),
-            Text('Processing time: ${result.processingDurationSeconds.toStringAsFixed(2)} s'),
+            Text(
+              'Audio duration: ${result.audioDurationSeconds.toStringAsFixed(2)} s',
+            ),
+            Text(
+              'Processing time: ${result.processingDurationSeconds.toStringAsFixed(2)} s',
+            ),
             const SizedBox(height: 12),
-            const Text('Output text:', style: TextStyle(fontWeight: FontWeight.bold)),
+            const Text(
+              'Output text:',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
             SelectableText(result.text.isEmpty ? '(empty)' : result.text),
           ],
         ),

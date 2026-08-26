@@ -38,10 +38,15 @@ ResolvedModelFiles resolveZipformerTransducerFiles(List<String> filenames) {
 }
 
 String _pick(List<String> filenames, String role) {
-  final candidates = filenames
-      .where((f) => f.toLowerCase().contains(role) && f.toLowerCase().endsWith('.onnx'))
-      .toList()
-    ..sort();
+  final candidates =
+      filenames
+          .where(
+            (f) =>
+                f.toLowerCase().contains(role) &&
+                f.toLowerCase().endsWith('.onnx'),
+          )
+          .toList()
+        ..sort();
 
   if (candidates.isEmpty) {
     throw ModelFileResolutionException(
@@ -49,7 +54,9 @@ String _pick(List<String> filenames, String role) {
     );
   }
 
-  final int8Candidates = candidates.where((f) => f.toLowerCase().contains('int8')).toList();
+  final int8Candidates = candidates
+      .where((f) => f.toLowerCase().contains('int8'))
+      .toList();
   return int8Candidates.isNotEmpty ? int8Candidates.first : candidates.first;
 }
 
