@@ -14,6 +14,62 @@ class BenchRunException implements Exception {
   String toString() => message;
 }
 
+/// Builds a zipformer-transducer [sherpa_onnx.OfflineRecognizer] from a
+/// model directory, resolving encoder/decoder/joiner/tokens by the same
+/// substring rules [BenchRunner.run] uses.
+///
+/// [decodingMethod] defaults to sherpa-onnx's own default ('greedy_search')
+/// so the generic RTF bench keeps its prior behavior. [ManifestEvalRunner]
+/// passes 'modified_beam_search' explicitly to match the desktop production
+/// config for ReazonSpeech ja (see scripts/asr_engine.py::_build_reazon) —
+/// without that, a mobile-vs-PC accuracy comparison would be conflating a
+/// platform difference with a decoding-config difference.
+///
+/// Shared with [ManifestEvalRunner] (manifest_eval_runner.dart) so both the
+/// single-file RTF bench and the batch manifest eval build recognizers the
+/// same way. Throws [BenchRunException] on a missing directory or files.
+Future<sherpa_onnx.OfflineRecognizer> buildZipformerRecognizer(
+  String modelDir, {
+  int numThreads = 2,
+  String decodingMethod = 'greedy_search',
+}) async {
+  final dir = Directory(modelDir);
+  if (!await dir.exists()) {
+    throw BenchRunException('Model directory not found: $modelDir');
+  }
+
+  final filenames = await dir
+      .list()
+      .where((e) => e is File)
+      .map((e) => e.uri.pathSegments.last)
+      .toList();
+
+  final ResolvedModelFiles resolved;
+  try {
+    resolved = resolveZipformerTransducerFiles(filenames);
+  } on ModelFileResolutionException catch (e) {
+    throw BenchRunException(e.message);
+  }
+
+  final sep = Platform.pathSeparator;
+  return sherpa_onnx.OfflineRecognizer(
+    sherpa_onnx.OfflineRecognizerConfig(
+      model: sherpa_onnx.OfflineModelConfig(
+        transducer: sherpa_onnx.OfflineTransducerModelConfig(
+          encoder: '$modelDir$sep${resolved.encoder}',
+          decoder: '$modelDir$sep${resolved.decoder}',
+          joiner: '$modelDir$sep${resolved.joiner}',
+        ),
+        tokens: '$modelDir$sep${resolved.tokens}',
+        numThreads: numThreads,
+        debug: false,
+        provider: 'cpu',
+      ),
+      decodingMethod: decodingMethod,
+    ),
+  );
+}
+
 /// Runs an offline ASR decode over a WAV file and measures RTF.
 ///
 /// Model/tokenizer discovery and the sherpa-onnx FFI calls live here so the
@@ -39,44 +95,14 @@ class BenchRunner {
       );
     }
 
-    final dir = Directory(modelDir);
-    if (!await dir.exists()) {
-      throw BenchRunException('Model directory not found: $modelDir');
-    }
-
     final wavFile = File(wavPath);
     if (!await wavFile.exists()) {
       throw BenchRunException('WAV file not found: $wavPath');
     }
 
-    final filenames = await dir
-        .list()
-        .where((e) => e is File)
-        .map((e) => e.uri.pathSegments.last)
-        .toList();
-
-    final ResolvedModelFiles resolved;
-    try {
-      resolved = resolveZipformerTransducerFiles(filenames);
-    } on ModelFileResolutionException catch (e) {
-      throw BenchRunException(e.message);
-    }
-
-    final sep = Platform.pathSeparator;
-    final recognizer = sherpa_onnx.OfflineRecognizer(
-      sherpa_onnx.OfflineRecognizerConfig(
-        model: sherpa_onnx.OfflineModelConfig(
-          transducer: sherpa_onnx.OfflineTransducerModelConfig(
-            encoder: '$modelDir$sep${resolved.encoder}',
-            decoder: '$modelDir$sep${resolved.decoder}',
-            joiner: '$modelDir$sep${resolved.joiner}',
-          ),
-          tokens: '$modelDir$sep${resolved.tokens}',
-          numThreads: numThreads,
-          debug: false,
-          provider: 'cpu',
-        ),
-      ),
+    final recognizer = await buildZipformerRecognizer(
+      modelDir,
+      numThreads: numThreads,
     );
 
     try {
