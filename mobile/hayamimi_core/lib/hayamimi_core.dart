@@ -18,6 +18,8 @@ export 'server/subtitle_event.dart';
 // than the HayamimiLive/HayamimiRemote facades give.
 export 'bench/bench_result.dart';
 export 'bench/bench_runner.dart';
+export 'bench/manifest_eval_result.dart';
+export 'bench/manifest_eval_runner.dart';
 export 'bench/model_file_resolver.dart';
 export 'bench/model_kind.dart';
 export 'live/live_transcriber.dart';

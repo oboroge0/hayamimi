@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:hayamimi_core/hayamimi_core.dart';
 import 'package:path_provider/path_provider.dart';
@@ -65,6 +66,15 @@ class _BenchPageState extends State<BenchPage> {
   final _modelDirController = TextEditingController();
   final _wavPathController = TextEditingController();
 
+  // Manifest batch-eval controls (kDebugMode only — see _ManifestEvalSection).
+  final _manifestModelDirController = TextEditingController();
+  final _manifestPathController = TextEditingController();
+  final _manifestWavDirController = TextEditingController();
+  final _manifestOutputController = TextEditingController();
+  bool _manifestRunning = false;
+  String? _manifestError;
+  String? _manifestSummary;
+
   ModelKind _modelKind = ModelKind.zipformerTransducer;
   bool _isRunning = false;
   String? _errorText;
@@ -82,11 +92,16 @@ class _BenchPageState extends State<BenchPage> {
     // a full path by hand. Any path is still editable.
     final docsDir = await getApplicationDocumentsDirectory();
     if (!mounted) return;
+    final sep = Platform.pathSeparator;
     setState(() {
-      _modelDirController.text =
-          '${docsDir.path}${Platform.pathSeparator}model';
-      _wavPathController.text =
-          '${docsDir.path}${Platform.pathSeparator}test.wav';
+      _modelDirController.text = '${docsDir.path}$sep' 'model';
+      _wavPathController.text = '${docsDir.path}$sep' 'test.wav';
+      _manifestModelDirController.text = '${docsDir.path}$sep' 'model';
+      _manifestPathController.text =
+          '${docsDir.path}${sep}eval_real${sep}manifest.json';
+      _manifestWavDirController.text = '${docsDir.path}$sep' 'eval_real';
+      _manifestOutputController.text =
+          '${docsDir.path}${sep}manifest_eval_result.json';
     });
   }
 
@@ -94,7 +109,48 @@ class _BenchPageState extends State<BenchPage> {
   void dispose() {
     _modelDirController.dispose();
     _wavPathController.dispose();
+    _manifestModelDirController.dispose();
+    _manifestPathController.dispose();
+    _manifestWavDirController.dispose();
+    _manifestOutputController.dispose();
     super.dispose();
+  }
+
+  Future<void> _runManifestEval() async {
+    setState(() {
+      _manifestRunning = true;
+      _manifestError = null;
+      _manifestSummary = null;
+    });
+
+    try {
+      final results = await ManifestEvalRunner.run(
+        modelDir: _manifestModelDirController.text.trim(),
+        manifestPath: _manifestPathController.text.trim(),
+        wavDir: _manifestWavDirController.text.trim(),
+      );
+
+      final outputPath = _manifestOutputController.text.trim();
+      await File(outputPath).writeAsString(ManifestEvalRunner.toJson(results));
+
+      final avgRtf = results.isEmpty
+          ? 0.0
+          : results.map((r) => r.rtf).reduce((a, b) => a + b) /
+                results.length;
+      setState(() {
+        _manifestSummary =
+            'Decoded ${results.length} clips. '
+            'Mean RTF (this device, informational only): '
+            '${avgRtf.toStringAsFixed(3)}.\n'
+            'Wrote results to: $outputPath\n'
+            '(pull with: adb pull $outputPath, then score with '
+            'scripts/eval_accuracy.py\'s cer_ja)';
+      });
+    } catch (e) {
+      setState(() => _manifestError = e.toString());
+    } finally {
+      setState(() => _manifestRunning = false);
+    }
   }
 
   Future<void> _runBench() async {
@@ -171,6 +227,72 @@ class _BenchPageState extends State<BenchPage> {
               style: TextStyle(color: Theme.of(context).colorScheme.error),
             ),
           if (_result != null) _ResultCard(result: _result!),
+          if (kDebugMode) ...[
+            const SizedBox(height: 32),
+            const Divider(),
+            const SizedBox(height: 8),
+            Text(
+              'Manifest batch eval (debug only)',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const Text(
+              'Decodes every clip in a manifest.json (see '
+              'testdata/eval_real) through one recognizer and writes a '
+              'JSON results file for offline CER scoring on the PC. Speed '
+              'numbers here are informational only — not comparable across '
+              'devices.',
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _manifestModelDirController,
+              decoration: const InputDecoration(
+                labelText: 'Model directory',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _manifestPathController,
+              decoration: const InputDecoration(
+                labelText: 'manifest.json path',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _manifestWavDirController,
+              decoration: const InputDecoration(
+                labelText: 'WAV directory (manifest "wav" fields join here)',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _manifestOutputController,
+              decoration: const InputDecoration(
+                labelText: 'Output JSON path',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            FilledButton(
+              onPressed: _manifestRunning ? null : _runManifestEval,
+              child: _manifestRunning
+                  ? const SizedBox(
+                      height: 20,
+                      width: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Text('Run manifest eval'),
+            ),
+            const SizedBox(height: 16),
+            if (_manifestError != null)
+              Text(
+                _manifestError!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            if (_manifestSummary != null) Text(_manifestSummary!),
+          ],
         ],
       ),
     );
