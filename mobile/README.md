@@ -1,7 +1,7 @@
 # hayamimi mobile (RTF bench + live transcription)
 
 Flutter app (Android + iOS, shared codebase) for prototyping hayamimi's
-speech recognition on phones. It has two screens:
+speech recognition on phones. It has three screens:
 
 - **Bench** — runs a [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)
   offline ASR model against a WAV file and reports the RTF (real-time
@@ -11,6 +11,11 @@ speech recognition on phones. It has two screens:
   It can also broadcast that transcript to other apps on the same LAN (see
   [Other app integration](#other-app-integration-broadcasting-subtitles)
   below).
+- **Remote** — a thin client: streams mic audio to a hayamimi server
+  running on a PC (`--input ws --serve`) and displays the subtitle events
+  streamed back, so the PC's full pipeline (5-tier language routing
+  included) does the actual recognition instead of the phone. See
+  [Remote mode](#remote-mode-streaming-to-a-pc) below.
 
 ## Status
 
@@ -57,7 +62,32 @@ speech recognition on phones. It has two screens:
 - `lib/server/subtitle_broadcast_server.dart` — the actual `dart:io`
   `HttpServer`: serves the overlay at `/` and an SSE stream at `/events`.
   Covered by an integration test that binds a real ephemeral port.
-- `lib/main.dart` — top-level app shell with a Bench/Live tab switcher.
+- `lib/remote/remote_event.dart` — pure logic: parses the JSON events a
+  hayamimi `/ingest` WebSocket sends back (`partial`/`final`/`translation`/
+  `refine`/`ready`/`error`/...) into typed values, wire-compatible with
+  `scripts/subtitle_server.py`. Unit tested, no I/O.
+- `lib/remote/remote_handshake.dart` — pure logic: builds the JSON
+  handshake frame `/ingest` expects as the first WebSocket message. Unit
+  tested.
+- `lib/remote/wav_pcm_reader.dart` — pure logic: parses a 16-bit PCM `.wav`
+  file's bytes (sample rate, channels, raw PCM) without touching disk. Unit
+  tested. Used by the debug test-wav sender.
+- `lib/remote/remote_connection_state.dart` — the connection lifecycle enum
+  the Remote screen displays.
+- `lib/remote/remote_transcriber.dart` — orchestrates the `record` mic
+  stream and a `dart:io` `WebSocket` connection to `/ingest`: sends the
+  handshake, streams PCM16 binary frames, parses incoming JSON events, and
+  auto-reconnects with a fixed backoff if the connection drops. Also
+  provides `sendTestWavFile`, a debug helper that streams a `.wav` file at
+  real-time pace over its own one-shot connection (mirrors
+  `scripts/ws_mic_client.py`) for testing without a real microphone. Not
+  unit tested itself (needs a real mic/socket); built from the pure pieces
+  above.
+- `lib/remote/remote_page.dart` — the Remote screen UI: server URL field,
+  connect/disconnect, partial text strip, finals list with language badge
+  and latency, and a debug-build-only "send test wav" card.
+- `lib/main.dart` — top-level app shell with the Bench/Live/Remote tab
+  switcher.
 - `test/` — unit tests for the pure logic (`flutter test`).
 
 ## Building on Windows (Android)
@@ -204,6 +234,87 @@ adb shell run-as dev.oboroge.hayamimi_mobile cp /data/local/tmp/hayamimi_bench/m
 `/sdcard` directly on newer Android — scoped storage blocks it even for
 world-readable-looking files. Staging under `/data/local/tmp` first avoids
 that.)
+
+## Remote mode: streaming to a PC
+
+Remote mode is the opposite of Live mode: instead of running ASR on the
+phone, the phone just captures mic audio and streams it to a hayamimi
+server running on a PC over the `/ingest` WebSocket endpoint
+(`scripts/ws_ingest.py`), and displays whatever subtitle events stream
+back. This gets you the PC pipeline's full quality (multi-language routing,
+refine pass, translation, speaker labels) from a phone with no model files
+on it at all.
+
+### 1. Start the server on the PC
+
+```
+python scripts/realtime_transcribe.py --input ws --serve
+```
+
+This starts two listeners:
+
+- `--serve` (default port **8833**): the HTTP dashboard/SSE feed at
+  `http://<pc>:8833/` and `http://<pc>:8833/events`, same as any other run.
+- `--input ws` (default port **8766**, override with `--ws-port`): the raw
+  `/ingest` WebSocket the phone connects to, at
+  `ws://<pc>:8766/ingest`.
+
+These are two different ports serving two different protocols — the Remote
+tab's server URL field wants the **8766** one, not 8833.
+
+### 2. Connect from the phone
+
+1. Open the **Remote** tab.
+2. Set **サーバーURL** to `ws://<pc address>:8766/ingest`:
+   - From the Android emulator, the host PC is reachable at `10.0.2.2`
+     (the field is prefilled with `ws://10.0.2.2:8766/ingest`).
+   - From a real phone on the same Wi-Fi, use the PC's LAN IP instead, e.g.
+     `ws://192.168.1.10:8766/ingest`.
+3. Tap **接続** (Connect). The app requests mic permission on first use,
+   then streams mic audio to the server continuously, auto-reconnecting
+   with a fixed 2s backoff if the connection drops.
+4. Subtitle events appear as they arrive: an italic partial strip for
+   in-progress text, and a list of finalized lines below it with a language
+   badge and decode latency. The exact same events also show up on the
+   PC's `/dashboard`/`/events` and OBS overlay, since they all come from
+   the same `SubtitleServer` broadcast.
+
+### Debug: sending a test wav (no real mic needed)
+
+An emulator has no usable microphone, so the debug build shows a "テスト
+wav送信" card for exercising the full pipeline without one. It streams a
+pushed 16-bit PCM `.wav` file at real-time pace over its own one-shot
+`/ingest` connection (the server only accepts one audio-producing client at
+a time, so this is independent of — and will conflict with — an active mic
+connection).
+
+To get a test file onto an emulator's app-private storage (see
+[Getting files onto an Android device/emulator](#getting-files-onto-an-android-deviceemulator)
+above for why the two-step push is needed):
+
+```
+adb push testdata/ja_test.wav /data/local/tmp/ja_test.wav
+adb shell run-as dev.oboroge.hayamimi_mobile cp /data/local/tmp/ja_test.wav app_flutter/ja_test.wav
+```
+
+The wav path field defaults to `<app docs dir>/ja_test.wav`. Tap
+**テストwavを送信**; the button shows "送信中..." while it streams (roughly
+the audio's real duration, plus a couple of seconds for the server to
+finalize and refine).
+
+### Notes and limitations
+
+- Only one audio-producing `/ingest` client is accepted by the server at a
+  time; a second connection attempt gets a `{"type": "error", ...}` event
+  and is closed immediately (see `scripts/ws_ingest.py`).
+- Like Live mode's broadcast server, mic streaming only runs while the app
+  is foregrounded with the screen on — no Android background service backs
+  it yet.
+- `refine` events (the server's second-pass, cleaned-up re-decode of a
+  group of finals) are shown as their own labeled `[清書]` lines rather
+  than replacing the finals they summarize, since a thin client has no
+  general way to "revise a line already on screen" without more UI state
+  than seemed worth it for this pass.
 
 ## Notes on RTF numbers from an emulator
 

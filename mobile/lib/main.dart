@@ -8,6 +8,7 @@ import 'bench/bench_result.dart';
 import 'bench/bench_runner.dart';
 import 'bench/model_kind.dart';
 import 'live/live_page.dart';
+import 'remote/remote_page.dart';
 
 void main() {
   sherpa_onnx.initBindings();
@@ -35,7 +36,7 @@ class HomeTabs extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
-      length: 2,
+      length: 3,
       child: Scaffold(
         appBar: AppBar(
           title: const Text('hayamimi'),
@@ -43,10 +44,13 @@ class HomeTabs extends StatelessWidget {
             tabs: [
               Tab(text: 'Bench', icon: Icon(Icons.speed)),
               Tab(text: 'Live', icon: Icon(Icons.mic)),
+              Tab(text: 'Remote', icon: Icon(Icons.cast)),
             ],
           ),
         ),
-        body: const TabBarView(children: [BenchPage(), LivePage()]),
+        body: const TabBarView(
+          children: [BenchPage(), LivePage(), RemotePage()],
+        ),
       ),
     );
   }
