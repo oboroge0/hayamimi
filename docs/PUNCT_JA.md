@@ -111,6 +111,16 @@ are consistently faster.
   incompatibility with this specific quantized graph). If a working int8
   build becomes available it should cut latency roughly in half per the
   source repo's numbers.
+  **Update**: a from-scratch INT8 requantization of the fp32 file (not the
+  broken upstream artifact) was verified functional and measured as part of
+  the mobile-sizing work — see `docs/MOBILE.md`, "Punctuation model INT8"
+  section, and `scripts/quantize_punct.py`. It is 74.9% smaller (363.5MB ->
+  91.4MB) and ~2x faster on this PC, with no accuracy regression on a
+  15-reference sample (in fact marginally fewer false-positive marks than
+  fp32). `PunctuatorJa` still defaults to fp32 (`punct_bert.onnx`); pass
+  `onnx_filename="quantized_ort/punct_bert.int8.onnx"` to use the
+  requantized model instead. It is not wired in as the default pending a
+  larger accuracy check and an on-device latency measurement.
 - **No streaming/incremental restoration.** `restore()` re-tokenizes and
   re-runs the whole given text each call; it's meant to be called on
   finalized ASR segments (e.g. one call per utterance/segment), not on a

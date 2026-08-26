@@ -65,15 +65,19 @@ class PunctuatorJa:
         period_threshold: float = 0.5,
         max_chars: int = 500,
         force_final_period: bool = True,
+        onnx_filename: str = "punct_bert.onnx",
     ):
         model_dir = Path(model_dir)
-        # NOTE: the int8 dynamic-quantized file shipped in this HF repo
-        # (punct_bert.int8.onnx) was verified to produce near-constant,
+        # NOTE: the int8 dynamic-quantized file shipped in the upstream HF
+        # repo (punct_bert.int8.onnx) was verified to produce near-constant,
         # token-independent logits on this onnxruntime build (1.29.0) --
         # i.e. it does not actually restore punctuation. The fp32 file
-        # (punct_bert.onnx) was verified correct, so it is used here.
-        # See docs/PUNCT_JA.md for details.
-        onnx_path = model_dir / "punct_bert.onnx"
+        # (punct_bert.onnx) is used by default. See docs/PUNCT_JA.md for
+        # details, and docs/MOBILE.md for a from-scratch INT8 requantization
+        # (scripts/quantize_punct.py) that IS verified functional -- pass
+        # onnx_filename="quantized_ort/punct_bert.int8.onnx" (or wherever it
+        # was written) to load that instead.
+        onnx_path = model_dir / onnx_filename
         vocab_path = model_dir / "vocab.txt"
         if not onnx_path.exists() or not vocab_path.exists():
             raise FileNotFoundError(
