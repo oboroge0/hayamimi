@@ -222,6 +222,7 @@ def resolve_sticky_lang(
     lang: str, last_lang: str | None, speech_s: float | None,
     min_switch_s: float, switch_confirm: int,
     pending_lang: str | None, pending_count: int,
+    bootstrap_probe_lang: str | None = None,
 ) -> tuple[str, bool, str | None, int]:
     """Sticky-LID hysteresis: decide whether to accept a new LID detection
     as a real language switch, or hold the session's current language.
@@ -249,14 +250,39 @@ def resolve_sticky_lang(
     omnilingual fallback for that segment, so a held language's empty
     decode isn't resurrected by it.
 
+    Session bootstrap (last_lang is None) used to instant-accept the very
+    first detection unconditionally. That let a single whisper-tiny
+    misfire to a language SenseVoice can't arbitrate (e.g. "ru") seed the
+    whole session with a collapsed decode, bypassing the dual-LID
+    confirmation used for the 5 SenseVoice-covered languages entirely (a
+    real-mic incident: whisper-tiny said "ru" on the first segment of a
+    Japanese session and the session never recovered). Bootstrap now goes
+    through the SAME switch_confirm accumulation as any other switch --
+    `lang` must repeat `switch_confirm` times (each >= min_switch_s) before
+    it becomes the session's language. `bootstrap_probe_lang` is the
+    caller's SenseVoice probe result for THIS exact audio (only meaningful
+    at bootstrap, since a probe is always cheap enough to run on the very
+    first segment): while no candidate has accumulated switch_confirm
+    detections, segments decode using bootstrap_probe_lang instead of
+    blindly trusting whisper-tiny's possibly-wrong candidate, since
+    SenseVoice alone already measures more accurate than whisper-tiny alone
+    (docs/LID.md table 2 vs table 1). If no probe was available
+    (bootstrap_probe_lang falsy, e.g. --minimal install), this falls back
+    to whisper-tiny's own candidate, same as before.
+
     Returns (resolved_lang, suppress_fallback, new_pending_lang, new_pending_count).
     """
-    if last_lang is None or lang == last_lang:
+    if last_lang is not None and lang == last_lang:
         return lang, False, None, 0
+
+    # while nothing has been confirmed yet, decode with the best available
+    # guess: the established session language, or (at bootstrap) the
+    # SenseVoice probe's own judgment if the caller has one
+    fallback = last_lang if last_lang is not None else (bootstrap_probe_lang or lang)
 
     is_short = speech_s is not None and speech_s < min_switch_s
     if is_short:
-        return last_lang, True, pending_lang, pending_count
+        return fallback, True, pending_lang, pending_count
 
     if lang == pending_lang:
         pending_count += 1
@@ -268,7 +294,7 @@ def resolve_sticky_lang(
         # candidate (>= min_switch_s) merely decoded under the wrong tier's
         # model, so let the omni fallback have a shot if that specialist
         # draws a blank.
-        return last_lang, False, pending_lang, pending_count
+        return fallback, False, pending_lang, pending_count
 
     return lang, False, None, 0
 
@@ -711,36 +737,62 @@ class RoutedASR:
         suppress_fallback = False
         probe_ms = 0.0
         sv_probe = None  # (text, raw_tag) if a SenseVoice confirmation probe already ran
+        bootstrap_probe_lang = None  # SenseVoice's tag for THIS audio, bootstrap only
         if self.forced_lang is not None or not live:
             pass  # out-of-band decode / forced single-language: no switch resolution
-        elif self.dual_confirm and lang in DUAL_CONFIRM_LANGS:
-            if lang != self.last_lang:
-                # docs/LID.md: for the 5 SenseVoice-covered languages, confirm
-                # a candidate switch with SenseVoice's own LID instead of the
-                # old length/repeat-count hysteresis (see resolve_dual_confirm).
+        else:
+            if self.last_lang is None and self.dual_confirm:
+                # session bootstrap: whisper-tiny alone is unreliable at short
+                # lengths (docs/LID.md) and can guess a language SenseVoice
+                # can't even arbitrate (a real-mic incident: whisper-tiny said
+                # "ru" on segment 1 of a Japanese session and it collapsed
+                # from there). Always confirm the very first segment against
+                # SenseVoice's own LID, whatever whisper-tiny said.
                 t0 = time.perf_counter()
-                sv_lang = ""
                 try:
                     probe_text, probe_tag = self._decode_full(self._get("sv"), samples, sample_rate)
                     sv_probe = (probe_text, probe_tag)
-                    sv_lang = sv_lid_tag(probe_tag)
+                    bootstrap_probe_lang = sv_lid_tag(probe_tag)
                 except ModelUnavailable:
-                    pass  # minimal install: no probe possible, mismatch by default
+                    pass  # minimal install: no probe possible
                 probe_ms = (time.perf_counter() - t0) * 1000
-                lang, switched = resolve_dual_confirm(lang, self.last_lang, speech_s, sv_lang)
-                suppress_fallback = speech_s is not None and speech_s < MIN_PROBE_S
-                if switched:
-                    # a confirmed dual-LID switch supersedes any hysteresis
-                    # candidate the fallback (non-SV) path was accumulating
-                    self._pending_lang, self._pending_count = None, 0
-            # lang == last_lang: already the session language, nothing to resolve
-        else:
-            # European/other languages SenseVoice can't arbitrate: fall back
-            # to the length + consecutive-detection hysteresis.
-            lang, suppress_fallback, self._pending_lang, self._pending_count = resolve_sticky_lang(
-                lang, self.last_lang, speech_s, self.min_switch_s, self.lid_switch_confirm,
-                self._pending_lang, self._pending_count,
-            )
+
+            if self.dual_confirm and lang in DUAL_CONFIRM_LANGS:
+                if lang != self.last_lang:
+                    # docs/LID.md: for the 5 SenseVoice-covered languages,
+                    # confirm a candidate switch with SenseVoice's own LID
+                    # instead of the old length/repeat-count hysteresis (see
+                    # resolve_dual_confirm). Reuse the bootstrap probe above
+                    # if it already decoded this exact audio.
+                    sv_lang = bootstrap_probe_lang
+                    if sv_probe is None:
+                        t0 = time.perf_counter()
+                        sv_lang = ""
+                        try:
+                            probe_text, probe_tag = self._decode_full(self._get("sv"), samples, sample_rate)
+                            sv_probe = (probe_text, probe_tag)
+                            sv_lang = sv_lid_tag(probe_tag)
+                        except ModelUnavailable:
+                            pass  # minimal install: no probe possible, mismatch by default
+                        probe_ms += (time.perf_counter() - t0) * 1000
+                    lang, switched = resolve_dual_confirm(lang, self.last_lang, speech_s, sv_lang)
+                    suppress_fallback = speech_s is not None and speech_s < MIN_PROBE_S
+                    if switched:
+                        # a confirmed dual-LID switch supersedes any hysteresis
+                        # candidate the fallback (non-SV) path was accumulating
+                        self._pending_lang, self._pending_count = None, 0
+                # lang == last_lang: already the session language, nothing to resolve
+            else:
+                # European/other languages SenseVoice can't arbitrate: fall
+                # back to the length + consecutive-detection hysteresis. At
+                # bootstrap, decode via the SenseVoice probe above until
+                # whisper-tiny's own candidate repeats lid_switch_confirm
+                # times (see resolve_sticky_lang's bootstrap_probe_lang).
+                lang, suppress_fallback, self._pending_lang, self._pending_count = resolve_sticky_lang(
+                    lang, self.last_lang, speech_s, self.min_switch_s, self.lid_switch_confirm,
+                    self._pending_lang, self._pending_count,
+                    bootstrap_probe_lang=bootstrap_probe_lang,
+                )
 
         t0 = time.perf_counter()
         sv_text, sv_lang2 = (sv_probe if sv_probe is not None else (None, None))

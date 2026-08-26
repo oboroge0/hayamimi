@@ -219,16 +219,24 @@ Headline numbers from that log:
   works well; word-level switching within one sentence does not.
 - **Very short utterances after a jingle/sting/BGM burst can misroute.**
   The language-switch guard (`--lang-switch-guard`, paired with
-  `--lid-switch-confirm`) mitigates this but a session's very first
-  utterance (before any session language is established) and
-  confidently-wrong LID+decode combinations (where the garbled text happens
-  to match the wrong language's character set) are known blind spots -- see
+  `--lid-switch-confirm`) mitigates this but confidently-wrong LID+decode
+  combinations (where the garbled text happens to match the wrong
+  language's character set) remain a known blind spot -- see
   `docs/BENCHMARKS.md`'s iteration #29 for a quantified before/after.
   `--lid-switch-confirm 1 --lang-switch-guard 0` fully disables the sticky
   hysteresis (every detection switches the session immediately), trading
   noise robustness for maximum responsiveness -- useful when validating
   whether the lock itself, rather than its tuning, is the right call for
   your setup.
+- **A session's very first utterance always confirms against SenseVoice
+  before deciding the language** (see `docs/NOISE.md`'s dual-LID confirm
+  section), so a whisper-tiny bootstrap misfire can no longer route the
+  session to a language with no matching model. Languages outside
+  SenseVoice's 5 (ja/en/zh/ko/yue) -- European/`--minimal`-uncovered ones --
+  still need `--lang-switch-guard`-length segments repeated
+  `--lid-switch-confirm` times to become the session's confirmed language,
+  so a legitimate European-language session establishes with a short delay
+  at startup rather than instantly.
 - **`--hotwords` currently has no effect on the ja (ReazonSpeech) tier.**
   ReazonSpeech's `tokens.txt` is byte-level BPE, incompatible with the
   `modeling_unit=cjkchar` encoding hayamimi uses for hotwords, so every

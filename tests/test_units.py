@@ -213,10 +213,58 @@ def test_has_kana():
 # ---- sticky LID hysteresis --------------------------------------------------
 
 def test_sticky_first_utterance_has_no_last_lang_yet():
-    # last_lang=None (session bootstrap): accept immediately, no hold.
+    # last_lang=None (session bootstrap), no SenseVoice probe hint: even a
+    # bootstrap detection must accumulate switch_confirm repeats before the
+    # session commits to it -- it is no longer instant-accepted (a real-mic
+    # incident: an uncontested first-segment whisper-tiny misfire used to
+    # seed the whole session with a wrong, sometimes SenseVoice-unarbitrable,
+    # language). Meanwhile it decodes using its own candidate since no probe
+    # hint was given.
     lang, suppress, pend, cnt = asr_engine.resolve_sticky_lang(
         "en", None, 3.0, 2.0, 2, None, 0)
-    assert (lang, suppress, pend, cnt) == ("en", False, None, 0)
+    assert (lang, suppress, pend, cnt) == ("en", False, "en", 1)
+
+
+def test_sticky_bootstrap_prefers_probe_language_over_unarbitrable_guess():
+    # Real-mic accident scenario (exact repro, testdata/switch_scenario.wav):
+    # whisper-tiny says "ru" (a language SenseVoice can't arbitrate on its
+    # own) on the 1.9s first segment of a session; the caller's SenseVoice
+    # probe for this exact audio says "ja". This segment is short of the
+    # default 2.0s guard, so it's held/suppressed like any short candidate,
+    # but critically it decodes using the probe's language, not "ru" --
+    # the fix that closes the collapse (previously: instant-accept "ru").
+    lang, suppress, pend, cnt = asr_engine.resolve_sticky_lang(
+        "ru", None, 1.9, 2.0, 2, None, 0, bootstrap_probe_lang="ja")
+    assert lang == "ja"
+    assert suppress is True
+    assert (pend, cnt) == (None, 0)  # too short to advance the switch-confirm counter
+
+
+def test_sticky_bootstrap_prefers_probe_language_for_long_unarbitrable_guess():
+    # Same disagreement, but long enough to count toward switch_confirm:
+    # still decodes via the probe's language while "ru" accumulates.
+    lang, suppress, pend, cnt = asr_engine.resolve_sticky_lang(
+        "ru", None, 2.5, 2.0, 2, None, 0, bootstrap_probe_lang="ja")
+    assert lang == "ja"
+    assert suppress is False
+    assert (pend, cnt) == ("ru", 1)
+
+
+def test_sticky_bootstrap_non_sv_lang_confirms_after_repeats():
+    # Two consecutive long "fr" detections at bootstrap confirm "fr" as the
+    # session language -- legitimate European-language sessions still get
+    # through, just with the same switch_confirm delay as any other switch
+    # (a probe hint, if any, only covers the held segments in between).
+    lang1, suppress1, pend1, cnt1 = asr_engine.resolve_sticky_lang(
+        "fr", None, 5.0, 2.0, 2, None, 0, bootstrap_probe_lang="ja")
+    assert lang1 == "ja"
+    assert (pend1, cnt1) == ("fr", 1)
+
+    lang2, suppress2, pend2, cnt2 = asr_engine.resolve_sticky_lang(
+        "fr", None, 5.0, 2.0, 2, pend1, cnt1, bootstrap_probe_lang="ja")
+    assert lang2 == "fr"
+    assert suppress2 is False
+    assert (pend2, cnt2) == (None, 0)
 
 
 def test_sticky_same_lang_resets_pending():
