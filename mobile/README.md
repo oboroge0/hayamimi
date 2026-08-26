@@ -8,7 +8,10 @@ speech recognition on phones. It has three screens:
   factor — processing time divided by audio duration).
 - **Live** — streams mic audio, cuts it into speech segments with Silero
   VAD, decodes each segment as it finalizes, and shows a running transcript.
-  It can also broadcast that transcript to other apps on the same LAN (see
+  It can also run a "清書" (refine) second pass that re-decodes several
+  segments' audio together for a cleaner result (see
+  [Two-pass refine](#two-pass-refine-清書) below), and broadcast the
+  transcript to other apps on the same LAN (see
   [Other app integration](#other-app-integration-broadcasting-subtitles)
   below).
 - **Remote** — a thin client: streams mic audio to a hayamimi server
@@ -45,12 +48,26 @@ speech recognition on phones. It has three screens:
   tested.
 - `lib/live/live_transcript_entry.dart` — one finalized transcript line
   (text + timestamp).
+- `lib/live/refine_pass.dart` — pure logic for the two-pass "refine" (清書)
+  feature: `RefineBuffer` (a duration-capped ring buffer of finalized
+  segments awaiting a refine), `combineSegmentSamples`/
+  `combineSegmentFastText` (merging a group's audio/text),
+  `isRefineTextTooShort` (the "don't let a refine lose content" guard), and
+  `isAutoRefineDue` (the silence-gap/max-buffered due check for auto mode).
+  Mirrors the shape of the desktop pipeline's `Refiner` class
+  (`scripts/realtime_transcribe.py`) with phone-tuned defaults. Unit
+  tested, no FFI. See [Two-pass refine](#two-pass-refine-清書) below.
 - `lib/live/live_transcriber.dart` — orchestrates the `record` mic stream,
   sherpa-onnx's `VoiceActivityDetector`, and the same `OfflineRecognizer`
-  the bench uses. Not unit tested (needs a real mic + native libs); built
-  from the pure pieces above so most of its logic is covered indirectly.
-- `lib/live/live_page.dart` — the live transcription screen UI, including
-  the "配信サーバー" (broadcast server) toggle.
+  the bench uses; also owns the refine pass (`refineNow`,
+  `autoRefineEnabled`, built from `refine_pass.dart`) and the debug-only
+  `runDebugWavRefineTest` helper. Not unit tested itself (needs a real mic
+  + native libs); built from the pure pieces above so most of its logic is
+  covered indirectly.
+- `lib/live/live_page.dart` — the live transcription screen UI: the
+  transcript list, the "清書" (refine) section with its manual button and
+  "自動清書" toggle, the "配信サーバー" (broadcast server) toggle, and (debug
+  builds only) the "wavから清書テスト" card.
 - `lib/server/subtitle_event.dart` — pure logic: the `partial`/`final`
   event value types and their JSON/SSE-frame encoding, wire-compatible with
   the desktop `scripts/subtitle_server.py`. Unit tested, no I/O.
@@ -167,6 +184,50 @@ On Android, first run will prompt for the `RECORD_AUDIO` permission
 `NSMicrophoneUsageDescription` is set in `ios/Runner/Info.plist`; no other
 iOS-specific setup is needed beyond what's already documented above for
 building on macOS.
+
+## Two-pass refine (清書)
+
+The Live screen can run a second decode pass — "清書" — over several
+already-finalized segments' audio at once, the same "re-decode with more
+context" trick the desktop pipeline's `Refiner` class uses
+(`scripts/realtime_transcribe.py`; measured ~23% relative CER better on
+real broadcast ja). This is re-decode only — no punctuation-restoration
+model is layered on top (a separate future task).
+
+- **清書 button** — always available while listening. Combines every
+  segment buffered since the last refine, re-decodes it as one utterance,
+  and appends the result to the "清書" section below the transcript.
+- **自動清書 toggle** (default **off**) — when on, a refine fires
+  automatically after ~4s of silence, or once ~20s of speech has buffered
+  without a pause. Off by default because every refine is a full
+  re-decode: firing it automatically trades battery and heat for
+  convenience, so it's opt-in. The manual button always works regardless
+  of this setting.
+- **Memory cap** — buffered audio for the next refine is capped at 60s;
+  once exceeded, the oldest buffered segment is dropped (a sliding window)
+  even if no refine has happened yet, independent of when a refine
+  actually fires. See `defaultRefineBufferMaxSeconds` in
+  `lib/live/refine_pass.dart`.
+- **Never loses content** — if a refine's re-decode comes back much
+  shorter than the fast per-segment finals it's replacing (under 70% of
+  their combined length), the fast finals are used instead. Mirrors the
+  desktop `Refiner`'s same guard.
+
+The refine result's format matches the Remote screen's `[清書]`-prefixed
+lines in spirit, but gets its own section here rather than a prefix, since
+the Live screen already separates "transcript" from other output.
+
+### Debug: exercising refine without a mic (`wavから清書テスト`)
+
+Debug builds (`kDebugMode`) show a card that runs
+`LiveTranscriber.runDebugWavRefineTest` against a wav file: it splits the
+file in half to stand in for two VAD segments, decodes each half
+individually, then decodes them combined (the refine result) — so you can
+see whether combining changed anything, without a live mic session or an
+emulator's (nonexistent) microphone. It reuses the Model directory field
+above and defaults its wav path to `<app docs dir>/test.wav` (the same
+file Bench uses; push it the same way, see
+[Getting files onto an Android device/emulator](#getting-files-onto-an-android-deviceemulator)).
 
 ## Other app integration: broadcasting subtitles
 
