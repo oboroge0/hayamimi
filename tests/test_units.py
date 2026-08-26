@@ -365,6 +365,65 @@ def test_sticky_short_detection_does_not_reset_a_real_candidate():
     assert (pend3, cnt3) == (None, 0)
 
 
+# ---- dual-LID switch confirmation (docs/LID.md) ----------------------------
+
+def test_sv_lid_tag_normalizes_bracketed_tag():
+    assert asr_engine.sv_lid_tag("<|ja|>") == "ja"
+    assert asr_engine.sv_lid_tag("<|yue|>") == "yue"
+    assert asr_engine.sv_lid_tag("<|unk|>") == ""
+
+
+def test_dual_confirm_same_lang_is_a_noop():
+    lang, switched = asr_engine.resolve_dual_confirm("ja", "ja", 3.0, "ja")
+    assert (lang, switched) == ("ja", False)
+
+
+def test_dual_confirm_bootstrap_trusts_probe_over_whisper_misfire():
+    # LID.md real-mic accident scenario: session start, whisper-tiny says
+    # "zh" (wrong), SenseVoice's own probe says "ja" (right) -- the very
+    # first segment must decode as "ja", not "zh".
+    lang, switched = asr_engine.resolve_dual_confirm("zh", None, 3.0, "ja")
+    assert lang == "ja"
+    assert switched is False  # the two LIDs disagreed; not a confirmed agreement
+
+
+def test_dual_confirm_bootstrap_agreement_marks_switched():
+    lang, switched = asr_engine.resolve_dual_confirm("en", None, 3.0, "en")
+    assert (lang, switched) == ("en", True)
+
+
+def test_dual_confirm_holds_current_lang_on_disagreement():
+    # LID.md scenario: a ja-only session hit by a whisper-tiny "en" misfire;
+    # SenseVoice's probe still says "ja" -> stays on "ja", no switch.
+    lang, switched = asr_engine.resolve_dual_confirm("en", "ja", 1.5, "ja")
+    assert lang == "ja"
+    assert switched is False
+
+
+def test_dual_confirm_switches_immediately_on_agreement():
+    # LID.md scenario: whisper-tiny and SenseVoice both say "en" -> switch
+    # immediately, no length or repeat-count gate needed (both LIDs agreeing
+    # measured 85-98% accurate at every length in docs/LID.md table 3).
+    lang, switched = asr_engine.resolve_dual_confirm("en", "ja", 1.0, "en")
+    assert lang == "en"
+    assert switched is True
+
+
+def test_dual_confirm_ignores_sub_probe_length_even_on_agreement():
+    lang, switched = asr_engine.resolve_dual_confirm("en", "ja", 0.3, "en")
+    assert lang == "ja"
+    assert switched is False
+
+
+def test_dual_confirm_mismatch_at_bootstrap_falls_back_to_whisper_guess():
+    # if the caller couldn't get any SenseVoice tag at all (e.g. --minimal
+    # install without the sv model), sv_lang is "" -- bootstrap must still
+    # resolve to something rather than staying silent forever.
+    lang, switched = asr_engine.resolve_dual_confirm("zh", None, 3.0, "")
+    assert lang == "zh"
+    assert switched is False
+
+
 def test_sticky_long_detections_still_confirm_a_switch_under_large_guard():
     # Detections at or above the guard length behave exactly as before:
     # switch_confirm consecutive ones confirm a genuine switch.

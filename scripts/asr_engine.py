@@ -145,6 +145,79 @@ def script_corrected_lang(tagged: str, text: str) -> str:
     return tagged
 
 
+
+# The 5 languages SenseVoice's own internal LID can arbitrate (its model
+# directory name: zh-en-ja-ko-yue). whisper-tiny can never actually emit
+# "yue" as a candidate (see the zh/yue arbitration in transcribe() below),
+# but it's listed here for documentation symmetry with docs/LID.md.
+DUAL_CONFIRM_LANGS = {"ja", "en", "zh", "ko", "yue"}
+
+# A whisper-tiny candidate shorter than this is presumed non-speech noise
+# (jingle/SFX/misfire) and never confirms a switch even if SenseVoice agrees.
+MIN_PROBE_S = 0.5
+
+_SV_LID_CODES = ("ja", "en", "zh", "ko", "yue")
+
+
+def sv_lid_tag(sv_tag: str) -> str:
+    """Normalize SenseVoice's raw '<|xx|>'-style language tag to a bare code
+    ("ja"/"en"/"zh"/"ko"/"yue"), or "" if none of the 5 codes appear."""
+    for code in _SV_LID_CODES:
+        if code in sv_tag:
+            return code
+    return ""
+
+
+def resolve_dual_confirm(
+    lang: str, last_lang: str | None, speech_s: float | None, sv_lang: str,
+) -> tuple[str, bool]:
+    """Dual-LID switch confirmation for the 5 SenseVoice-covered languages.
+
+    docs/LID.md measured whisper-tiny alone at only 59-65% LID accuracy at
+    2 seconds (far worse under babble noise -- 59%), but whisper-tiny AND
+    SenseVoice's own internal LID AGREEING on the same language hits
+    85-98% accuracy at the same length ("一致時正解率" in the LID.md
+    tables, which beats "単独LID全体正解率" at every measured length in
+    both clean and babble_snr10). So instead of gating a switch on segment
+    length or repeat-count (the old resolve_sticky_lang hysteresis), gate
+    it on the two independent LID signals agreeing: length and repeat-count
+    add nothing once both models agree, and agreement is available from the
+    very first segment.
+
+    `sv_lang` is the caller's already-computed SenseVoice LID tag for this
+    exact audio (via sv_lid_tag() on its decode's .lang field) -- this
+    function is pure and makes no model calls itself.
+
+    Session bootstrap (last_lang is None) has no current language to hold
+    at while waiting for agreement, so it resolves directly to `sv_lang`:
+    SenseVoice's own LID is already more accurate alone than whisper-tiny
+    alone (docs/LID.md table 2 vs table 1), and this is confirmed by
+    agreement whenever sv_lang == lang too (this is the case tests exercise
+    where whisper-tiny misfires "zh" but SenseVoice correctly says "ja" --
+    the first segment must decode as "ja", not "zh", not silence).
+
+    A candidate shorter than MIN_PROBE_S is presumed non-speech noise and
+    never confirms a switch, even on agreement.
+
+    Returns (resolved_lang, switched) -- `switched` is True only when this
+    call is the reason the session's language changed (both LIDs agreed on
+    something new), so callers can clear any stale hysteresis state or
+    count corrections.
+    """
+    if lang == last_lang:
+        return lang, False
+    too_short = speech_s is not None and speech_s < MIN_PROBE_S
+    if last_lang is None:
+        # no current language to hold at: trust the probe's own judgment
+        resolved = sv_lang or lang
+        return resolved, (not too_short and sv_lang == lang)
+    if too_short:
+        return last_lang, False
+    if sv_lang == lang:
+        return lang, True
+    return last_lang, False
+
+
 def resolve_sticky_lang(
     lang: str, last_lang: str | None, speech_s: float | None,
     min_switch_s: float, switch_confirm: int,
@@ -337,8 +410,11 @@ class RoutedASR:
     def __init__(self, threads: int = 4, warmup: bool = True, preload: bool = True,
                  max_resident: int | None = None, punctuate: bool = True,
                  hotwords_file: str = "", replace_file: str = "",
-                 lid_switch_confirm: int = 2):
+                 lid_switch_confirm: int = 2, dual_confirm: bool = True,
+                 forced_lang: str | None = None):
         self._threads = threads
+        self.dual_confirm = dual_confirm  # --mode balanced (default); False = --mode fast
+        self.forced_lang = forced_lang    # --mode single: skip all LID/switch logic
         self._models: dict[str, object] = {}
         self._last_used: dict[str, float] = {}
         self._max_resident = max_resident
@@ -618,7 +694,10 @@ class RoutedASR:
                    live: bool = True) -> dict:
         """live=False (e.g. the refine pass re-decoding past audio) must not
         touch the sticky/pending language state of the live stream."""
-        if known_lang is not None and (speech_s is None or speech_s < 4.0):
+        if self.forced_lang is not None:
+            # --mode single: no LID, no switch logic, ever.
+            lang, lid_ms = self.forced_lang, 0.0
+        elif known_lang is not None and (speech_s is None or speech_s < 4.0):
             # trust the mid-utterance early LID only for short utterances; a
             # long one gives the full 4s window a chance to overrule the
             # guess made from its first 2 seconds (first-clip-per-language
@@ -630,33 +709,75 @@ class RoutedASR:
             lid_ms = (time.perf_counter() - t0) * 1000
 
         suppress_fallback = False
-        if not live:
-            pass  # out-of-band decode: leave the live language state alone
+        probe_ms = 0.0
+        sv_probe = None  # (text, raw_tag) if a SenseVoice confirmation probe already ran
+        if self.forced_lang is not None or not live:
+            pass  # out-of-band decode / forced single-language: no switch resolution
+        elif self.dual_confirm and lang in DUAL_CONFIRM_LANGS:
+            if lang != self.last_lang:
+                # docs/LID.md: for the 5 SenseVoice-covered languages, confirm
+                # a candidate switch with SenseVoice's own LID instead of the
+                # old length/repeat-count hysteresis (see resolve_dual_confirm).
+                t0 = time.perf_counter()
+                sv_lang = ""
+                try:
+                    probe_text, probe_tag = self._decode_full(self._get("sv"), samples, sample_rate)
+                    sv_probe = (probe_text, probe_tag)
+                    sv_lang = sv_lid_tag(probe_tag)
+                except ModelUnavailable:
+                    pass  # minimal install: no probe possible, mismatch by default
+                probe_ms = (time.perf_counter() - t0) * 1000
+                lang, switched = resolve_dual_confirm(lang, self.last_lang, speech_s, sv_lang)
+                suppress_fallback = speech_s is not None and speech_s < MIN_PROBE_S
+                if switched:
+                    # a confirmed dual-LID switch supersedes any hysteresis
+                    # candidate the fallback (non-SV) path was accumulating
+                    self._pending_lang, self._pending_count = None, 0
+            # lang == last_lang: already the session language, nothing to resolve
         else:
+            # European/other languages SenseVoice can't arbitrate: fall back
+            # to the length + consecutive-detection hysteresis.
             lang, suppress_fallback, self._pending_lang, self._pending_count = resolve_sticky_lang(
                 lang, self.last_lang, speech_s, self.min_switch_s, self.lid_switch_confirm,
                 self._pending_lang, self._pending_count,
             )
 
         t0 = time.perf_counter()
-        sv = None
-        if lang == "zh":
+        sv_text, sv_lang2 = (sv_probe if sv_probe is not None else (None, None))
+        if self.forced_lang is not None:
+            # --mode single: route straight to the forced language, no
+            # zh/yue arbitration and no script-based re-decode below.
+            rec, tier = self._route(lang)
+            text = self._decode(rec, samples, sample_rate)
+        elif lang == "zh":
             # whisper-tiny LID labels Cantonese as "zh" (measured 0/12 correct
             # on FLEURS yue), so let SenseVoice's internal LID arbitrate: keep
             # its transcript for yue, re-decode with Paraformer for true zh.
-            try:
-                sv = self._get("sv")
-            except ModelUnavailable:
-                sv = None  # minimal install: plain routing below
-        if sv is not None:
-            text, sv_lang = self._decode_full(sv, samples, sample_rate)
-            if "yue" in sv_lang:
-                lang, tier = "yue", "sv"
+            # Reuse the switch-confirmation probe above if it already decoded
+            # this exact audio through SenseVoice instead of a second pass.
+            if sv_text is None:
+                try:
+                    sv = self._get("sv")
+                    sv_text, sv_lang2 = self._decode_full(sv, samples, sample_rate)
+                except ModelUnavailable:
+                    sv_text = None  # minimal install: plain routing below
+            if sv_text is not None:
+                text = sv_text
+                if "yue" in sv_lang2:
+                    lang, tier = "yue", "sv"
+                else:
+                    rec, tier = self._get_with_fallback("pz")
+                    text2 = self._decode(rec, samples, sample_rate)
+                    if text2.strip():
+                        text = text2
             else:
-                rec, tier = self._get_with_fallback("pz")
-                text2 = self._decode(rec, samples, sample_rate)
-                if text2.strip():
-                    text = text2
+                rec, tier = self._route(lang)
+                text = self._decode(rec, samples, sample_rate)
+        elif lang in ("ko", "yue") and sv_text is not None and sv_lid_tag(sv_lang2) == lang:
+            # the switch-confirmation probe already decoded this exact audio
+            # through the tier "ko"/"yue" routes to anyway; reuse it instead
+            # of a second SenseVoice pass over the same samples.
+            text, tier = sv_text, "sv"
         else:
             rec, tier = self._route(lang)
             text = self._decode(rec, samples, sample_rate)
@@ -666,7 +787,7 @@ class RoutedASR:
             text = self._decode(self._get("omni"), samples, sample_rate)
             tier = "omni"
         corrected = script_corrected_lang(lang, text)
-        if live and text.strip() and corrected != lang:
+        if self.forced_lang is None and live and text.strip() and corrected != lang:
             # the decoded script contradicts the LID tag (romaji-mangled
             # English under a ja tag, CJK under a non-CJK tag): re-decode
             # with the right model before anyone sees the final.
@@ -714,4 +835,5 @@ class RoutedASR:
 
         if live and text.strip():  # empty results must not poison the sticky language
             self.last_lang = lang
-        return {"text": text, "lang": lang, "tier": tier, "lid_ms": lid_ms, "decode_ms": decode_ms}
+        return {"text": text, "lang": lang, "tier": tier, "lid_ms": lid_ms,
+                "decode_ms": decode_ms, "probe_ms": probe_ms}

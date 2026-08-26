@@ -161,13 +161,15 @@ class SessionStats:
         self.total_audio_s = 0.0
         self.segments = 0
         self.latencies_ms: list[float] = []
+        self.refine_lang_corrections = 0  # times the refine pass overruled the fast-path language
 
     def summary(self) -> str:
         if not self.latencies_ms:
             return f"total_audio={self.total_audio_s:.1f}s segments=0"
         mean = sum(self.latencies_ms) / len(self.latencies_ms)
         return (f"total_audio={self.total_audio_s:.1f}s segments={self.segments} "
-                f"mean_latency={mean:.0f}ms max_latency={max(self.latencies_ms):.0f}ms")
+                f"mean_latency={mean:.0f}ms max_latency={max(self.latencies_ms):.0f}ms "
+                f"refine_lang_corrections={self.refine_lang_corrections}")
 
 
 PREROLL_S = 1.0  # audio to prepend before the VAD's detected speech onset
@@ -349,12 +351,13 @@ class Refiner:
 
     def __init__(self, asr: RoutedASR, history: AudioHistory, sample_rate: int,
                  printer: PartialPrinter, transcript_path: str | None = None,
-                 translators: dict | None = None):
+                 translators: dict | None = None, stats: "SessionStats | None" = None):
         self.asr = asr
         self.history = history
         self.sr = sample_rate
         self.printer = printer
         self.translators = translators or {}  # ja->target, synchronous per refine
+        self.stats = stats
         self.spans: list[tuple[int, int, str, str, str]] = []
         self._transcript = open(transcript_path, "a", encoding="utf-8") if transcript_path else None
         self._worker_lock = threading.Lock()  # serialize refine decodes off the hot path
@@ -394,23 +397,45 @@ class Refiner:
             # not delay the next utterance's instant final (soak test showed
             # 2.6s latency spikes when run inline)
             with self._worker_lock:
+                refine_lang = lang
                 if mixed:
                     text = fast_joined
                 else:
-                    text = self.asr.transcribe(buf, self.sr, known_lang=lang, live=False)["text"]
+                    # re-run LID on the merged (longer, higher-confidence)
+                    # audio: the fast path's per-segment majority vote used
+                    # only 2-4s clips, which docs/LID.md measured well below
+                    # whisper-tiny's high-confidence length for several
+                    # languages. If the full-window LID disagrees, trust it
+                    # and re-decode with the corrected language's model.
+                    detected = self.asr._identify_lang(buf, self.sr)
+                    if detected != lang:
+                        text = self.asr.transcribe(buf, self.sr, known_lang=detected,
+                                                    live=False)["text"]
+                        if text.strip():
+                            refine_lang = detected
+                        else:
+                            text = self.asr.transcribe(buf, self.sr, known_lang=lang,
+                                                        live=False)["text"]
+                    else:
+                        text = self.asr.transcribe(buf, self.sr, known_lang=lang,
+                                                    live=False)["text"]
                 # a merged re-decode must never LOSE content; if it comes back
                 # much shorter than the fast finals combined, trust those
                 if len(text.strip()) < 0.7 * len(fast_joined):
                     text = fast_joined
+                    refine_lang = lang
                 if not text.strip():
                     return
-                tag = f"{speaker}|{lang}" if speaker else lang
+                if refine_lang != lang and self.stats is not None:
+                    self.stats.refine_lang_corrections += 1
+                    print(f"[refine] language corrected {lang}->{refine_lang}", flush=True)
+                tag = f"{speaker}|{refine_lang}" if speaker else refine_lang
                 print(f"[refine/{tag}] {text}", flush=True)
                 if self.printer.server is not None:
-                    self.printer.server.publish({"type": "refine", "text": text, "lang": lang,
+                    self.printer.server.publish({"type": "refine", "text": text, "lang": refine_lang,
                                                  "speaker": speaker})
                 outs = []
-                if self.translators and lang == "ja":
+                if self.translators and refine_lang == "ja":
                     # synchronous here (we're already off the hot path) so the
                     # transcript keeps source and translations adjacent, in
                     # order. The MT models degrade on multi-sentence input,
@@ -504,15 +529,31 @@ def main():
                     help="hotword list (one per line) to bias Japanese decoding")
     ap.add_argument("--replace", metavar="PATH", default="",
                     help="user dictionary: 'wrong=right' per line, applied to all output")
-    ap.add_argument("--lang-switch-guard", type=float, default=2.0, metavar="SEC",
+    ap.add_argument("--mode", choices=["single", "balanced", "fast"], default="balanced",
+                    help="language-switch policy preset (default balanced). single: fixed to "
+                         "--lang, no LID/switching at all. balanced: dual-LID switch "
+                         "confirmation for ja/en/zh/ko/yue via SenseVoice, length+repeat-count "
+                         "hysteresis for other languages (docs/LID.md). fast: switch "
+                         "immediately on any whisper-tiny detection, no confirmation "
+                         "(equivalent to --lid-switch-confirm 1 --lang-switch-guard 0). "
+                         "The individual --lang-switch-guard/--lid-switch-confirm flags below "
+                         "still override the preset's values when passed explicitly.")
+    ap.add_argument("--lang", metavar="CODE", default=None,
+                    help="required by --mode single: force every segment to this language "
+                         "code, skipping LID and switch logic entirely")
+    ap.add_argument("--lang-switch-guard", type=float, default=None, metavar="SEC",
                     help="treat a new-language detection shorter than SEC as noise: it never "
                          "counts toward confirming a switch (see --lid-switch-confirm) and it "
                          "suppresses the omnilingual fallback on an empty decode "
-                         "(0 disables; raise for single-language streams)")
-    ap.add_argument("--lid-switch-confirm", type=int, default=2, metavar="N",
+                         "(0 disables; raise for single-language streams). Only used as the "
+                         "fallback policy for languages SenseVoice can't confirm (see --mode). "
+                         "Default depends on --mode (2.0 for balanced, 0 for fast).")
+    ap.add_argument("--lid-switch-confirm", type=int, default=None, metavar="N",
                     help="consecutive same-language detections (each >= --lang-switch-guard "
                          "long) required before the session switches to a new language; "
-                         "raise for stickier single-language sessions")
+                         "raise for stickier single-language sessions. Only used as the "
+                         "fallback policy for languages SenseVoice can't confirm (see --mode). "
+                         "Default depends on --mode (2 for balanced, 1 for fast).")
     ap.add_argument("--speakers", action="store_true",
                     help="label utterances with speaker ids (S1, S2, ...)")
     ap.add_argument("--translate", nargs="?", const="en", default=None, metavar="LANGS",
@@ -531,6 +572,17 @@ def main():
                     help="port for the --input ws /ingest endpoint (default 8766)")
     args = ap.parse_args()
 
+    if args.mode == "single" and not args.lang:
+        ap.error("--mode single requires --lang CODE")
+    # --mode bundles defaults for the two hysteresis knobs; an explicitly
+    # passed --lang-switch-guard/--lid-switch-confirm still wins.
+    mode_defaults = {"balanced": (2.0, 2), "fast": (0.0, 1), "single": (2.0, 2)}
+    default_guard, default_confirm = mode_defaults[args.mode]
+    if args.lang_switch_guard is None:
+        args.lang_switch_guard = default_guard
+    if args.lid_switch_confirm is None:
+        args.lid_switch_confirm = default_confirm
+
     server = None
     if args.serve:
         from subtitle_server import SubtitleServer
@@ -543,7 +595,9 @@ def main():
     asr = RoutedASR(threads=args.threads,
                     max_resident=args.max_resident if args.max_resident > 0 else None,
                     hotwords_file=args.hotwords, replace_file=args.replace,
-                    lid_switch_confirm=max(args.lid_switch_confirm, 1))
+                    lid_switch_confirm=max(args.lid_switch_confirm, 1),
+                    dual_confirm=(args.mode != "fast"),
+                    forced_lang=args.lang if args.mode == "single" else None)
     asr.min_switch_s = max(args.lang_switch_guard, 0.0)
     vad = build_vad(args.min_silence, args.max_speech)
     stats = SessionStats()
@@ -566,7 +620,7 @@ def main():
     history = AudioHistory(SAMPLE_RATE)
     refiner = None if args.no_refine else Refiner(asr, history, SAMPLE_RATE, printer,
                                                   transcript_path=args.transcript,
-                                                  translators=translators)
+                                                  translators=translators, stats=stats)
 
     def finish(sr):
         vad.flush()
