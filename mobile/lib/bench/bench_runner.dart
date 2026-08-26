@@ -91,7 +91,10 @@ class BenchRunner {
       final stream = recognizer.createStream();
       final stopwatch = Stopwatch()..start();
       try {
-        stream.acceptWaveform(samples: wave.samples, sampleRate: wave.sampleRate);
+        stream.acceptWaveform(
+          samples: wave.samples,
+          sampleRate: wave.sampleRate,
+        );
         recognizer.decode(stream);
         stopwatch.stop();
 
