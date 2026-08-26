@@ -63,10 +63,10 @@ class _LivePageState extends State<LivePage> {
   String? _broadcastError;
   String? _lanAddress;
 
-  /// Fixed language tag reported on every broadcast event. The mobile app
-  /// runs a single model per session (no per-utterance language routing
-  /// like the desktop pipeline), so this is a simple constant for now —
-  /// see [FinalSubtitleEvent.lang].
+  /// Fallback language tag for broadcast events when a segment carries no
+  /// routed language (a plain [RoutingProfile.jaOnly] session, which only
+  /// ever runs the ja model) — see [FinalSubtitleEvent.lang] and
+  /// [_onEntry], which prefers [LiveTranscriptEntry.lang] when set.
   static const _broadcastLang = 'ja';
 
   @override
@@ -117,7 +117,10 @@ class _LivePageState extends State<LivePage> {
       _broadcastServer.broadcast(
         FinalSubtitleEvent(
           text: entry.text,
-          lang: _broadcastLang,
+          // Use the segment's routed language when available (a
+          // [RoutingProfile.jaSenseVoice] session) — falling back to the
+          // fixed ja default would mislabel every non-ja routed segment.
+          lang: entry.lang ?? _broadcastLang,
           latencyMs: entry.latencyMs,
         ),
       );
@@ -155,9 +158,49 @@ class _LivePageState extends State<LivePage> {
       final result = await LiveTranscriber.runDebugWavRefineTest(
         modelDir: _modelDirController.text.trim(),
         wavPath: _debugWavPathController.text.trim(),
+        routingProfile: _routingProfile,
+        senseVoiceModelDir: _routingProfile.dualConfirmed
+            ? _senseVoiceModelDirController.text.trim()
+            : null,
+        lidModelDir: _routingProfile.dualConfirmed
+            ? _lidModelDirController.text.trim()
+            : null,
       );
       if (!mounted) return;
       setState(() => _debugWavResult = result);
+      // Also feed the results through the same entry/broadcast pipeline a
+      // real live session uses (_onEntry/_onRefineEntry) — this is the only
+      // way to exercise the transcript list and the 配信サーバー broadcast
+      // end to end on an emulator, which has no usable microphone (see the
+      // class doc on `runDebugWavRefineTest`).
+      final now = DateTime.now();
+      if (result.segment1Text.isNotEmpty) {
+        _onEntry(
+          LiveTranscriptEntry(
+            text: result.segment1Text,
+            timestamp: now,
+            lang: result.segment1Lang,
+          ),
+        );
+      }
+      if (result.segment2Text.isNotEmpty) {
+        _onEntry(
+          LiveTranscriptEntry(
+            text: result.segment2Text,
+            timestamp: now,
+            lang: result.segment2Lang,
+          ),
+        );
+      }
+      if (result.refineText.isNotEmpty) {
+        _onRefineEntry(
+          LiveTranscriptEntry(
+            text: result.refineText,
+            timestamp: now,
+            lang: result.refineLang,
+          ),
+        );
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() => _debugWavError = e.toString());
@@ -668,20 +711,66 @@ class _DebugWavRefineCard extends StatelessWidget {
               ),
             if (result != null) ...[
               const SizedBox(height: 8),
-              Text(
-                '個別1: ${result!.segment1Text.isEmpty ? '(empty)' : result!.segment1Text}',
+              _DebugResultLine(
+                label: '個別1',
+                text: result!.segment1Text,
+                lang: result!.segment1Lang,
               ),
-              Text(
-                '個別2: ${result!.segment2Text.isEmpty ? '(empty)' : result!.segment2Text}',
+              _DebugResultLine(
+                label: '個別2',
+                text: result!.segment2Text,
+                lang: result!.segment2Lang,
               ),
               const Divider(height: 16),
-              Text(
-                '清書 (結合): ${result!.refineText.isEmpty ? '(empty)' : result!.refineText}',
-                style: const TextStyle(fontWeight: FontWeight.bold),
+              _DebugResultLine(
+                label: '清書 (結合)',
+                text: result!.refineText,
+                lang: result!.refineLang,
+                bold: true,
               ),
             ],
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// One labeled result row in [_DebugWavRefineCard]: the decoded text, with
+/// a [_LangBadge] alongside it when the test ran with routing enabled
+/// (`lang` non-null).
+class _DebugResultLine extends StatelessWidget {
+  const _DebugResultLine({
+    required this.label,
+    required this.text,
+    this.lang,
+    this.bold = false,
+  });
+
+  final String label;
+  final String text;
+  final String? lang;
+  final bool bold;
+
+  @override
+  Widget build(BuildContext context) {
+    final style = bold ? const TextStyle(fontWeight: FontWeight.bold) : null;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Text(
+              '$label: ${text.isEmpty ? '(empty)' : text}',
+              style: style,
+            ),
+          ),
+          if (lang != null) ...[
+            const SizedBox(width: 8),
+            _LangBadge(lang: lang!),
+          ],
+        ],
       ),
     );
   }

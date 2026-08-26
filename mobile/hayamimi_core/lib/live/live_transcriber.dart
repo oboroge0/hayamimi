@@ -470,16 +470,26 @@ class LiveTranscriber {
   /// real WAV file, without needing a live mic session or an emulator's
   /// (nonexistent) microphone.
   ///
-  /// Loads its own short-lived [sherpa_onnx.OfflineRecognizer] from
-  /// [modelDir] (independent of any running live session), splits
-  /// [wavPath]'s samples into two halves to stand in for two VAD segments,
-  /// decodes each half individually (the "fast path" comparison), then runs
-  /// them back through [combineSegmentSamples] and decodes the combined
-  /// audio (the "refine" result) — so a caller can see whether the refine
-  /// decode differs from the two individual ones.
+  /// Loads its own short-lived recognizer(s) from [modelDir] (independent of
+  /// any running live session), splits [wavPath]'s samples into two halves
+  /// to stand in for two VAD segments, decodes each half individually (the
+  /// "fast path" comparison), then runs them back through
+  /// [combineSegmentSamples] and decodes the combined audio (the "refine"
+  /// result) — so a caller can see whether the refine decode differs from
+  /// the two individual ones.
+  ///
+  /// When [routingProfile] is [RoutingProfile.jaSenseVoice] (mirrors
+  /// [start]'s routing parameters), each decode goes through a short-lived
+  /// [RoutedRecognizerSet] instead of a plain ja-only recognizer, so this
+  /// path can also exercise the routing badge shown on the Live screen
+  /// without a live mic session — the only way to do so on an emulator,
+  /// which has no usable microphone.
   static Future<DebugRefineTestResult> runDebugWavRefineTest({
     required String modelDir,
     required String wavPath,
+    RoutingProfile routingProfile = RoutingProfile.jaOnly,
+    String? senseVoiceModelDir,
+    String? lidModelDir,
   }) async {
     final dir = Directory(modelDir);
     if (!await dir.exists()) {
@@ -490,35 +500,57 @@ class LiveTranscriber {
       throw LiveTranscriberException('WAV file not found: $wavPath');
     }
 
-    final filenames = await dir
-        .list()
-        .where((e) => e is File)
-        .map((e) => e.uri.pathSegments.last)
-        .toList();
-
-    final ResolvedModelFiles resolved;
-    try {
-      resolved = resolveZipformerTransducerFiles(filenames);
-    } on ModelFileResolutionException catch (e) {
-      throw LiveTranscriberException(e.message);
+    if (routingProfile.dualConfirmed &&
+        (senseVoiceModelDir == null || lidModelDir == null)) {
+      throw LiveTranscriberException(
+        '${routingProfile.label} requires senseVoiceModelDir and '
+        'lidModelDir.',
+      );
     }
 
-    final sep = Platform.pathSeparator;
-    final recognizer = sherpa_onnx.OfflineRecognizer(
-      sherpa_onnx.OfflineRecognizerConfig(
-        model: sherpa_onnx.OfflineModelConfig(
-          transducer: sherpa_onnx.OfflineTransducerModelConfig(
-            encoder: '$modelDir$sep${resolved.encoder}',
-            decoder: '$modelDir$sep${resolved.decoder}',
-            joiner: '$modelDir$sep${resolved.joiner}',
+    sherpa_onnx.OfflineRecognizer? recognizer;
+    RoutedRecognizerSet? routed;
+    if (routingProfile.dualConfirmed) {
+      try {
+        routed = await RoutedRecognizerSet.build(
+          reazonModelDir: modelDir,
+          senseVoiceModelDir: senseVoiceModelDir!,
+          lidModelDir: lidModelDir!,
+        );
+      } on RoutedRecognizerException catch (e) {
+        throw LiveTranscriberException(e.message);
+      }
+    } else {
+      final filenames = await dir
+          .list()
+          .where((e) => e is File)
+          .map((e) => e.uri.pathSegments.last)
+          .toList();
+
+      final ResolvedModelFiles resolved;
+      try {
+        resolved = resolveZipformerTransducerFiles(filenames);
+      } on ModelFileResolutionException catch (e) {
+        throw LiveTranscriberException(e.message);
+      }
+
+      final sep = Platform.pathSeparator;
+      recognizer = sherpa_onnx.OfflineRecognizer(
+        sherpa_onnx.OfflineRecognizerConfig(
+          model: sherpa_onnx.OfflineModelConfig(
+            transducer: sherpa_onnx.OfflineTransducerModelConfig(
+              encoder: '$modelDir$sep${resolved.encoder}',
+              decoder: '$modelDir$sep${resolved.decoder}',
+              joiner: '$modelDir$sep${resolved.joiner}',
+            ),
+            tokens: '$modelDir$sep${resolved.tokens}',
+            numThreads: 2,
+            debug: false,
+            provider: 'cpu',
           ),
-          tokens: '$modelDir$sep${resolved.tokens}',
-          numThreads: 2,
-          debug: false,
-          provider: 'cpu',
         ),
-      ),
-    );
+      );
+    }
 
     try {
       final wave = sherpa_onnx.readWave(wavPath);
@@ -528,12 +560,16 @@ class LiveTranscriber {
         );
       }
 
-      String decode(Float32List samples) {
-        final stream = recognizer.createStream();
+      (String, String?) decode(Float32List samples) {
+        if (routed != null) {
+          final result = routed.decode(samples);
+          return (result.text, result.lang);
+        }
+        final stream = recognizer!.createStream();
         try {
           stream.acceptWaveform(samples: samples, sampleRate: wave.sampleRate);
           recognizer.decode(stream);
-          return recognizer.getResult(stream).text.trim();
+          return (recognizer.getResult(stream).text.trim(), null);
         } finally {
           stream.free();
         }
@@ -551,18 +587,22 @@ class LiveTranscriber {
         capturedAt: DateTime.now(),
       );
 
-      final text1 = decode(segment1.samples);
-      final text2 = decode(segment2.samples);
+      final (text1, lang1) = decode(segment1.samples);
+      final (text2, lang2) = decode(segment2.samples);
       final combined = combineSegmentSamples([segment1, segment2]);
-      final refineText = decode(combined);
+      final (refineText, refineLang) = decode(combined);
 
       return DebugRefineTestResult(
         segment1Text: text1,
         segment2Text: text2,
         refineText: refineText,
+        segment1Lang: lang1,
+        segment2Lang: lang2,
+        refineLang: refineLang,
       );
     } finally {
-      recognizer.free();
+      recognizer?.free();
+      routed?.free();
     }
   }
 }
@@ -575,9 +615,19 @@ class DebugRefineTestResult {
     required this.segment1Text,
     required this.segment2Text,
     required this.refineText,
+    this.segment1Lang,
+    this.segment2Lang,
+    this.refineLang,
   });
 
   final String segment1Text;
   final String segment2Text;
   final String refineText;
+
+  /// The language each decode resolved to, when [LiveTranscriber.start]'s
+  /// `routingProfile` was [RoutingProfile.jaSenseVoice] — `null` for a
+  /// plain ja-only test run.
+  final String? segment1Lang;
+  final String? segment2Lang;
+  final String? refineLang;
 }
