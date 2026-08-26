@@ -1,5 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <!-- Debug/profile builds already carry this (for the VM service), but a
+         release build needs it declared explicitly for the "other app
+         integration" broadcast server (lib/server/) to bind a socket. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
     <application
         android:label="hayamimi_mobile"
         android:name="${applicationName}"

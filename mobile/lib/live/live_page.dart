@@ -5,6 +5,9 @@ import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../bench/model_kind.dart';
+import '../server/lan_address.dart';
+import '../server/subtitle_broadcast_server.dart';
+import '../server/subtitle_event.dart';
 import 'live_transcript_entry.dart';
 import 'live_transcriber.dart';
 
@@ -31,6 +34,22 @@ class _LivePageState extends State<LivePage> {
   bool _isStarting = false;
   bool _isDecoding = false;
   String? _errorText;
+
+  // "Other app integration": an in-app HTTP server that mirrors the
+  // desktop hayamimi subtitle feed (scripts/subtitle_server.py) so an OBS
+  // browser source or browser on the same LAN can subscribe to this
+  // phone's live transcript. See lib/server/.
+  final _broadcastServer = SubtitleBroadcastServer();
+  bool _isBroadcastEnabled = false;
+  bool _isBroadcastStarting = false;
+  String? _broadcastError;
+  String? _lanAddress;
+
+  /// Fixed language tag reported on every broadcast event. The mobile app
+  /// runs a single model per session (no per-utterance language routing
+  /// like the desktop pipeline), so this is a simple constant for now —
+  /// see [FinalSubtitleEvent.lang].
+  static const _broadcastLang = 'ja';
 
   @override
   void initState() {
@@ -69,6 +88,48 @@ class _LivePageState extends State<LivePage> {
         curve: Curves.easeOut,
       );
     });
+    if (_broadcastServer.isRunning) {
+      _broadcastServer.broadcast(
+        FinalSubtitleEvent(
+          text: entry.text,
+          lang: _broadcastLang,
+          latencyMs: entry.latencyMs,
+        ),
+      );
+    }
+  }
+
+  Future<void> _toggleBroadcast() async {
+    if (_broadcastServer.isRunning) {
+      await _broadcastServer.stop();
+      if (!mounted) return;
+      setState(() {
+        _isBroadcastEnabled = false;
+        _lanAddress = null;
+      });
+      return;
+    }
+
+    setState(() {
+      _isBroadcastStarting = true;
+      _broadcastError = null;
+    });
+    try {
+      await _broadcastServer.start();
+      final lanAddress = await currentLanAddress();
+      if (!mounted) return;
+      setState(() {
+        _isBroadcastEnabled = true;
+        _lanAddress = lanAddress;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _broadcastError = e.toString());
+    } finally {
+      if (mounted) {
+        setState(() => _isBroadcastStarting = false);
+      }
+    }
   }
 
   Future<void> _toggle() async {
@@ -103,6 +164,7 @@ class _LivePageState extends State<LivePage> {
     _entriesSubscription?.cancel();
     _decodingSubscription?.cancel();
     _transcriber.dispose();
+    _broadcastServer.stop();
     _modelDirController.dispose();
     _vadModelPathController.dispose();
     _scrollController.dispose();
@@ -173,6 +235,15 @@ class _LivePageState extends State<LivePage> {
                 style: TextStyle(color: Theme.of(context).colorScheme.error),
               ),
             ),
+          const SizedBox(height: 12),
+          _BroadcastServerCard(
+            isEnabled: _isBroadcastEnabled,
+            isStarting: _isBroadcastStarting,
+            lanAddress: _lanAddress,
+            port: _broadcastServer.boundPort ?? _broadcastServer.port,
+            errorText: _broadcastError,
+            onToggle: _isBroadcastStarting ? null : _toggleBroadcast,
+          ),
           const SizedBox(height: 16),
           Expanded(
             child: _entries.isEmpty
@@ -199,4 +270,78 @@ class _LivePageState extends State<LivePage> {
 String _formatTimestamp(DateTime timestamp) {
   String twoDigits(int value) => value.toString().padLeft(2, '0');
   return '${twoDigits(timestamp.hour)}:${twoDigits(timestamp.minute)}:${twoDigits(timestamp.second)}';
+}
+
+/// Toggle + status card for the "other app integration" broadcast server:
+/// lets OBS or a browser on the same LAN subscribe to this phone's live
+/// transcript at `http://<lan ip>:<port>/`.
+class _BroadcastServerCard extends StatelessWidget {
+  const _BroadcastServerCard({
+    required this.isEnabled,
+    required this.isStarting,
+    required this.lanAddress,
+    required this.port,
+    required this.errorText,
+    required this.onToggle,
+  });
+
+  final bool isEnabled;
+  final bool isStarting;
+  final String? lanAddress;
+  final int port;
+  final String? errorText;
+  final VoidCallback? onToggle;
+
+  @override
+  Widget build(BuildContext context) {
+    final url = lanAddress == null ? null : 'http://$lanAddress:$port/';
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('配信サーバー'),
+              subtitle: const Text(
+                '同じLAN内のOBS/ブラウザに字幕を配信します（画面ON中のみ）',
+              ),
+              value: isEnabled,
+              onChanged: isStarting || onToggle == null
+                  ? null
+                  : (_) => onToggle!(),
+              secondary: isStarting
+                  ? const SizedBox(
+                      height: 20,
+                      width: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.podcasts),
+            ),
+            if (isEnabled)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: url == null
+                    ? const Text(
+                        'LAN上のIPアドレスが見つかりません（Wi-Fi未接続？）',
+                      )
+                    : SelectableText(url),
+              ),
+            if (errorText != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(
+                  errorText!,
+                  style: TextStyle(
+                    color: Theme.of(context).colorScheme.error,
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
 }

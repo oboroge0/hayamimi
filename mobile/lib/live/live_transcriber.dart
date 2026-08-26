@@ -177,14 +177,20 @@ class LiveTranscriber {
     }
 
     _decodingController.add(true);
+    final stopwatch = Stopwatch()..start();
     final stream = recognizer.createStream();
     try {
       stream.acceptWaveform(samples: segment.samples, sampleRate: sampleRate);
       recognizer.decode(stream);
       final result = recognizer.getResult(stream);
+      stopwatch.stop();
       if (result.text.trim().isNotEmpty) {
         _entriesController.add(
-          LiveTranscriptEntry(text: result.text, timestamp: DateTime.now()),
+          LiveTranscriptEntry(
+            text: result.text,
+            timestamp: DateTime.now(),
+            latencyMs: stopwatch.elapsedMicroseconds / 1000,
+          ),
         );
       }
     } finally {
