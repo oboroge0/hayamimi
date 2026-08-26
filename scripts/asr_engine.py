@@ -218,6 +218,51 @@ def resolve_dual_confirm(
     return last_lang, False
 
 
+# The refine pass re-runs whisper-tiny LID on a merged utterance group,
+# trusting it more than the fast path's per-segment vote because the group
+# is (usually) longer. But a Refiner "group" can be a single short segment
+# sitting alone between silence gaps -- not a real multi-segment utterance
+# -- so that assumption doesn't automatically hold. docs/LID.md's table 1
+# shows whisper-tiny-ALONE accuracy hasn't clearly separated from chance for
+# several languages below ~2.5s (babble_snr10 overall: 44% at 1.5s, 59% at
+# 2.0s, 65% at 2.5s); below that, a lone re-judgment is a coin flip that can
+# undo a live decision the dual-LID-confirmed bootstrap path already got
+# right. Real-mic incident: a 1.9s segment correctly resolved live as "ko"
+# (bootstrap dual-confirm) sat alone in its own refine group and got
+# whisper-tiny-alone re-judged back to "ru", reproducing the exact garbled
+# collapse the bootstrap fix exists to prevent.
+REFINE_MIN_REGROUP_S = 2.5
+
+
+def resolve_refine_lang(
+    current_lang: str, whisper_lang: str, sv_lang: str, group_duration_s: float,
+) -> tuple[str, bool]:
+    """Decide whether the refine pass's LID re-judgment should override the
+    fast path's per-segment language for this utterance group.
+
+    Applies the same dual-LID confirmation as the live path
+    (resolve_dual_confirm): a whisper-tiny re-judgment that disagrees with
+    the group's current language is only accepted when SenseVoice's own
+    probe on the SAME merged audio agrees with whisper-tiny. Below
+    REFINE_MIN_REGROUP_S total group duration, the re-judgment is skipped
+    outright regardless of agreement -- callers should not even bother
+    running the SenseVoice probe in that case.
+
+    `sv_lang` is the caller's SenseVoice LID tag for the merged group audio
+    (via sv_lid_tag() on its decode's .lang field); this function is pure
+    and makes no model calls itself.
+
+    Returns (resolved_lang, changed).
+    """
+    if whisper_lang == current_lang:
+        return current_lang, False
+    if group_duration_s < REFINE_MIN_REGROUP_S:
+        return current_lang, False
+    if sv_lang == whisper_lang:
+        return whisper_lang, True
+    return current_lang, False
+
+
 def resolve_sticky_lang(
     lang: str, last_lang: str | None, speech_s: float | None,
     min_switch_s: float, switch_confirm: int,

@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
-from realtime_transcribe import (AudioHistory, PREROLL_S, digits_consistent,
+from realtime_transcribe import (AudioHistory, PREROLL_S, Refiner, digits_consistent,
                                  translate_by_sentence)
 import asr_engine
 import translate_m2m
@@ -484,3 +484,98 @@ def test_sticky_long_detections_still_confirm_a_switch_under_large_guard():
     assert lang2 == "zh"
     assert suppress2 is False
     assert (pend2, cnt2) == (None, 0)
+
+
+# ---- refine-pass dual-LID confirmation (real-mic incident: switch_scenario.wav) --
+
+def test_refine_short_solo_group_never_reconsiders_language():
+    # A refine "group" can be a single short segment sitting alone between
+    # silence gaps -- not a real multi-segment utterance. Below
+    # REFINE_MIN_REGROUP_S, whisper-tiny's re-judgment is skipped outright,
+    # even if it disagrees with the current language (this is what let a
+    # correctly dual-confirmed live "ko" get flipped back to "ru" by a lone
+    # whisper-tiny re-judgment during refine).
+    lang, changed = asr_engine.resolve_refine_lang("ko", "ru", "", 1.9)
+    assert (lang, changed) == ("ko", False)
+
+
+def test_refine_disagreement_without_sv_confirmation_keeps_current_lang():
+    # Long enough to reconsider, but SenseVoice's probe on the same merged
+    # audio does NOT agree with whisper-tiny's re-judgment: keep the
+    # current (fast-path) language rather than trusting whisper-tiny alone.
+    lang, changed = asr_engine.resolve_refine_lang("ko", "ru", "ja", 5.0)
+    assert (lang, changed) == ("ko", False)
+
+
+def test_refine_agreement_above_length_gate_overrides():
+    # whisper-tiny's re-judgment AND SenseVoice's probe on the merged audio
+    # agree, and the group is long enough: accept the correction.
+    lang, changed = asr_engine.resolve_refine_lang("ko", "ja", "ja", 5.0)
+    assert (lang, changed) == ("ja", True)
+
+
+def test_refine_same_lang_is_a_noop():
+    lang, changed = asr_engine.resolve_refine_lang("ja", "ja", "ja", 5.0)
+    assert (lang, changed) == ("ja", False)
+
+
+def test_refine_agreement_below_length_gate_still_does_not_override():
+    # Even if whisper-tiny and SenseVoice happen to agree, a sub-2.5s group
+    # doesn't get to override -- docs/LID.md's own curve hasn't separated
+    # from noise yet at that length for several languages.
+    lang, changed = asr_engine.resolve_refine_lang("ko", "ja", "ja", 2.0)
+    assert (lang, changed) == ("ko", False)
+
+
+# ---- Refiner.add_span: groups must not cross a language boundary ----------
+
+class _FakeRefiner:
+    """Exercises Refiner.add_span's grouping decision in isolation, with
+    maybe_refine stubbed out so no model/audio-buffer work happens (mirrors
+    the real method's effect on self.spans: a forced flush empties it)."""
+
+    add_span = Refiner.add_span
+
+    def __init__(self):
+        self.spans = []
+        self.calls = []
+
+    def maybe_refine(self, now_sample, force=False, force_sync=None):
+        self.calls.append((now_sample, force, force_sync))
+        self.spans = []
+
+
+def test_refiner_add_span_keeps_same_language_in_one_group():
+    r = _FakeRefiner()
+    r.add_span(0, 16000, "ja", "こんにちは", "")
+    r.add_span(16000, 32000, "ja", "元気ですか", "")
+    assert r.calls == []
+    assert len(r.spans) == 2
+
+
+def test_refiner_add_span_splits_group_at_language_boundary():
+    # Real-mic incident: an en segment sandwiched between two ja ones used
+    # to accumulate into one refine group (the "mixed" guard in maybe_refine
+    # protected the DECODE but not the display), printing as a single
+    # "[refine/ja] ..." line that swallowed the English sentence. A
+    # language change must force-flush the previous group asynchronously
+    # (force=True, force_sync=False: not urgent, must not block the hot
+    # path) before starting a new one.
+    r = _FakeRefiner()
+    r.add_span(0, 16000, "ja", "そこの上流かな", "")
+    r.add_span(48000, 64000, "en", "He was in a fevered state of mind", "")
+    assert r.calls == [(48000, True, False)]
+    assert len(r.spans) == 1
+    assert r.spans[0][2] == "en"
+
+
+def test_refiner_add_span_splits_again_on_return_to_original_language():
+    # ja -> en -> ja must produce three separate groups, not merge the
+    # trailing ja span back into anything.
+    r = _FakeRefiner()
+    r.add_span(0, 16000, "ja", "そこの上流かな", "")
+    r.add_span(48000, 64000, "en", "He was in a fevered state of mind", "")
+    r.add_span(96000, 112000, "ja", "得意のドルフィンキック", "")
+    assert r.calls == [(48000, True, False), (96000, True, False)]
+    assert len(r.spans) == 1
+    assert r.spans[0][2] == "ja"

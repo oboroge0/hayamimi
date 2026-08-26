@@ -203,7 +203,7 @@ class AudioHistory:
 
 def drain_segments(vad, sample_rate: int, asr: RoutedASR, stats: SessionStats,
                    printer: PartialPrinter, history: AudioHistory | None = None,
-                   known_lang: str | None = None, spans_out: list | None = None,
+                   known_lang: str | None = None, refiner: "Refiner | None" = None,
                    translator_worker: "TranslationWorker | None" = None,
                    speaker_labeler=None) -> int:
     drained = 0
@@ -245,9 +245,9 @@ def drain_segments(vad, sample_rate: int, asr: RoutedASR, stats: SessionStats,
               f"decode={result['decode_ms']:.0f}ms, latency={latency_ms:.0f}ms)", flush=True)
         if translator_worker is not None and result["lang"] == "ja" and result["text"].strip():
             translator_worker.submit(result["text"])
-        if spans_out is not None:
-            spans_out.append((seg_start, seg_end, result["lang"], result["text"],
-                              speaker.rstrip("|")))
+        if refiner is not None:
+            refiner.add_span(seg_start, seg_end, result["lang"], result["text"],
+                             speaker.rstrip("|"))
     return drained
 
 
@@ -336,7 +336,9 @@ class TranslationWorker:
                         self._server.publish({"type": "translation", "lang": lang, "text": out})
 
 
-from asr_engine import script_corrected_lang  # shared with the engine's live correction
+from asr_engine import (  # shared with the engine's live correction / refine dual-LID confirm
+    ModelUnavailable, REFINE_MIN_REGROUP_S, resolve_refine_lang, script_corrected_lang, sv_lid_tag,
+)
 
 GROUP_GAP_S = 2.0   # this much true silence closes an utterance group
 GROUP_MAX_S = 25.0  # refine early rather than outgrow the audio history
@@ -363,7 +365,30 @@ class Refiner:
         self._transcript = open(transcript_path, "a", encoding="utf-8") if transcript_path else None
         self._worker_lock = threading.Lock()  # serialize refine decodes off the hot path
 
-    def maybe_refine(self, now_sample: int, force: bool = False):
+    def add_span(self, seg_start: int, seg_end: int, lang: str, text: str, speaker: str):
+        """Append one finalized segment to the pending refine group.
+
+        Splits the group first if this segment's (script-corrected)
+        language differs from the group's current language. Without this,
+        a group kept accumulating across a language change until the next
+        silence gap or GROUP_MAX_S -- the "mixed" guard in maybe_refine
+        already protected the DECODE from being corrupted (it skips
+        re-decoding and falls back to the joined fast-path text), but the
+        group still printed as a single refine line under one language tag,
+        visually swallowing an en segment sandwiched between two ja ones
+        into a "[refine/ja] ..." line. Refine groups now never cross a
+        language boundary.
+        """
+        corrected = script_corrected_lang(lang, text)
+        if self.spans:
+            group_lang = script_corrected_lang(self.spans[-1][2], self.spans[-1][3])
+            if corrected != group_lang:
+                # flush the previous group off the hot path; it belongs to
+                # a different language and must not accumulate this span
+                self.maybe_refine(seg_start, force=True, force_sync=False)
+        self.spans.append((seg_start, seg_end, lang, text, speaker))
+
+    def maybe_refine(self, now_sample: int, force: bool = False, force_sync: bool | None = None):
         if not self.spans:
             return
         first_start = self.spans[0][0]
@@ -373,6 +398,12 @@ class Refiner:
                or last_end - first_start >= int(GROUP_MAX_S * self.sr))
         if not due:
             return
+        # force=True normally means "run synchronously" (the shutdown/flush
+        # path wants the transcript finished before the process exits);
+        # force_sync=False overrides that for a forced-but-not-urgent flush
+        # (a language-boundary split mid-stream) so it still goes through
+        # the background thread and doesn't stall the hot path.
+        run_sync = force if force_sync is None else force_sync
         lo = max(first_start - int(PREROLL_S * self.sr), self.history.offset)
         buf = self.history.buf[lo - self.history.offset:last_end - self.history.offset].copy()
         # LID tags lie under BGM; trust the script of the decoded text over
@@ -406,14 +437,33 @@ class Refiner:
                     # audio: the fast path's per-segment majority vote used
                     # only 2-4s clips, which docs/LID.md measured well below
                     # whisper-tiny's high-confidence length for several
-                    # languages. If the full-window LID disagrees, trust it
-                    # and re-decode with the corrected language's model.
+                    # languages. But "longer" only holds when the group
+                    # really is a multi-segment utterance -- a group can be
+                    # a single short segment sitting alone between silence
+                    # gaps, and a lone whisper-tiny re-judgment on that is
+                    # no more reliable than the live path's single LID call
+                    # (real-mic incident: this flipped a correctly
+                    # dual-confirmed live "ko" back to a collapsed "ru").
+                    # So the re-judgment goes through the SAME dual-LID
+                    # confirmation as the live path: SenseVoice must agree,
+                    # and resolve_refine_lang additionally gates on the
+                    # group's total duration (see REFINE_MIN_REGROUP_S).
+                    group_duration_s = len(buf) / self.sr
                     detected = self.asr._identify_lang(buf, self.sr)
-                    if detected != lang:
-                        text = self.asr.transcribe(buf, self.sr, known_lang=detected,
+                    sv_lang = ""
+                    if detected != lang and group_duration_s >= REFINE_MIN_REGROUP_S:
+                        try:
+                            sv_rec = self.asr._get("sv")
+                            _, sv_tag = self.asr._decode_full(sv_rec, buf, self.sr)
+                            sv_lang = sv_lid_tag(sv_tag)
+                        except ModelUnavailable:
+                            sv_lang = ""  # minimal install: no probe possible, no override
+                    resolved, changed = resolve_refine_lang(lang, detected, sv_lang, group_duration_s)
+                    if changed:
+                        text = self.asr.transcribe(buf, self.sr, known_lang=resolved,
                                                     live=False)["text"]
                         if text.strip():
-                            refine_lang = detected
+                            refine_lang = resolved
                         else:
                             text = self.asr.transcribe(buf, self.sr, known_lang=lang,
                                                         live=False)["text"]
@@ -453,7 +503,7 @@ class Refiner:
                         self._transcript.write(f"  →{tlang} {out}\n")
                     self._transcript.flush()
 
-        if force:
+        if run_sync:
             work()  # shutdown path: finish the transcript before exiting
         else:
             threading.Thread(target=work, daemon=True).start()
@@ -476,7 +526,7 @@ def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStat
             # of waiting for silence that may never arrive.
             vad.flush()
             if drain_segments(vad, sample_rate, asr, stats, printer, history, early_lang,
-                              spans_out=refiner.spans if refiner else None,
+                              refiner=refiner,
                               translator_worker=translator_worker,
                               speaker_labeler=speaker_labeler):
                 early_lang = None
@@ -500,7 +550,7 @@ def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStat
                 printer.show(asr.partial(cur, sample_rate, lang_hint=early_lang))
 
         if drain_segments(vad, sample_rate, asr, stats, printer, history, early_lang,
-                          spans_out=refiner.spans if refiner else None,
+                          refiner=refiner,
                           translator_worker=translator_worker,
                           speaker_labeler=speaker_labeler):
             early_lang = None
@@ -626,7 +676,7 @@ def main():
     def finish(sr):
         vad.flush()
         drain_segments(vad, sr, asr, stats, printer, history,
-                       spans_out=refiner.spans if refiner else None,
+                       refiner=refiner,
                        translator_worker=translator_worker,
                        speaker_labeler=speaker_labeler)
         if refiner is not None:
