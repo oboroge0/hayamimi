@@ -202,6 +202,129 @@ divergence rather than dropped/garbled/wrong-language output. Combined with
 the loadability check above, there's no evidence the mobile INT8 pipeline
 degrades accuracy relative to the PC pipeline it's copied from.
 
+## Punctuation model INT8 (`scripts/punct_ja.py` model)
+
+Second mobile-sizing target: the ja punctuation-restoration BERT-char model
+behind `scripts/punct_ja.py` (`models/mojicast-punct-onnx/punct_bert.onnx`,
+see `docs/PUNCT_JA.md` for the model/architecture background), quantized and
+evaluated with `scripts/quantize_punct.py`.
+
+### Background: the upstream INT8 file is broken here
+
+`docs/PUNCT_JA.md` already documents that the INT8 file the upstream Mojicast
+HF repo ships (`punct_bert.int8.onnx`) was found non-functional in this
+environment (onnxruntime 1.29.0, CPU EP, Windows): its logits were nearly
+constant and didn't track the input at all, so `punct_ja.py` was hard-coded
+to load the fp32 file only. This task asks the open question left there: is
+a *from-scratch* dynamic quantization (the same `quantize_dynamic(...,
+weight_type=QInt8)` recipe used for the ReazonSpeech encoder above) any
+better, or does this BERT graph just not survive dynamic INT8 quantization
+on this onnxruntime build in general?
+
+Answer: **our own INT8 export works correctly** — unlike the shipped one,
+it produces token-dependent logits and restores punctuation. So the earlier
+failure was specific to the upstream artifact (bad export/upload, or an
+onnxruntime-version mismatch at export time), not a fundamental
+incompatibility between this model architecture and dynamic INT8 on this
+platform.
+
+### Method
+
+- `onnxruntime.quantization.quantize_dynamic(weight_type=QInt8)` applied to
+  the whole `punct_bert.onnx` graph (single file, unlike the 3-component
+  ReazonSpeech transducer) → `quantized_ort/punct_bert.int8.onnx` (not
+  committed, `models/` is untracked).
+- Accuracy: reuses the 15 ja clips' *reference transcripts* (already
+  punctuated) from `testdata/eval_real/manifest.json` as text-only ground
+  truth — no audio/ASR involved. For each ref, `、`/`。`/`？` are stripped to
+  build unpunctuated input, `PunctuatorJa.restore()` is run with each model
+  variant, and the restored output is scored two ways:
+  - **Punctuation-position F1**: since `restore()` never alters
+    non-punctuation characters, marks in the reference and in the
+    hypothesis can be aligned by base-character position (no edit-distance
+    alignment needed) and compared as exact-type matches (`、` vs `。` vs
+    `？`) per gap.
+  - **Punctuation-inclusive CER**: whole-string Levenshtein distance between
+    the fully-restored hypothesis and the original (punctuated) reference,
+    divided by reference length — i.e. how close the end-to-end punctuated
+    output is to the original sentence, not just comma/period placement.
+- Speed: mean wall-clock latency of `PunctuatorJa.restore()` over the same
+  15 inputs, CPU, this Windows PC (not representative of an ARM device,
+  same caveat as the ASR section above).
+
+### Size
+
+| variant | size | reduction |
+|---|---|---|
+| fp32 (`punct_bert.onnx`) | 363.5 MB | — |
+| int8 (ours, `quantized_ort/punct_bert.int8.onnx`) | 91.4 MB | 74.9% |
+
+### Accuracy (15 ja reference transcripts, text-only, no ASR)
+
+| variant | punct F1 | precision | recall | punct-inclusive CER |
+|---|---|---|---|---|
+| fp32 | 0.615 | 0.600 | 0.632 | 4.08% |
+| int8 (ours) | **0.686** | **0.750** | 0.632 | **3.45%** |
+
+Both models found the same 12/19 correct punctuation marks (recall tied at
+0.632 — int8 didn't *miss* anything fp32 caught). int8 had **fewer false
+positives**: fp32 over-inserted marks on 2 clips where int8 correctly
+left the text unpunctuated at that gap (e.g. ja_08's second/third clauses,
+ja_12 — see `scratch_quantize_punct_results.json` for full per-clip
+output), which is what drives both the higher precision/F1 and the lower
+CER. This is a **15-reference, single-domain (TV news) sample** — not
+enough to claim int8 is *better* in general, but it does clearly rule out
+the "quantization silently degrades this model" concern raised by the
+broken upstream int8 file: our own INT8 export is at least as accurate as
+fp32 here, with no regression observed.
+
+### Speed (mean `restore()` latency, this PC, CPU, single-threaded call path)
+
+| variant | mean latency | model load time |
+|---|---|---|
+| fp32 | 21.35 ms | 429 ms |
+| int8 (ours) | **10.56 ms** | **197 ms** |
+
+Unlike the ReazonSpeech encoder above (where dynamic INT8 was *slower* than
+fp32 on this PC's MLAS path), this BERT-char model's INT8 export is
+**~2x faster** here, consistent with the ~11ms/5ms fp32/int8 numbers the
+upstream Mojicast repo itself cites (`docs/PUNCT_JA.md`) — this model's
+matmul-heavy transformer shape apparently does hit onnxruntime's INT8
+fast path on this build, even though the ASR transducer's conv/GEMM mix
+didn't. Model load time is also roughly halved. As with the ASR result,
+PC numbers are not a stand-in for ARM timing — only the size and
+"does the graph still restore punctuation correctly" checks transfer with
+confidence; RTF/latency needs re-measurement on-device.
+
+### Verdict: PASS — candidate for mobile deployment
+
+Both the size win (75% smaller, 363.5MB → 91.4MB) and the accuracy check
+(no measurable degradation vs fp32 on this sample; int8 was in fact
+marginally better) support using the self-quantized INT8 punctuation model
+for the phone-deployable ("スマホ搭載完全版") profile, replacing the
+currently-mandatory fp32 file. Recommended before shipping:
+- Re-verify on a larger/more diverse ja reference set (15 short TV-news
+  sentences is a thin sample, same caveat as the ASR CER above).
+- Re-measure latency on an actual ARM device (Android emulator load +
+  accuracy parity check, following the same procedure as "On-emulator
+  accuracy parity" above, is the natural next step since text-only
+  scoring doesn't need audio pushed to the device).
+- Wire the int8 path into `PunctuatorJa` as a selectable/default option
+  (currently `onnx_filename` must be passed explicitly; `scripts/punct_ja.py`
+  still defaults to fp32) once a decision is made to ship it.
+
+### Reproduce
+
+```
+H:\Programming\hayamimi\.venv\Scripts\python.exe scripts\quantize_punct.py
+```
+
+Writes the quantized model under
+`models/mojicast-punct-onnx/quantized_ort/punct_bert.int8.onnx` (not
+committed) and a `scratch_quantize_punct_results.json` summary at repo root
+(also not committed, scratch artifact). Pass `--skip-quantize` to re-run
+just the evaluation against an already-produced int8 file.
+
 ## Next steps for a mobile profile
 
 - Load + accuracy validated on an Android emulator via `sherpa_onnx.dart`
