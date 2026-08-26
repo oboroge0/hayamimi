@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -28,12 +29,28 @@ class _LivePageState extends State<LivePage> {
   final _transcriber = LiveTranscriber();
   StreamSubscription<LiveTranscriptEntry>? _entriesSubscription;
   StreamSubscription<bool>? _decodingSubscription;
+  StreamSubscription<LiveTranscriptEntry>? _refineEntriesSubscription;
 
   final ModelKind _modelKind = ModelKind.zipformerTransducer;
   final List<LiveTranscriptEntry> _entries = [];
   bool _isStarting = false;
   bool _isDecoding = false;
   String? _errorText;
+
+  // Two-pass "refine" (清書): see lib/live/refine_pass.dart for why the
+  // trigger conditions and defaults are what they are.
+  final List<LiveTranscriptEntry> _refineEntries = [];
+  bool _autoRefineEnabled = false;
+  bool _isRefining = false;
+
+  // Debug-only "wavから清書テスト" path (kDebugMode only, see build() below):
+  // runs LiveTranscriber.runDebugWavRefineTest against a pushed wav file, so
+  // the refine pass's audio-combining logic can be exercised on an
+  // emulator, which has no usable microphone for a real live session.
+  final _debugWavPathController = TextEditingController();
+  bool _isRunningDebugWavTest = false;
+  String? _debugWavError;
+  DebugRefineTestResult? _debugWavResult;
 
   // "Other app integration": an in-app HTTP server that mirrors the
   // desktop hayamimi subtitle feed (scripts/subtitle_server.py) so an OBS
@@ -60,6 +77,9 @@ class _LivePageState extends State<LivePage> {
       if (!mounted) return;
       setState(() => _isDecoding = decoding);
     });
+    _refineEntriesSubscription = _transcriber.refineEntries.listen(
+      _onRefineEntry,
+    );
   }
 
   Future<void> _prefillDefaultPaths() async {
@@ -74,6 +94,7 @@ class _LivePageState extends State<LivePage> {
           '${docsDir.path}$sep'
           'vad$sep'
           'silero_vad.onnx';
+      _debugWavPathController.text = '${docsDir.path}${sep}test.wav';
     });
   }
 
@@ -96,6 +117,50 @@ class _LivePageState extends State<LivePage> {
           latencyMs: entry.latencyMs,
         ),
       );
+    }
+  }
+
+  void _onRefineEntry(LiveTranscriptEntry entry) {
+    if (!mounted) return;
+    setState(() => _refineEntries.add(entry));
+  }
+
+  Future<void> _triggerRefine() async {
+    setState(() => _isRefining = true);
+    try {
+      await _transcriber.refineNow();
+    } finally {
+      if (mounted) {
+        setState(() => _isRefining = false);
+      }
+    }
+  }
+
+  void _toggleAutoRefine(bool enabled) {
+    setState(() => _autoRefineEnabled = enabled);
+    _transcriber.autoRefineEnabled = enabled;
+  }
+
+  Future<void> _runDebugWavRefineTest() async {
+    setState(() {
+      _isRunningDebugWavTest = true;
+      _debugWavError = null;
+      _debugWavResult = null;
+    });
+    try {
+      final result = await LiveTranscriber.runDebugWavRefineTest(
+        modelDir: _modelDirController.text.trim(),
+        wavPath: _debugWavPathController.text.trim(),
+      );
+      if (!mounted) return;
+      setState(() => _debugWavResult = result);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _debugWavError = e.toString());
+    } finally {
+      if (mounted) {
+        setState(() => _isRunningDebugWavTest = false);
+      }
     }
   }
 
@@ -163,10 +228,12 @@ class _LivePageState extends State<LivePage> {
   void dispose() {
     _entriesSubscription?.cancel();
     _decodingSubscription?.cancel();
+    _refineEntriesSubscription?.cancel();
     _transcriber.dispose();
     _broadcastServer.stop();
     _modelDirController.dispose();
     _vadModelPathController.dispose();
+    _debugWavPathController.dispose();
     _scrollController.dispose();
     super.dispose();
   }
@@ -176,92 +243,140 @@ class _LivePageState extends State<LivePage> {
     final isRunning = _transcriber.isRunning;
     return Padding(
       padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Text(
-            'Model: ${_modelKind.label}',
-            style: Theme.of(context).textTheme.bodyMedium,
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _modelDirController,
-            enabled: !isRunning,
-            decoration: const InputDecoration(
-              labelText: 'Model directory',
-              border: OutlineInputBorder(),
+      // SingleChildScrollView (rather than Expanded lists filling all
+      // remaining space) so the page degrades to scrolling instead of
+      // overflowing once the debug-only refine card is showing too — the
+      // fixed controls above the transcript/清書 lists can already get tall
+      // enough to not leave room for both at a comfortable size.
+      child: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'Model: ${_modelKind.label}',
+              style: Theme.of(context).textTheme.bodyMedium,
             ),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _vadModelPathController,
-            enabled: !isRunning,
-            decoration: const InputDecoration(
-              labelText: 'VAD model path (silero_vad.onnx)',
-              border: OutlineInputBorder(),
-            ),
-          ),
-          const SizedBox(height: 16),
-          FilledButton.icon(
-            onPressed: _isStarting ? null : _toggle,
-            icon: _isStarting
-                ? const SizedBox(
-                    height: 16,
-                    width: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : Icon(isRunning ? Icons.stop : Icons.mic),
-            label: Text(isRunning ? 'Stop' : 'Start listening'),
-            style: FilledButton.styleFrom(
-              backgroundColor: isRunning
-                  ? Theme.of(context).colorScheme.error
-                  : null,
-            ),
-          ),
-          const SizedBox(height: 8),
-          if (isRunning)
-            Row(
-              children: [
-                Icon(Icons.circle, size: 10, color: Colors.red.shade400),
-                const SizedBox(width: 6),
-                Text(_isDecoding ? 'Decoding...' : 'Listening...'),
-              ],
-            ),
-          if (_errorText != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 8),
-              child: Text(
-                _errorText!,
-                style: TextStyle(color: Theme.of(context).colorScheme.error),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _modelDirController,
+              enabled: !isRunning,
+              decoration: const InputDecoration(
+                labelText: 'Model directory',
+                border: OutlineInputBorder(),
               ),
             ),
-          const SizedBox(height: 12),
-          _BroadcastServerCard(
-            isEnabled: _isBroadcastEnabled,
-            isStarting: _isBroadcastStarting,
-            lanAddress: _lanAddress,
-            port: _broadcastServer.boundPort ?? _broadcastServer.port,
-            errorText: _broadcastError,
-            onToggle: _isBroadcastStarting ? null : _toggleBroadcast,
-          ),
-          const SizedBox(height: 16),
-          Expanded(
-            child: _entries.isEmpty
-                ? const Center(child: Text('Transcript will appear here.'))
-                : ListView.separated(
-                    controller: _scrollController,
-                    itemCount: _entries.length,
-                    separatorBuilder: (_, _) => const Divider(height: 1),
-                    itemBuilder: (context, index) {
-                      final entry = _entries[index];
-                      return ListTile(
-                        title: SelectableText(entry.text),
-                        subtitle: Text(_formatTimestamp(entry.timestamp)),
-                      );
-                    },
-                  ),
-          ),
-        ],
+            const SizedBox(height: 12),
+            TextField(
+              controller: _vadModelPathController,
+              enabled: !isRunning,
+              decoration: const InputDecoration(
+                labelText: 'VAD model path (silero_vad.onnx)',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: _isStarting ? null : _toggle,
+              icon: _isStarting
+                  ? const SizedBox(
+                      height: 16,
+                      width: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Icon(isRunning ? Icons.stop : Icons.mic),
+              label: Text(isRunning ? 'Stop' : 'Start listening'),
+              style: FilledButton.styleFrom(
+                backgroundColor: isRunning
+                    ? Theme.of(context).colorScheme.error
+                    : null,
+              ),
+            ),
+            const SizedBox(height: 8),
+            if (isRunning)
+              Row(
+                children: [
+                  Icon(Icons.circle, size: 10, color: Colors.red.shade400),
+                  const SizedBox(width: 6),
+                  Text(_isDecoding ? 'Decoding...' : 'Listening...'),
+                ],
+              ),
+            if (_errorText != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  _errorText!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ),
+            const SizedBox(height: 12),
+            _BroadcastServerCard(
+              isEnabled: _isBroadcastEnabled,
+              isStarting: _isBroadcastStarting,
+              lanAddress: _lanAddress,
+              port: _broadcastServer.boundPort ?? _broadcastServer.port,
+              errorText: _broadcastError,
+              onToggle: _isBroadcastStarting ? null : _toggleBroadcast,
+            ),
+            const SizedBox(height: 8),
+            _RefinePassCard(
+              isRunning: isRunning,
+              isRefining: _isRefining,
+              autoRefineEnabled: _autoRefineEnabled,
+              bufferedSeconds: _transcriber.refineBufferedSeconds,
+              onRefineNow: isRunning && !_isRefining ? _triggerRefine : null,
+              onToggleAuto: isRunning ? _toggleAutoRefine : null,
+            ),
+            if (kDebugMode) ...[
+              const SizedBox(height: 12),
+              _DebugWavRefineCard(
+                pathController: _debugWavPathController,
+                isRunning: _isRunningDebugWavTest,
+                errorText: _debugWavError,
+                result: _debugWavResult,
+                onRun: _isRunningDebugWavTest ? null : _runDebugWavRefineTest,
+              ),
+            ],
+            const SizedBox(height: 16),
+            Text('文字起こし', style: Theme.of(context).textTheme.labelLarge),
+            const SizedBox(height: 4),
+            SizedBox(
+              height: 240,
+              child: _entries.isEmpty
+                  ? const Center(child: Text('Transcript will appear here.'))
+                  : ListView.separated(
+                      controller: _scrollController,
+                      itemCount: _entries.length,
+                      separatorBuilder: (_, _) => const Divider(height: 1),
+                      itemBuilder: (context, index) {
+                        final entry = _entries[index];
+                        return ListTile(
+                          title: SelectableText(entry.text),
+                          subtitle: Text(_formatTimestamp(entry.timestamp)),
+                        );
+                      },
+                    ),
+            ),
+            const Divider(height: 16),
+            Text('清書', style: Theme.of(context).textTheme.labelLarge),
+            const SizedBox(height: 4),
+            SizedBox(
+              height: 200,
+              child: _refineEntries.isEmpty
+                  ? const Center(child: Text('清書結果はここに表示されます。'))
+                  : ListView.separated(
+                      itemCount: _refineEntries.length,
+                      separatorBuilder: (_, _) => const Divider(height: 1),
+                      itemBuilder: (context, index) {
+                        final entry = _refineEntries[index];
+                        return ListTile(
+                          title: SelectableText(entry.text),
+                          subtitle: Text(_formatTimestamp(entry.timestamp)),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -305,9 +420,7 @@ class _BroadcastServerCard extends StatelessWidget {
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
               title: const Text('配信サーバー'),
-              subtitle: const Text(
-                '同じLAN内のOBS/ブラウザに字幕を配信します（画面ON中のみ）',
-              ),
+              subtitle: const Text('同じLAN内のOBS/ブラウザに字幕を配信します（画面ON中のみ）'),
               value: isEnabled,
               onChanged: isStarting || onToggle == null
                   ? null
@@ -324,9 +437,7 @@ class _BroadcastServerCard extends StatelessWidget {
               Padding(
                 padding: const EdgeInsets.only(bottom: 8),
                 child: url == null
-                    ? const Text(
-                        'LAN上のIPアドレスが見つかりません（Wi-Fi未接続？）',
-                      )
+                    ? const Text('LAN上のIPアドレスが見つかりません（Wi-Fi未接続？）')
                     : SelectableText(url),
               ),
             if (errorText != null)
@@ -334,11 +445,159 @@ class _BroadcastServerCard extends StatelessWidget {
                 padding: const EdgeInsets.only(bottom: 8),
                 child: Text(
                   errorText!,
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.error,
-                  ),
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ),
               ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Manual "清書" button + "自動清書" toggle for the two-pass refine feature.
+/// See `lib/live/refine_pass.dart` for why auto mode defaults off and what
+/// triggers it, and `LiveTranscriber.refineNow`/`autoRefineEnabled` for the
+/// glue this drives.
+class _RefinePassCard extends StatelessWidget {
+  const _RefinePassCard({
+    required this.isRunning,
+    required this.isRefining,
+    required this.autoRefineEnabled,
+    required this.bufferedSeconds,
+    required this.onRefineNow,
+    required this.onToggleAuto,
+  });
+
+  final bool isRunning;
+  final bool isRefining;
+  final bool autoRefineEnabled;
+  final double bufferedSeconds;
+  final VoidCallback? onRefineNow;
+  final ValueChanged<bool>? onToggleAuto;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: onRefineNow,
+                    icon: isRefining
+                        ? const SizedBox(
+                            height: 16,
+                            width: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.auto_fix_high),
+                    label: Text(
+                      isRunning
+                          ? '清書 (${bufferedSeconds.toStringAsFixed(1)}s分)'
+                          : '清書',
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              dense: true,
+              title: const Text('自動清書'),
+              subtitle: const Text('無音が続いたら自動で清書します（既定オフ：バッテリー・発熱に配慮）'),
+              value: autoRefineEnabled,
+              onChanged: onToggleAuto,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Debug-only (see `kDebugMode`) card that exercises the refine pass's
+/// audio-combining logic against a pushed test wav, splitting it into two
+/// halves to stand in for two VAD segments — see
+/// `LiveTranscriber.runDebugWavRefineTest`. Exists because an emulator has
+/// no usable microphone, so there's no other way to exercise this path
+/// there.
+class _DebugWavRefineCard extends StatelessWidget {
+  const _DebugWavRefineCard({
+    required this.pathController,
+    required this.isRunning,
+    required this.errorText,
+    required this.result,
+    required this.onRun,
+  });
+
+  final TextEditingController pathController;
+  final bool isRunning;
+  final String? errorText;
+  final DebugRefineTestResult? result;
+  final VoidCallback? onRun;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'デバッグ: wavから清書テスト（モデルは上のModel directoryを使用）',
+              style: Theme.of(context).textTheme.labelMedium,
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: pathController,
+              decoration: const InputDecoration(
+                labelText: 'wavファイルパス',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: onRun,
+              icon: isRunning
+                  ? const SizedBox(
+                      height: 16,
+                      width: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.science),
+              label: Text(isRunning ? '実行中...' : 'wavから清書テスト'),
+            ),
+            if (errorText != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  errorText!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ),
+            if (result != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                '個別1: ${result!.segment1Text.isEmpty ? '(empty)' : result!.segment1Text}',
+              ),
+              Text(
+                '個別2: ${result!.segment2Text.isEmpty ? '(empty)' : result!.segment2Text}',
+              ),
+              const Divider(height: 16),
+              Text(
+                '清書 (結合): ${result!.refineText.isEmpty ? '(empty)' : result!.refineText}',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ],
           ],
         ),
       ),
