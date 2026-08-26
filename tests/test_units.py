@@ -102,6 +102,36 @@ def test_load_replacements_empty_path():
     assert asr_engine._load_replacements("") == []
 
 
+# ---- hotword encodability check (issue #1) ---------------------------------
+
+def test_cjkchar_units_splits_cjk_chars_and_keeps_ascii_words():
+    assert asr_engine._cjkchar_units("屈足湖") == ["屈", "足", "湖"]
+    assert asr_engine._cjkchar_units("GANKE FES") == ["GANKE", "FES"]
+    assert asr_engine._cjkchar_units("屈足 FES") == ["屈", "足", "FES"]
+
+
+def test_check_hotwords_encodable_all_missing(tmp_path):
+    tokens = tmp_path / "tokens.txt"
+    tokens.write_text("<blk> 0\n<unk> 1\n▁ƊĢĥ 2\n", encoding="utf-8")
+    hw = tmp_path / "hotwords.txt"
+    hw.write_text("屈足湖\nGANKE FES\n# comment\n\n", encoding="utf-8")
+    total, bad = asr_engine.check_hotwords_encodable(str(hw), str(tokens))
+    assert (total, bad) == (2, 2)
+
+
+def test_check_hotwords_encodable_some_found(tmp_path):
+    tokens = tmp_path / "tokens.txt"
+    tokens.write_text("<blk> 0\n屈 1\n足 2\n", encoding="utf-8")
+    hw = tmp_path / "hotwords.txt"
+    hw.write_text("屈足\n屈足湖\n", encoding="utf-8")
+    total, bad = asr_engine.check_hotwords_encodable(str(hw), str(tokens))
+    assert (total, bad) == (2, 1)  # "屈足" fully found, "屈足湖" missing 湖
+
+
+def test_check_hotwords_encodable_empty_path():
+    assert asr_engine.check_hotwords_encodable("", "tokens.txt") == (0, 0)
+
+
 # ---- routing table consistency --------------------------------------------
 
 def test_routing_sets_are_disjoint():

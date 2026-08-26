@@ -200,6 +200,78 @@ def resolve_sticky_lang(
     return lang, False, None, 0
 
 
+def _cjkchar_units(phrase: str) -> list[str]:
+    """Split a hotword phrase the way sherpa-onnx's cjkchar modeling_unit
+    encodes it: each CJK character becomes its own lookup unit, and runs of
+    non-CJK, non-whitespace characters are grouped into whole-word units
+    (matches the "屈 足 湖" / "GANKE FES" splits seen in sherpa-onnx's own
+    "Cannot find ID for token" warnings)."""
+    units: list[str] = []
+    buf: list[str] = []
+
+    def flush():
+        if buf:
+            units.append("".join(buf))
+            buf.clear()
+
+    for ch in phrase:
+        if ch.isspace():
+            flush()
+            continue
+        if "一" <= ch <= "鿿" or "぀" <= ch <= "ヿ" or "가" <= ch <= "힯":
+            flush()
+            units.append(ch)
+        else:
+            buf.append(ch)
+    flush()
+    return units
+
+
+def _load_token_vocab(tokens_path: str) -> set[str]:
+    vocab: set[str] = set()
+    if not os.path.isfile(tokens_path):
+        return vocab
+    with open(tokens_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            # "<token> <id>"; rsplit so a token that itself contains a
+            # literal space (rare) still separates cleanly from the id.
+            parts = line.rsplit(None, 1)
+            if len(parts) == 2:
+                vocab.add(parts[0])
+    return vocab
+
+
+def check_hotwords_encodable(hotwords_path: str, tokens_path: str) -> tuple[int, int]:
+    """Return (total_hotwords, num_unencodable) for the cjkchar modeling_unit
+    used by the ja (ReazonSpeech) tier.
+
+    sherpa-onnx encodes each hotword by looking up its cjkchar units
+    (see `_cjkchar_units`) directly against tokens.txt. ReazonSpeech's
+    tokens.txt is byte-level BPE, not a cjkchar vocabulary, so every lookup
+    normally misses -- sherpa-onnx only reports this as stderr warnings and
+    still exits 0 (GitHub issue #1). This lets callers surface that loudly
+    instead of leaving it buried in stderr.
+    """
+    if not hotwords_path or not os.path.isfile(hotwords_path):
+        return 0, 0
+    vocab = _load_token_vocab(tokens_path)
+    total = 0
+    bad = 0
+    with open(hotwords_path, encoding="utf-8") as f:
+        for line in f:
+            phrase = line.strip()
+            if not phrase or phrase.startswith("#"):
+                continue
+            total += 1
+            units = _cjkchar_units(phrase)
+            if not units or any(u not in vocab for u in units):
+                bad += 1
+    return total, bad
+
+
 def _load_replacements(path: str) -> list[tuple[str, str]]:
     """User dictionary: one "wrong=right" (or tab/arrow-separated) pair per line."""
     if not path:
@@ -275,6 +347,7 @@ class RoutedASR:
         self._ko_spacer = None
         self._ko_spacer_ok = True
         self._hotwords_file = hotwords_file
+        self._warn_hotwords_encodability(hotwords_file)
         self._replacements = _load_replacements(replace_file)
         self._load_lock = threading.Lock()  # punct + registry bookkeeping
         self._model_locks = {name: threading.Lock() for name in _BUILDERS}
@@ -294,6 +367,36 @@ class RoutedASR:
             # pull the other tiers in on a daemon thread so the first
             # non-tier-0 utterance doesn't pay the ~2s model-load cost.
             threading.Thread(target=self._preload_rest, daemon=True).start()
+
+    @staticmethod
+    def _warn_hotwords_encodability(hotwords_file: str):
+        """Print a loud, hard-to-miss warning if --hotwords entries can't be
+        encoded against the ja (ReazonSpeech) tier's tokens.txt.
+
+        sherpa-onnx only reports failed encodes as stderr warnings and still
+        exits 0 with a normal-looking transcript, so this was silently doing
+        nothing for every ReazonSpeech user until they happened to read
+        stderr closely (GitHub issue #1). ReazonSpeech ships a byte-level
+        BPE tokens.txt with no bpe.model, so there is currently no
+        modeling_unit that encodes cjkchar-style hotwords against it; until
+        that's fixed upstream (or hayamimi ships its own bpe.model), the
+        best we can do is make the failure visible and point at --replace.
+        """
+        if not hotwords_file:
+            return
+        tokens_path = os.path.join(RZ_MODEL_DIR, "tokens.txt")
+        total, bad = check_hotwords_encodable(hotwords_file, tokens_path)
+        if bad == 0:
+            return
+        if bad == total:
+            print(f"[hayamimi] WARNING: 0/{total} hotwords could be encoded for the ja "
+                  f"tier (ReazonSpeech uses byte-level BPE tokens, incompatible with "
+                  f"modeling_unit=cjkchar) -- --hotwords will have NO EFFECT on ja "
+                  f"output. Use --replace for post-hoc find/replace instead.")
+        else:
+            print(f"[hayamimi] warning: {bad}/{total} hotwords cannot be encoded for "
+                  f"the ja tier (ReazonSpeech uses byte-level BPE tokens); --hotwords "
+                  f"will have no effect for these. Consider --replace instead.")
 
     def _preload_rest(self):
         if self._punctuate:

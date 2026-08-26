@@ -34,7 +34,7 @@ same clips, while running at 10-50x realtime on a 6-core desktop CPU.
 | Two-pass refinement | after 2s of silence, recent utterances are batch re-decoded for a higher-accuracy "clean" transcript (ja real-broadcast CER 15.5% -> 12.0%) |
 | Speaker labels | `--speakers` tags each utterance S1/S2/... using CAM++ speaker embeddings (turn-taking, not full diarization) |
 | Translation | `--translate en,zh,ko` translates Japanese lines live (en via FuguMT, zh/ko via M2M-100) |
-| Hotwords / user dictionary | `--hotwords` biases decoding toward proper nouns; `--replace` does post-hoc find/replace |
+| Hotwords / user dictionary | `--hotwords` biases decoding toward proper nouns (currently has no effect on the ja tier -- see Limitations); `--replace` does post-hoc find/replace and works everywhere |
 | OBS overlay + dashboard | `--serve` starts a local HTTP server with a browser-source overlay and a live dashboard |
 | Memory-bounded | LRU model eviction keeps resident models under a configurable cap (default: <2GB total) |
 | CPU-only | every model runs as quantized ONNX via sherpa-onnx; no GPU or PyTorch required |
@@ -105,7 +105,7 @@ All flags are on `scripts/realtime_transcribe.py`:
 | `--serve [PORT]` | off, 8765 | serve the dashboard + OBS overlay at `http://localhost:PORT` |
 | `--no-refine` | off | disable the second-pass re-decode of utterance groups |
 | `--transcript PATH` | none | append refined transcript lines to this file |
-| `--hotwords PATH` | none | hotword list (one per line) to bias Japanese decoding toward proper nouns |
+| `--hotwords PATH` | none | hotword list (one per line) to bias decoding toward proper nouns -- **currently has no effect on the ja tier** (ReazonSpeech's byte-level BPE tokens.txt can't encode them; a startup warning tells you how many failed). Use `--replace` for ja proper nouns instead |
 | `--replace PATH` | none | user dictionary: `wrong=right` per line, applied to all output |
 | `--lang-switch-guard SEC` | 2.0 | treat a new-language detection shorter than this as noise: it can never count toward confirming a switch (see `--lid-switch-confirm`) and it suppresses the omnilingual fallback on an empty decode (`0` disables) |
 | `--lid-switch-confirm N` | 2 | consecutive new-language detections (each >= `--lang-switch-guard` long) required before the session actually switches language; raise for stickier single-language sessions |
@@ -197,6 +197,15 @@ Headline numbers from that log:
   confidently-wrong LID+decode combinations (where the garbled text happens
   to match the wrong language's character set) are known blind spots -- see
   `docs/BENCHMARKS.md`'s iteration #29 for a quantified before/after.
+- **`--hotwords` currently has no effect on the ja (ReazonSpeech) tier.**
+  ReazonSpeech's `tokens.txt` is byte-level BPE, incompatible with the
+  `modeling_unit=cjkchar` encoding hayamimi uses for hotwords, so every
+  hotword fails to encode (sherpa-onnx only reports this as stderr warnings
+  and still exits 0 -- see GitHub issue #1). hayamimi now prints a startup
+  warning telling you how many hotwords failed to encode; use `--replace`
+  for ja proper nouns instead. A real fix needs either a matching
+  `bpe.model` for the ReazonSpeech release (not currently shipped) or a
+  from-scratch byte-BPE hotword encoder -- tracked as future work.
 - **Two overlapping speakers are not separated.** `--speakers` does
   turn-taking speaker labeling (one embedding per finalized VAD segment,
   nearest-centroid assignment), not true diarization -- simultaneous speech
