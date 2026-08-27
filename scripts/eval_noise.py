@@ -130,11 +130,12 @@ def eval_manifest_dir(asr: RoutedASR, mdir: str, denoiser=None):
             # Each language's clip block is an independent recording, not a
             # continuous multi-lingual conversation -- reset the sticky-LID
             # session so the engine's language-switch hysteresis (see
-            # RoutedASR.transcribe / resolve_sticky_lang in asr_engine.py)
-            # doesn't charge the first clip of a new block for "switching
-            # away" from an unrelated previous block's language. Real
-            # in-session switch latency is covered separately by
-            # tests/test_units.py's resolve_sticky_lang tests.
+            # RoutedASR.transcribe / resolve_dual_confirm in asr_engine.py --
+            # ja/en/zh/ko/yue, all the languages evaluated here, are
+            # DUAL_CONFIRM_LANGS) doesn't charge the first clip of a new
+            # block for "switching away" from an unrelated previous block's
+            # language. Real in-session switch latency is covered separately
+            # by tests/test_units.py's resolve_dual_confirm tests.
             asr.reset_session()
             prev_lang = e["lang"]
         wav_path = os.path.join(mdir, e["wav"])

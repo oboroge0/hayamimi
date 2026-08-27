@@ -651,9 +651,12 @@ def main():
     if args.mode == "single" and not args.lang:
         ap.error("--mode single requires --lang CODE")
     # --mode bundles defaults for the two hysteresis knobs; an explicitly
-    # passed --lang-switch-guard/--lid-switch-confirm still wins.
-    mode_defaults = {"balanced": (2.0, 2), "fast": (0.0, 1), "single": (2.0, 2)}
-    default_guard, default_confirm = mode_defaults[args.mode]
+    # passed --lang-switch-guard/--lid-switch-confirm still wins. "single"
+    # has no entry here: forced_lang (set below) bypasses all switch/
+    # hysteresis logic in asr_engine.RoutedASR.transcribe(), so these two
+    # knobs are never read for that mode.
+    mode_defaults = {"balanced": (2.0, 2), "fast": (0.0, 1)}
+    default_guard, default_confirm = mode_defaults.get(args.mode, (2.0, 2))
     if args.lang_switch_guard is None:
         args.lang_switch_guard = default_guard
     if args.lid_switch_confirm is None:
