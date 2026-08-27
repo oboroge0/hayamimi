@@ -158,6 +158,19 @@ class SpeakerLabeler:
         # creation) so merge_centroids() can fold this flag unconditionally.
         self._confirmed: list[bool] = []
 
+        # Diagnostics for docs/DIARIZATION_PLAN.md section 10.6's open
+        # question: does the production full pipeline open more global
+        # centroids via the fast path (label(), called once per VAD
+        # segment) or via the refine-path remap (match_embedding() with an
+        # explicit threshold=, called once per local diarization cluster
+        # per closed refine group)? match_embedding()'s `source` kwarg (a
+        # free-form string the caller supplies -- realtime_transcribe.py
+        # and eval_diar.py pass "fast"/"remap") is appended here every time
+        # a NEW centroid is opened (not on an existing-centroid match), so
+        # centroid_open_counts() can report the breakdown. Purely
+        # observational: never read back to influence matching.
+        self._open_log: list[str] = []
+
     def embed(self, samples: np.ndarray, sample_rate: int) -> np.ndarray:
         """Compute an L2-normalized CAM++ embedding for one audio buffer.
 
@@ -183,7 +196,7 @@ class SpeakerLabeler:
         return self._remap_threshold
 
     def match_embedding(self, emb: np.ndarray, update: bool = True,
-                         threshold: float | None = None) -> str:
+                         threshold: float | None = None, source: str = "") -> str:
         """Assign a precomputed embedding to the nearest global centroid
         (or open a new speaker), same policy as label() but for a caller
         that already has an embedding (see embed()).
@@ -202,6 +215,10 @@ class SpeakerLabeler:
         different (independently tuned) threshold than the fast path's
         label() calls, which always use self._threshold. See __init__'s
         docstring for why the two calls warrant separate thresholds.
+
+        source is a free-form diagnostic tag ("fast"/"remap") recorded in
+        centroid_open_counts() whenever this call opens a brand-new
+        centroid -- see __init__'s _open_log comment. Purely observational.
         """
         thr = self._threshold if threshold is None else threshold
         best, best_sim = -1, -1.0
@@ -226,6 +243,7 @@ class SpeakerLabeler:
             return ""
         self._centroids.append(emb)
         self._counts.append(1)
+        self._open_log.append(source)
         new_idx = len(self._centroids) - 1
         if self._hysteresis_enabled:
             has_confirmed = any(
@@ -239,9 +257,39 @@ class SpeakerLabeler:
             self._confirmed.append(True)
         return self._label_for(new_idx)
 
-    def label(self, samples: np.ndarray, sample_rate: int) -> str:
+    def label(self, samples: np.ndarray, sample_rate: int, source: str = "fast") -> str:
         emb = self.embed(samples, sample_rate)
-        return self.match_embedding(emb, update=True)
+        return self.match_embedding(emb, update=True, source=source)
+
+    def centroid_open_counts(self) -> dict[str, int]:
+        """{source: count} of how many currently-open centroids were first
+        opened by each caller-supplied `source` tag (see match_embedding()),
+        for diagnosing docs/DIARIZATION_PLAN.md section 10.6."""
+        counts: dict[str, int] = {}
+        for src in self._open_log:
+            counts[src] = counts.get(src, 0) + 1
+        return counts
+
+    def centroid_summary(self) -> list[tuple[str, str, int]]:
+        """[(label, opened_by_source, final_match_count)] for every centroid
+        ever opened (including merged-away ones), in opening order.
+
+        final_match_count is self._counts[i] -- how many embeddings (its own
+        opening one plus every later match_embedding() hit) ever folded into
+        that centroid's running mean. A count of 1 means the centroid was
+        opened and never matched again: exactly the "one-off embedding
+        outlier" case docs/DIARIZATION_PLAN.md section 10.6 asks about --
+        such a centroid still prints its own S{n} line the moment it opens
+        (production's console has no concept of "too rare to show"), while
+        a DER hypothesis built from per-group majority votes or remap
+        results (eval_diar.py's generate_diarize_hypothesis) will often
+        never surface it at all if it's never the mode of any group.
+        """
+        return [
+            (self._label_for(i), self._open_log[i] if i < len(self._open_log) else "",
+             self._counts[i])
+            for i in range(len(self._centroids))
+        ]
 
     # --- iteration 6: new-speaker hysteresis (docs/DIARIZATION_PLAN.md section 9) ---
 

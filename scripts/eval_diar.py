@@ -324,7 +324,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
                 continue
             emb = labeler.embed(cluster_audio, sr)
             global_label[local_id] = labeler.match_embedding(
-                emb, update=True, threshold=labeler.remap_threshold)
+                emb, update=True, threshold=labeler.remap_threshold, source="remap")
 
         # iteration 6 (section 9): this group's remap is exactly the "clean
         # copy" boundary merge_centroids() is meant for -- give it a chance
@@ -340,6 +340,17 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
         "n_groups": len(groups),
         "audio_s": len(samples) / sr,
         "merge_history": labeler.merge_history(),
+        # docs/DIARIZATION_PLAN.md section 10.6 diagnostics: compare against
+        # realtime_transcribe.py's "session summary" refine_groups_closed /
+        # centroid_open_counts lines for the same file -- this eval path has
+        # no decoded text to force a language-boundary group split (see
+        # group_segments()'s docstring), so a materially higher n_groups /
+        # "remap"-sourced centroid count in production than here is evidence
+        # that language-boundary over-splitting (not just this dual
+        # fast+remap architecture, which both paths share) drives the extra
+        # global speakers observed in the full pipeline.
+        "centroid_open_counts": labeler.centroid_open_counts(),
+        "centroid_summary": labeler.centroid_summary(),
     }
     return hyp, stats
 
@@ -516,6 +527,8 @@ def main():
                       f"confusion={result['confusion'] * 100:.1f}%]")
         if result.get("merge_history"):
             extra += f"  merged={result['merge_history']}"
+        if result.get("centroid_open_counts"):
+            extra += f"  opened_by={result['centroid_open_counts']}"
         print(f"[{entry['meeting']}] DER={result['der'] * 100:.1f}%  "
               f"ref_speakers={result['n_ref_speakers']} hyp_speakers={result['n_hyp_speakers']}  "
               f"ref_turns={result['n_ref_turns']} hyp_segments={result['n_hyp_segments']}  "

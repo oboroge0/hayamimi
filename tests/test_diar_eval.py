@@ -13,6 +13,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
 from eval_diar import der_breakdown, group_segments, parse_rttm, segments_to_der_tuples
+from realtime_transcribe import AudioHistory, PartialPrinter, Refiner, SessionStats
+import numpy as np
 
 
 # ---- parse_rttm -------------------------------------------------------------
@@ -204,3 +206,80 @@ def test_group_segments_splits_on_max_length():
 
 def test_group_segments_empty_input():
     assert group_segments([], SR, group_gap_s=2.0, group_max_s=25.0) == []
+
+
+# ---- eval-vs-production grouping divergence (docs/DIARIZATION_PLAN.md ------
+# section 10.6/10.8 root-cause investigation) --------------------------------
+
+class _FakeAsrForGrouping:
+    """Just enough of RoutedASR's interface for Refiner.maybe_refine()'s
+    work() to run to completion without a real model: _identify_lang always
+    agrees with the span's language (so resolve_refine_lang() never tries a
+    SenseVoice re-judgment) and transcribe() returns fixed non-empty text
+    (so the "never lose content" guard doesn't discard the group)."""
+
+    def _identify_lang(self, buf, sr):
+        return "en"
+
+    def transcribe(self, buf, sr, known_lang=None, live=False, speech_s=None):
+        return {"text": "ok"}
+
+
+def test_production_over_splits_relative_to_eval_replica_on_a_skipped_vad_segment():
+    """docs/DIARIZATION_PLAN.md section 10.6 found the full production
+    pipeline (--speakers) reaching far more global speaker labels (S1..S13
+    on ES2011a) than eval_diar.py's --method refine_diarize DER hypothesis
+    for the identical audio (4-5). Section 10.8 traces one concrete,
+    reproducible contributor (a second exists too -- see
+    speaker_id.SpeakerLabeler.centroid_summary()'s docstring): eval's
+    generate_diarize_hypothesis() calls SpeakerLabeler.label() and appends
+    to group_segments()'s input for EVERY VAD segment, speech or not (no
+    ASR in that path to tell the difference). Production's
+    realtime_transcribe.drain_segments() only calls Refiner.add_span() when
+    ASR actually returned non-empty text -- a VAD misfire (jingle, breath,
+    cross-talk noise) that ASR correctly declines to transcribe never
+    becomes a span. But Refiner.maybe_refine()'s "due" (silence-gap) check
+    is evaluated against the real current audio position (run_stream passes
+    it real elapsed samples, not "time of the last kept span" -- see
+    run_stream()'s refiner.maybe_refine(int(audio_pos * sample_rate)) call),
+    so skipping that segment's own span doesn't skip the real time it took:
+    a gap that stays comfortably under GROUP_GAP_S when the skipped
+    segment's boundaries are counted (eval) can cross it once that
+    segment's own start/end stop being available as intermediate points
+    (production) -- closing an extra group, and therefore giving the
+    refine-path remap one extra, spurious chance to open a new global
+    centroid at a segment boundary eval's replica would never have split
+    on.
+    """
+    seg1 = (0, 16000, "x")        # 1.0s of real speech
+    noise = (17000, 48000, "x")   # VAD-flagged noise/jingle; ASR returns "" for it in production
+    seg3 = (49000, 65000, "x")    # 1.0s of real speech
+
+    # eval_diar.py's replica: every VAD segment (including the noise one)
+    # is a boundary point. Both gaps (1000 samples each) are tiny relative
+    # to GROUP_GAP_S*SR (32000 samples) -- one group.
+    eval_groups = group_segments([seg1, noise, seg3], SR, group_gap_s=2.0, group_max_s=25.0)
+    assert len(eval_groups) == 1
+
+    # Production: the noise segment's ASR text is empty, so drain_segments()
+    # never hands it to Refiner.add_span() -- only seg1 and seg3 become
+    # spans. maybe_refine() still gets called with the real (post-noise)
+    # audio position, exactly as run_stream() does after every drain.
+    stats = SessionStats()
+    history = AudioHistory(SR, keep_s=30.0)
+    history.push(np.zeros(70000, dtype=np.float32))
+    printer = PartialPrinter(enabled=False)
+    refiner = Refiner(_FakeAsrForGrouping(), history, SR, printer, stats=stats)
+
+    refiner.add_span(seg1[0], seg1[1], "en", "hello there", "")
+    refiner.maybe_refine(17000)  # mirrors run_stream() right after the noise VAD segment starts
+    # noise segment: ASR text empty -> drain_segments skips add_span(), but
+    # real audio time still advances past its end (48000) before the next
+    # drain reaches maybe_refine, exactly as run_stream() would call it.
+    refiner.maybe_refine(49000, force_sync=True)  # gap vs. seg1's end (16000) is 33000 >= 32000: due
+    refiner.add_span(seg3[0], seg3[1], "en", "second utterance", "")
+    refiner.maybe_refine(66000, force=True, force_sync=True)  # flush the trailing group
+
+    assert stats.refine_groups_closed == 2, (
+        "production should have closed 2 groups (seg1 alone, then seg3 alone) where "
+        f"eval's replica sees only 1 -- got {stats.refine_groups_closed}")
