@@ -40,6 +40,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from punct_ja import PunctuatorJa  # noqa: E402
+from eval_accuracy import levenshtein  # noqa: E402
 
 MODEL_DIR = os.path.join(ROOT, "models", "mojicast-punct-onnx")
 FP32_PATH = os.path.join(MODEL_DIR, "punct_bert.onnx")
@@ -350,23 +351,6 @@ def marks_from_restored(restored: str, base_len: int):
     if len(marks_after) < base_len:
         marks_after += [""] * (base_len - len(marks_after))
     return marks_after[:base_len]
-
-
-def levenshtein(a: str, b: str) -> int:
-    if a == b:
-        return 0
-    if not a:
-        return len(b)
-    if not b:
-        return len(a)
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, start=1):
-        cur = [i] + [0] * len(b)
-        for j, cb in enumerate(b, start=1):
-            cost = 0 if ca == cb else 1
-            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
-        prev = cur
-    return prev[-1]
 
 
 def punct_cer(ref: str, hyp: str):
