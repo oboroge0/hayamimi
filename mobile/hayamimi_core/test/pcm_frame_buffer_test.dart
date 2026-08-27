@@ -85,4 +85,49 @@ void main() {
       expect(buffer.pendingSampleCount, 1);
     });
   });
+
+  group('concatFloat32Lists', () {
+    test('joins chunks in order', () {
+      final combined = concatFloat32Lists([
+        Float32List.fromList([1, 2]),
+        Float32List.fromList([3]),
+        Float32List.fromList([4, 5]),
+      ]);
+
+      expect(combined, Float32List.fromList([1, 2, 3, 4, 5]));
+    });
+
+    test('returns an empty list for no chunks', () {
+      expect(concatFloat32Lists([]), isEmpty);
+    });
+
+    test('handles a single chunk', () {
+      final chunk = Float32List.fromList([1, 2, 3]);
+      expect(concatFloat32Lists([chunk]), chunk);
+    });
+  });
+
+  group('capDraftWindow', () {
+    test('returns samples unchanged when under the cap', () {
+      final samples = Float32List.fromList(List.filled(100, 1.0));
+      final capped = capDraftWindow(samples, sampleRate: 100, maxSeconds: 2.0);
+      expect(capped, samples);
+    });
+
+    test('returns exactly the cap length when equal', () {
+      final samples = Float32List.fromList(List.filled(200, 1.0));
+      final capped = capDraftWindow(samples, sampleRate: 100, maxSeconds: 2.0);
+      expect(capped.length, 200);
+    });
+
+    test('keeps only the trailing window when over the cap', () {
+      final samples = Float32List.fromList(
+        List.generate(10, (i) => i.toDouble()),
+      );
+      final capped = capDraftWindow(samples, sampleRate: 5, maxSeconds: 1.0);
+
+      // maxSamples = 5 * 1.0 = 5, so the last 5 samples: [5, 6, 7, 8, 9]
+      expect(capped, Float32List.fromList([5, 6, 7, 8, 9]));
+    });
+  });
 }

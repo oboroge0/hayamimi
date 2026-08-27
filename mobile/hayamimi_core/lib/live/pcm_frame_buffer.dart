@@ -53,3 +53,35 @@ class PcmFrameBuffer {
   /// Drops any buffered, not-yet-complete samples.
   void reset() => _pending.clear();
 }
+
+/// Concatenates [chunks] into a single Float32List, in order. Used to turn
+/// the frames accumulated for an in-progress draft decode (a `List` because
+/// they arrive one VAD window at a time) into one buffer to feed the
+/// recognizer, the same shape [combineSegmentSamples] produces for the
+/// refine pass's finalized segments.
+Float32List concatFloat32Lists(List<Float32List> chunks) {
+  final totalLength = chunks.fold<int>(0, (sum, c) => sum + c.length);
+  final combined = Float32List(totalLength);
+  var offset = 0;
+  for (final chunk in chunks) {
+    combined.setRange(offset, offset + chunk.length, chunk);
+    offset += chunk.length;
+  }
+  return combined;
+}
+
+/// Returns the trailing [maxSeconds] of [samples] (or all of it, if
+/// shorter) -- the draft pass's equivalent of the desktop's
+/// `PARTIAL_WINDOW_S` cap (see `draft_pass.dart`), kept here alongside the
+/// other sample-buffer helpers since it's plain Float32List slicing.
+Float32List capDraftWindow(
+  Float32List samples, {
+  required int sampleRate,
+  required double maxSeconds,
+}) {
+  final maxSamples = (maxSeconds * sampleRate).round();
+  if (samples.length <= maxSamples) {
+    return samples;
+  }
+  return Float32List.sublistView(samples, samples.length - maxSamples);
+}

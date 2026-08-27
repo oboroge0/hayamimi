@@ -49,6 +49,9 @@ class HayamimiLive {
     _decodingSubscription = _transcriber.decoding.listen(
       _decodingController.add,
     );
+    _draftsSubscription = _transcriber.drafts.listen((entry) {
+      _eventsController.add(PartialSubtitleEvent(entry.text));
+    });
   }
 
   final LiveTranscriber _transcriber;
@@ -57,6 +60,7 @@ class HayamimiLive {
   late final StreamSubscription _entriesSubscription;
   late final StreamSubscription _refineEntriesSubscription;
   late final StreamSubscription _decodingSubscription;
+  late final StreamSubscription _draftsSubscription;
 
   /// BCP-47-ish language tag stamped on every emitted event that doesn't
   /// carry its own (i.e. a plain single-model session, or a routed
@@ -127,6 +131,7 @@ class HayamimiLive {
     await _entriesSubscription.cancel();
     await _refineEntriesSubscription.cancel();
     await _decodingSubscription.cancel();
+    await _draftsSubscription.cancel();
     await _transcriber.dispose();
     await _eventsController.close();
     await _decodingController.close();
