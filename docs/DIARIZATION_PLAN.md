@@ -526,6 +526,182 @@ DERそのものは大幅に改善しているため（同じグループ内の�
 - オーバーラップ区間の扱い（先着優先）は本イテレーションでも
   未着手のまま（スコープ外として据え置き、§3の設計方針通り）。
 
+## 8. イテレーション⑤実装結果: グローバル閾値の分離チューニング + 内訳分析
+
+### 実験設計
+
+§7の引き継ぎ通り、グローバル話者数過大推定の主因は`FastClusteringConfig.threshold`
+（清書グループ内のローカル分離）ではなく`speaker_id.SIM_THRESHOLD=0.45`
+（ローカルクラスタ代表埋め込みをグローバルセントロイドへ対応付ける際の閾値）
+と当たりを付けていたため、まずこの1点を検証した。
+
+`speaker_id.SpeakerLabeler`に2つ目の閾値`remap_threshold`を追加した
+（`__init__`のキーワード引数、デフォルトは新設の`REMAP_THRESHOLD=0.35`）。
+`match_embedding(emb, update, threshold=None)`が`threshold`引数を受け取れるよう
+にし、`None`のときだけ`self._threshold`（従来の`SIM_THRESHOLD`、速報パスの
+`label()`が使う値）にフォールバックする。清書パスの対応付け呼び出し
+（`realtime_transcribe.Refiner._emit_turns()`と`eval_diar.py`の
+`generate_diarize_hypothesis()`の両方）は`threshold=labeler.remap_threshold`を
+明示的に渡すよう変更した。これにより**速報パス（`label()`、VADセグメント単位で
+高頻度に呼ばれる）と清書パスのグローバル対応付け（グループごとのローカル
+クラスタ単位で低頻度に呼ばれる）を別々の閾値で運用できる**ようになった
+(`scripts/speaker_id.py:16-79`, `scripts/eval_diar.py --sim-threshold`/
+`--remap-threshold`, `scripts/realtime_transcribe.py --speaker-remap-threshold`)。
+
+dev会議（ES2011a, IS1008a）で以下を振った:
+
+1. 対称スイープ: `sim_threshold`(=`SIM_THRESHOLD`扱い)を0.30/0.35/0.40/0.45/0.50で
+   振り、`remap_threshold`は同じ値にフォールバック（従来の単一閾値運用と同等）。
+2. 非対称スイープ: `sim_threshold=0.45`（速報パス据え置き、回帰リスクゼロ）に固定し、
+   `remap_threshold`だけを0.30/0.35/0.40で振る。
+
+### dev会議での結果
+
+対称スイープ（`diar_threshold=0.5`固定）:
+
+| sim=remap閾値 | ES2011a DER | ES2011a 話者数 | IS1008a DER | IS1008a 話者数 |
+|---|---|---|---|---|
+| 0.30 | 48.5% | 3 | 4.0% | 5 |
+| 0.35 | 18.6% | 4 | 4.0% | 6 |
+| 0.40 | 18.0% | 5 | 4.0% | 6 |
+| 0.45(旧デフォルト) | 18.0% | 8 | 4.2% | 10 |
+| 0.50 | 19.4% | 10 | 4.4% | 12 |
+
+0.30まで下げるとES2011aが崩壊する（DER 48.5%、話者数が3に潰れる＝過少推定側に
+振り切れる）。0.35〜0.40が対称スイープの中では最良で、話者数もrefの4に近づくが、
+DERはIS1008aでは横ばい（各閾値でDER自体はほぼ4.0〜4.4%と鈍感、話者数だけが動く）。
+
+非対称スイープ（`sim_threshold=0.45`固定、`diar_threshold=0.5`固定）:
+
+| remap閾値 | ES2011a DER | ES2011a 話者数 | IS1008a DER | IS1008a 話者数 |
+|---|---|---|---|---|
+| 0.30 | 17.7% | 5 | 4.0% | 6 |
+| **0.35** | **16.8%** | **4** | **4.0%** | 7 |
+| 0.40 | 17.8% | 7 | 4.0% | 7 |
+
+`remap_threshold=0.35`（速報パスは0.45のまま）が対称スイープの最良値
+（`sim=remap=0.35`: ES2011a DER 18.6%）を上回った（ES2011a DER 16.8%、話者数は
+参照通り4に一致）。速報パス閾値を動かさない分、清書の恩恵を受けない場面
+（`--speakers`使用時でも清書前に表示される確定行など）への影響もない。
+**採用: `remap_threshold=0.35`、`SIM_THRESHOLD`(速報パス)は0.45のまま据え置き。**
+
+### test会議での汎化確認
+
+選定した`remap_threshold=0.35`（`sim_threshold`はデフォルトの0.45、
+`diar_threshold`もデフォルトの0.5）を、dev会議選定に使っていない残り3会議
+（test split: ES2004a, IS1009a, TS3003a）で検証した。
+
+| 会議 | split | ref話者数 | §7時点DER(remap=0.45) | §7時点話者数 | ⑤採用後DER(remap=0.35) | ⑤採用後話者数 |
+|---|---|---|---|---|---|---|
+| ES2011a | dev | 4 | 18.0% | 8 | 16.8% | 4 |
+| IS1008a | dev | 4 | 4.2% | 10 | 4.0% | 7 |
+| ES2004a | test | 4 | 17.8% | 10〜11 | 17.8% | 8 |
+| IS1009a | test | 4 | 17.3% | 8〜9 | 16.9% | 6 |
+| TS3003a | test | 4 | 14.1% | 8 | 14.1% | 7 |
+| **平均** | | | **14.3%*** | | **13.9%** | |
+
+(*§7表のthreshold=0.5列の平均。dev/test全5会議、collar=0.25s。)
+
+test会議でもDERは横ばい〜微改善（悪化した会議はゼロ）、話者数は全会議で
+過大推定が縮小した（ES2004a 10〜11→8、IS1009a 8〜9→6、TS3003a 8→7）。
+dev会議で選んだ設定がtest会議でも一貫して効いており、dev/testの過学習は
+見られない。ただし**話者数の過大推定は解消しきれていない**（refの4に対し
+6〜8で下げ止まり）。速報パス閾値0.45を維持したことで速報パス自体の性質
+（同一閾値0.45での新規話者生成しやすさ）はそのまま残っており、清書パスの
+対応付け閾値だけを緩めても速報パスが最初に開いた「分裂気味の」グローバル
+セントロイド集合自体は変えられないため、と考えられる（根本対応には
+速報パス側のセントロイド管理そのもの、例えば定期的な再クラスタリングや
+ヒステリシス付き閾値が必要で、これは本イテレーションのスコープ外）。
+
+### pyannote.metrics による内訳分析
+
+`pyannote.metrics==4.1`を`requirements-dev.txt`に追加し
+（`pip install pyannote.metrics`で`pyannote.core`/`pyannote.database`/
+`pandas`/`scikit-learn`ごと入る、simpladerより重い依存。§4で書いた通り
+「日常はsimpleder、内訳が要る時だけpyannote.metrics」の二段構え通りの位置づけ）、
+`scripts/eval_diar.py`に`der_breakdown()`関数と`--breakdown`フラグを追加した
+(`pyannote.metrics.diarization.DiarizationErrorRate(collar=...)`を
+`detailed=True`で呼び、Miss/FalseAlarm/Confusionを参照総発話時間で正規化して返す)。
+`tests/test_diar_eval.py`に2件のユニットテストを追加（同一ref/hypでゼロ、
+純粋なConfusionケースと純粋なMissケースが正しく分離されることを確認）。
+
+採用設定（`remap_threshold=0.35`, `sim_threshold=0.45`, `diar_threshold=0.5`）で
+AMI 5会議の内訳を実測:
+
+| 会議 | DER(simpleder) | Miss | False Alarm | Confusion |
+|---|---|---|---|---|
+| ES2011a | 16.8% | 11.3% | 3.5% | 5.9% |
+| IS1008a | 4.0% | 2.6% | 3.5% | 0.7% |
+| ES2004a | 17.8% | 14.5% | 3.7% | 5.0% |
+| IS1009a | 16.9% | 6.8% | 4.5% | 12.4% |
+| TS3003a | 14.1% | 8.7% | 6.5% | 0.7% |
+
+（pyannote.metricsのDER定義はsimpladerと実装が異なるため個々の内訳の合計は
+simpladerのDER%と厳密には一致しない。overlap区間の扱いなど採点細部の差異による
+もので、傾向を見る内訳比較としては問題ない。）
+
+**結論: 5会議中4会議はMiss（検出漏れ）がConfusion（話者取り違え）を上回る**
+（ES2011a: 11.3%>5.9%、IS1008a: 2.6%>0.7%、ES2004a: 14.5%>5.0%、
+TS3003a: 8.7%>0.7%）。唯一IS1009aだけConfusionがMissを上回る（12.4%>6.8%）。
+
+これは§1限界②で挙げていた「話者過大推定」問題の実害を見る上で重要な情報:
+グローバル話者数はrefの4に対し6〜8で過大推定のままだが、それによる
+**DERへの実害（Confusion）は多くの会議で小さい**。過大推定で生まれた余分な
+S{n}ラベルは、既存の話者と時間的に大きく重ならない区間（境界のズレで
+別クラスタに割れた小さな発話片など）に付くことが多く、参照話者への
+誤帰属（＝真の意味での話者取り違え）としてはあまりカウントされていない
+と読める。DERの主成分はむしろMiss（VADのセグメント境界とRTTMの参照境界の
+ずれ、pyannote segmentationの発話境界検出誤差）であり、§6で立てていた
+仮説（VAD境界と参照境界のミスアラインメントがMiss/FAに寄与）が内訳計測で
+裏付けられた形になる。IS1009aだけConfusionが優勢なのは、この会議固有の
+話者交代パターン（早口・被り発話が多い、§6の観察2と整合）が影響している
+可能性が高い。
+
+### 本番反映と回帰確認
+
+- `speaker_id.py`: `REMAP_THRESHOLD=0.35`を新設し`SpeakerLabeler.__init__`の
+  `remap_threshold`デフォルトに設定。`SIM_THRESHOLD=0.45`（速報パス）は無変更。
+- `realtime_transcribe.py`: `--speaker-remap-threshold`CLIオプションを追加
+  （未指定時は`speaker_id.REMAP_THRESHOLD`が効く。明示的に値を渡した場合のみ
+  上書き）。`Refiner._emit_turns()`のグローバル対応付け呼び出しを
+  `threshold=self.speaker_labeler.remap_threshold`を渡す形に変更。
+- `eval_diar.py`: `--sim-threshold`/`--remap-threshold`CLIオプションを追加、
+  `--breakdown`でpyannote.metrics内訳を追加出力。
+- **速報パス回帰確認**: `--method baseline`（`SIM_THRESHOLD`のみを使う経路、
+  `remap_threshold`は一切関与しない）を5会議で再実行し、§6の元の数値と
+  完全一致することを確認した（ES2011a 32.1%, IS1008a 18.2%, ES2004a 28.5%,
+  IS1009a 32.9%, TS3003a 16.7%, 平均25.7% -- 1桁まで全て一致）。
+  `remap_threshold`の追加が速報パス・ベースライン経路に一切影響しないことの
+  直接的な裏付け。
+- **清書パス最終確認**: `--method refine_diarize`（フラグ無し=新デフォルト）を
+  5会議で再実行し、平均DER 13.9%（会議別: 16.8/4.0/17.8/16.9/14.1%）を確認。
+
+### 最終DERサマリー（ベースライン→③④→⑤、AMI 5会議、collar=0.25s）
+
+| 段階 | 手法 | 平均DER | 話者数（refは全会議4） |
+|---|---|---|---|
+| §6 ベースライン | 速報パスのみ（`SpeakerLabeler`単体） | 25.7% | 6〜9 |
+| §7 ③④ | 清書パス統合、`diar_threshold=0.5`、単一閾値0.45 | 14.1〜14.3% | 8〜11（悪化した会議あり） |
+| §8 ⑤（採用） | 清書パス、`remap_threshold=0.35`分離 | **13.9%** | 4〜8（全会議で改善） |
+
+### 残課題
+
+- **話者数の過大推定は残る**（refの4に対し4〜8）。§8の非対称閾値調整は
+  DERと話者数の両方を改善したが、根治には至っていない。次に効きそうな
+  方向性: (a) 速報パスのセントロイド管理自体の改善（定期的な再クラスタリング、
+  ヒステリシス付き閾値、セッション終盤の全体再クラスタリング）、
+  (b) ローカルクラスタ代表埋め込みの計算方法自体の改善（現状はクラスタに
+  属する区間を単純連結してから1回埋め込み計算 -- 複数区間の埋め込みを
+  個別計算して平均する方が安定する可能性）。いずれも本イテレーションの
+  スコープ外（§5当初計画のイテレーション⑤で完結させる粒度を優先した）。
+- オーバーラップ区間の扱い（先着優先）は引き続き未着手（§3設計方針通り、
+  スコープ外として据え置き）。
+- `download_models.py`にpyannote segmentation-3.0の取得を追加した
+  (`SEGMENTATION_TAG="speaker-segmentation-models"`、既存の`campplus_sv.onnx`
+  取得の直後、`--speakers`使用時のみ関与しモデル欠如時は速報パスのみへ
+  フォールバックするため必須化はしていない)。README英日の`--speakers`説明を
+  実測DERと清書パスの挙動変化に合わせて更新した。
+
 ## 出典
 
 - [Speaker Diarization — sherpa-onnx docs](https://k2-fsa.github.io/sherpa/onnx/speaker-diarization/index.html)
@@ -536,7 +712,7 @@ DERそのものは大幅に改善しているため（同じグループ内の�
 - [3D-Speaker (modelscope, CAM++)](https://github.com/modelscope/3D-Speaker)
 - [AMI Meeting Corpus](https://groups.inf.ed.ac.uk/ami/corpus/) / [AMI License (CC BY 4.0)](https://groups.inf.ed.ac.uk/ami/corpus/license.shtml)
 - [VoxConverse (joonson/voxconverse)](https://github.com/joonson/voxconverse)
-- [pyannote.metrics (GitHub)](https://github.com/pyannote/pyannote-metrics) / [pyannote-metrics (PyPI)](https://pypi.org/project/pyannote-metrics/)
+- [pyannote.metrics (GitHub)](https://github.com/pyannote/pyannote-metrics) / [pyannote-metrics (PyPI)](https://pypi.org/project/pyannote-metrics/) (導入・実測: 本イテレーション⑤)
 - [simpleder (PyPI)](https://pypi.org/project/simpleder/)
 - `.venv` 内 `sherpa_onnx` 1.13.6 実体の `dir()`/`help()` 出力（本調査で直接確認）
 - リポジトリ内: `scripts/speaker_id.py`, `scripts/realtime_transcribe.py`,
