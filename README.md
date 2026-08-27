@@ -23,6 +23,9 @@ language, all running as quantized (INT8) ONNX models via
 On real broadcast Japanese audio (see `docs/SCORECARD.md`), that routing
 gets **5.8% CER**, less than half of `whisper-large-v3-turbo`'s 13.8% on the
 same clips, while running at 10-50x realtime on a 6-core desktop CPU.
+A full comparison against Whisper variants, cloud STT APIs, and other local
+models -- including the languages where hayamimi loses -- is in
+`docs/COMPARISON.md`.
 
 ## Features
 
