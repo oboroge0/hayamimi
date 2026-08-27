@@ -30,34 +30,85 @@ class ModelFileResolutionException implements Exception {
 
 ResolvedModelFiles resolveZipformerTransducerFiles(List<String> filenames) {
   return ResolvedModelFiles(
-    encoder: _pick(filenames, 'encoder'),
-    decoder: _pick(filenames, 'decoder'),
-    joiner: _pick(filenames, 'joiner'),
+    encoder: resolveOnnxFile(filenames, role: 'encoder'),
+    decoder: resolveOnnxFile(filenames, role: 'decoder'),
+    joiner: resolveOnnxFile(filenames, role: 'joiner'),
     tokens: _pickExact(filenames, 'tokens.txt'),
   );
 }
 
-String _pick(List<String> filenames, String role) {
+/// Resolves a single `.onnx` file out of a flat directory listing.
+///
+/// [role] is matched as a case-insensitive substring of the filename (e.g.
+/// `"encoder"`); pass the default `""` to match any `.onnx` file
+/// regardless of name, which is what a model shipped as one combined file
+/// (e.g. SenseVoice) needs.
+///
+/// When multiple files match [role] and an int8-quantized variant is among
+/// them, that variant is preferred -- this is the common
+/// full-precision-plus-quantized layout sherpa-onnx release archives ship.
+/// Pass [requireInt8]: true to instead reject the match entirely unless an
+/// int8 variant is present (used where only the quantized model is ever
+/// meant to be loaded, e.g. this app's whisper-tiny LID tier).
+String resolveOnnxFile(
+  List<String> filenames, {
+  String role = '',
+  bool requireInt8 = false,
+}) {
+  final needle = role.toLowerCase();
   final candidates =
       filenames
           .where(
             (f) =>
-                f.toLowerCase().contains(role) &&
+                f.toLowerCase().contains(needle) &&
                 f.toLowerCase().endsWith('.onnx'),
           )
           .toList()
         ..sort();
+
+  final int8Candidates = candidates
+      .where((f) => f.toLowerCase().contains('int8'))
+      .toList();
+
+  if (requireInt8) {
+    if (int8Candidates.isEmpty) {
+      throw ModelFileResolutionException(
+        'No int8 .onnx file containing "$role" found in model directory',
+      );
+    }
+    return int8Candidates.first;
+  }
 
   if (candidates.isEmpty) {
     throw ModelFileResolutionException(
       'No .onnx file containing "$role" found in model directory',
     );
   }
-
-  final int8Candidates = candidates
-      .where((f) => f.toLowerCase().contains('int8'))
-      .toList();
   return int8Candidates.isNotEmpty ? int8Candidates.first : candidates.first;
+}
+
+/// A pair of `.onnx` files resolved together by [resolveOnnxFilePair], e.g.
+/// a whisper-style encoder + decoder.
+class ResolvedOnnxPair {
+  const ResolvedOnnxPair({required this.first, required this.second});
+
+  final String first;
+  final String second;
+}
+
+/// Resolves two related `.onnx` files (e.g. an encoder/decoder pair) out of
+/// a flat directory listing in one call, applying [resolveOnnxFile]'s
+/// int8-preference (or, with [requireInt8], int8-requirement) rule to each.
+ResolvedOnnxPair resolveOnnxFilePair(
+  List<String> filenames, {
+  required String role1,
+  required String role2,
+  bool requireInt8 = false,
+}) {
+  return ResolvedOnnxPair(
+    first: resolveOnnxFile(filenames, role: role1, requireInt8: requireInt8),
+    second: resolveOnnxFile(filenames, role: role2, requireInt8: requireInt8),
+  );
 }
 
 String _pickExact(List<String> filenames, String name) {

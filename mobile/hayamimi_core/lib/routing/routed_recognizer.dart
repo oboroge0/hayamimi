@@ -124,14 +124,19 @@ class RoutedRecognizerSet {
         .where((e) => e is File)
         .map((e) => e.uri.pathSegments.last)
         .toList();
-    final svModel = svFilenames.firstWhere(
-      (f) => f.toLowerCase().endsWith('.onnx'),
-      orElse: () => '',
-    );
     final svTokens = svFilenames.firstWhere(
       (f) => f.toLowerCase() == 'tokens.txt',
       orElse: () => '',
     );
+    final String svModel;
+    try {
+      svModel = svTokens.isEmpty ? '' : resolveOnnxFile(svFilenames);
+    } on ModelFileResolutionException catch (_) {
+      reazon.free();
+      throw RoutedRecognizerException(
+        'SenseVoice model/tokens not found in: $senseVoiceModelDir',
+      );
+    }
     if (svModel.isEmpty || svTokens.isEmpty) {
       reazon.free();
       throw RoutedRecognizerException(
@@ -167,19 +172,18 @@ class RoutedRecognizerSet {
         .where((e) => e is File)
         .map((e) => e.uri.pathSegments.last)
         .toList();
-    String pickLid(String needle) {
-      final hits = lidFilenames.where(
-        (f) =>
-            f.toLowerCase().contains(needle) &&
-            f.toLowerCase().contains('int8') &&
-            f.toLowerCase().endsWith('.onnx'),
+    final ResolvedOnnxPair lidFiles;
+    try {
+      // requireInt8: true -- this tier only ever ships the quantized
+      // whisper-tiny variant, so a match without an int8 file is treated
+      // the same as no match at all (mirrors the old hand-rolled pickLid).
+      lidFiles = resolveOnnxFilePair(
+        lidFilenames,
+        role1: 'encoder',
+        role2: 'decoder',
+        requireInt8: true,
       );
-      return hits.isNotEmpty ? hits.first : '';
-    }
-
-    final lidEncoder = pickLid('encoder');
-    final lidDecoder = pickLid('decoder');
-    if (lidEncoder.isEmpty || lidDecoder.isEmpty) {
+    } on ModelFileResolutionException catch (_) {
       reazon.free();
       senseVoice.free();
       throw RoutedRecognizerException(
@@ -189,8 +193,8 @@ class RoutedRecognizerSet {
     final lid = sherpa_onnx.SpokenLanguageIdentification(
       sherpa_onnx.SpokenLanguageIdentificationConfig(
         whisper: sherpa_onnx.SpokenLanguageIdentificationWhisperConfig(
-          encoder: '$lidModelDir$sep$lidEncoder',
-          decoder: '$lidModelDir$sep$lidDecoder',
+          encoder: '$lidModelDir$sep${lidFiles.first}',
+          decoder: '$lidModelDir$sep${lidFiles.second}',
         ),
         numThreads: numThreads,
       ),
