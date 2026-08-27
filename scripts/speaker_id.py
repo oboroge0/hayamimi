@@ -27,7 +27,16 @@ class SpeakerLabeler:
         self._centroids: list[np.ndarray] = []  # running mean per speaker
         self._counts: list[int] = []
 
-    def label(self, samples: np.ndarray, sample_rate: int) -> str:
+    def embed(self, samples: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Compute an L2-normalized CAM++ embedding for one audio buffer.
+
+        Split out of label() so callers that already have their own
+        clustering (e.g. scripts/diarize.py's GroupDiarizer, whose local
+        speaker clusters need remapping onto this labeler's global
+        centroids -- docs/DIARIZATION_PLAN.md iteration 4) can get the same
+        embedding label() would compute without going through its
+        assign-or-open-new-speaker side effects.
+        """
         max_len = int(MAX_EMBED_SECONDS * sample_rate)
         if len(samples) > max_len:
             samples = samples[:max_len]
@@ -36,7 +45,20 @@ class SpeakerLabeler:
         stream.input_finished()
         emb = np.asarray(self._extractor.compute(stream), dtype=np.float32)
         emb /= np.linalg.norm(emb) + 1e-9
+        return emb
 
+    def match_embedding(self, emb: np.ndarray, update: bool = True) -> str:
+        """Assign a precomputed embedding to the nearest global centroid
+        (or open a new speaker), same policy as label() but for a caller
+        that already has an embedding (see embed()).
+
+        update=False looks up the nearest speaker without folding the
+        embedding into the running centroid mean and without opening a new
+        speaker on a miss (returns "" instead) -- used for read-only
+        lookups where mutating session state would be wrong (e.g. probing
+        which existing global speaker a diarization cluster most resembles
+        before deciding whether it deserves a brand-new global label).
+        """
         best, best_sim = -1, -1.0
         for i, c in enumerate(self._centroids):
             sim = float(np.dot(emb, c) / (np.linalg.norm(c) + 1e-9))
@@ -44,12 +66,18 @@ class SpeakerLabeler:
                 best, best_sim = i, sim
 
         if best >= 0 and best_sim >= self._threshold:
-            # fold into the running mean so the centroid tracks the speaker
-            n = self._counts[best]
-            self._centroids[best] = (self._centroids[best] * n + emb) / (n + 1)
-            self._counts[best] = n + 1
+            if update:
+                n = self._counts[best]
+                self._centroids[best] = (self._centroids[best] * n + emb) / (n + 1)
+                self._counts[best] = n + 1
             return f"S{best + 1}"
 
+        if not update:
+            return ""
         self._centroids.append(emb)
         self._counts.append(1)
         return f"S{len(self._centroids)}"
+
+    def label(self, samples: np.ndarray, sample_rate: int) -> str:
+        emb = self.embed(samples, sample_rate)
+        return self.match_embedding(emb, update=True)
