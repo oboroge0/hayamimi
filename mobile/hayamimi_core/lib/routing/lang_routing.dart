@@ -105,11 +105,14 @@ class StickyLangResult {
 /// Sticky-LID hysteresis: decide whether to accept a new LID detection as
 /// a real language switch, or hold the session's current language.
 ///
-/// Ported from the desktop `resolve_sticky_lang` for languages outside
-/// SenseVoice's 5-language coverage (mobile currently has no tier for
-/// those — see `docs/MOBILE.md` — but this is kept as a faithful, tested
-/// port so a future non-SenseVoice tier can reuse it without re-deriving
-/// the hysteresis rules).
+/// A direct port of the desktop `resolve_sticky_lang`, for languages
+/// outside SenseVoice's 5-language coverage. It has **zero production
+/// callers today** — mobile currently has no tier for those languages (see
+/// `docs/MOBILE.md`), so [RoutedRecognizerSet] never reaches this path.
+/// It's kept, not deleted, as a faithful, tested port so a future
+/// non-SenseVoice language tier can reuse it without re-deriving the
+/// hysteresis rules from the desktop pipeline. Only [lang_routing_test.dart]
+/// exercises it for now.
 ///
 /// A single new-language detection can be a babble-noise misfire or a
 /// jingle/SFX blip rather than a genuine switch. [switchConfirm]
