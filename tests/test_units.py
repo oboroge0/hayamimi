@@ -739,6 +739,11 @@ class _FakeRefiner:
     def __init__(self):
         self.spans = []
         self.calls = []
+        # add_span() now bumps self.stats.refine_lang_boundary_flushes on a
+        # language-boundary split (docs/DIARIZATION_PLAN.md section 10.6
+        # diagnostics) -- None mirrors how the real Refiner behaves when
+        # constructed without a SessionStats (see Refiner.__init__).
+        self.stats = None
 
     def maybe_refine(self, now_sample, force=False, force_sync=None):
         self.calls.append((now_sample, force, force_sync))

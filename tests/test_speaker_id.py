@@ -37,6 +37,7 @@ def make_labeler(threshold: float = 0.45, merge_enabled: bool = False,
     labeler._hysteresis_enabled = hysteresis_enabled
     labeler._hysteresis_min_hits = hysteresis_min_hits
     labeler._confirmed = []
+    labeler._open_log = []
     return labeler
 
 
@@ -92,6 +93,54 @@ def test_match_embedding_picks_nearest_of_several_centroids():
     labeler.match_embedding(unit([0.0, 1.0, 0.0]))       # S2
     label = labeler.match_embedding(unit([0.05, 0.95, 0.0]))  # closest to S2
     assert label == "S2"
+
+
+# ---------------------------------------------------------------------------
+# docs/DIARIZATION_PLAN.md section 10.6/10.8: centroid-open diagnostics
+# ---------------------------------------------------------------------------
+
+def test_match_embedding_default_source_is_empty_and_only_logged_on_open():
+    labeler = make_labeler(threshold=0.9)
+    labeler.match_embedding(unit([1.0, 0.0]))  # opens S1, no source given
+    # a hit on an existing centroid must not append to the open log at all
+    labeler.match_embedding(unit([0.99, 0.01]))
+    assert labeler._open_log == [""]
+
+
+def test_centroid_open_counts_tags_fast_and_remap_sources_separately():
+    labeler = make_labeler(threshold=0.9)
+    labeler.match_embedding(unit([1.0, 0.0]), source="fast")     # opens S1
+    labeler.match_embedding(unit([0.0, 1.0]), source="fast")     # opens S2 (miss)
+    labeler.match_embedding(unit([-1.0, 0.0]), source="remap")   # opens S3 (miss)
+    assert labeler.centroid_open_counts() == {"fast": 2, "remap": 1}
+
+
+def test_label_forwards_source_to_match_embedding():
+    labeler = make_labeler(threshold=0.9)
+    labeler._extractor = None  # embed() isn't reached: patch label()'s callee instead
+    labeler.embed = lambda samples, sr: unit([1.0, 0.0])
+    labeler.label(np.zeros(10), 16000)  # default source="fast"
+    labeler.embed = lambda samples, sr: unit([0.0, 1.0])
+    labeler.label(np.zeros(10), 16000, source="probe")
+    assert labeler._open_log == ["fast", "probe"]
+
+
+def test_centroid_summary_flags_one_off_opens_with_a_final_match_count_of_one():
+    # docs/DIARIZATION_PLAN.md section 10.8's root-cause finding: production
+    # prints every fast-path S{n} the instant it opens, including a
+    # centroid that (like this one) never gets matched again -- exactly
+    # what centroid_summary()'s final_match_count is meant to surface, since
+    # eval_diar.py's DER hypothesis construction (per-group majority vote /
+    # remap-selected labels) structurally never surfaces such a label
+    # unless it happens to also win a group.
+    labeler = make_labeler(threshold=0.9)
+    labeler.match_embedding(unit([1.0, 0.0]), source="fast")   # S1: matched again below
+    labeler.match_embedding(unit([0.99, 0.01]), source="fast")  # folds into S1
+    labeler.match_embedding(unit([0.0, 1.0]), source="fast")   # S2: a one-off outlier
+    assert labeler.centroid_summary() == [
+        ("S1", "fast", 2),
+        ("S2", "fast", 1),
+    ]
 
 
 # ---------------------------------------------------------------------------

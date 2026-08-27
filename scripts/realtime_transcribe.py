@@ -162,6 +162,22 @@ class SessionStats:
         self.segments = 0
         self.latencies_ms: list[float] = []
         self.refine_lang_corrections = 0  # times the refine pass overruled the fast-path language
+        # docs/DIARIZATION_PLAN.md section 10.6 diagnostics: eval_diar.py's
+        # generate_diarize_hypothesis() groups VAD segments purely on the
+        # silence-gap/max-length "due" condition (see group_segments()'s
+        # docstring) and has no decoded text to split groups on a language
+        # change, but production's Refiner.add_span() also force-flushes a
+        # group the moment the (script-corrected) language differs from the
+        # group in progress. Every extra group is an extra GroupDiarizer
+        # call and an extra round of remap-path match_embedding() calls
+        # (each a fresh chance to open a new global centroid at
+        # remap_threshold), so counting groups actually closed in
+        # production vs. how many were closed specifically because of a
+        # language-boundary split (rather than silence/GROUP_MAX_S) tells
+        # us whether over-grouping is a real contributor to the S1..S13
+        # overcount, independent of eval_diar.py's simplified replica.
+        self.refine_groups_closed = 0
+        self.refine_lang_boundary_flushes = 0
 
     def summary(self) -> str:
         if not self.latencies_ms:
@@ -169,7 +185,9 @@ class SessionStats:
         mean = sum(self.latencies_ms) / len(self.latencies_ms)
         return (f"total_audio={self.total_audio_s:.1f}s segments={self.segments} "
                 f"mean_latency={mean:.0f}ms max_latency={max(self.latencies_ms):.0f}ms "
-                f"refine_lang_corrections={self.refine_lang_corrections}")
+                f"refine_lang_corrections={self.refine_lang_corrections} "
+                f"refine_groups_closed={self.refine_groups_closed} "
+                f"refine_lang_boundary_flushes={self.refine_lang_boundary_flushes}")
 
 
 PREROLL_S = 1.0  # audio to prepend before the VAD's detected speech onset
@@ -231,7 +249,7 @@ def drain_segments(vad, sample_rate: int, asr: RoutedASR, stats: SessionStats,
 
         speaker = ""
         if speaker_labeler is not None:
-            speaker = speaker_labeler.label(samples, sample_rate) + "|"
+            speaker = speaker_labeler.label(samples, sample_rate, source="fast") + "|"
 
         stats.segments += 1
         stats.latencies_ms.append(latency_ms)
@@ -423,6 +441,8 @@ class Refiner:
             if corrected != group_lang:
                 # flush the previous group off the hot path; it belongs to
                 # a different language and must not accumulate this span
+                if self.stats is not None:
+                    self.stats.refine_lang_boundary_flushes += 1
                 self.maybe_refine(seg_start, force=True, force_sync=False)
         self.spans.append((seg_start, seg_end, lang, text, speaker))
 
@@ -476,7 +496,8 @@ class Refiner:
             )
             emb = self.speaker_labeler.embed(cluster_audio, self.sr)
             global_label[local_id] = self.speaker_labeler.match_embedding(
-                emb, update=True, threshold=self.speaker_labeler.remap_threshold)
+                emb, update=True, threshold=self.speaker_labeler.remap_threshold,
+                source="remap")
 
         # iteration 6 (docs/DIARIZATION_PLAN.md section 9): this refine
         # group's remap is the natural "clean copy" boundary -- give
@@ -552,6 +573,8 @@ class Refiner:
         self.spans = []
         if len(buf) < self.sr // 2:
             return
+        if self.stats is not None:
+            self.stats.refine_groups_closed += 1
 
         def work():
             # off the hot path: a refine of a 25s group takes ~0.5-1s and must
@@ -978,6 +1001,13 @@ def main():
                 # is how a reader reconciles those older lines by hand.
                 pairs = ", ".join(f"{old}->{new}" for old, new in sorted(merges.items()))
                 print(f"=== speaker merges (old->current label): {pairs} ===")
+            # docs/DIARIZATION_PLAN.md section 10.6 diagnostics: which path
+            # (fast per-VAD-segment label() vs. refine-group remap
+            # match_embedding()) opened each currently-live global centroid.
+            print(f"=== speaker centroids opened by source: "
+                  f"{speaker_labeler.centroid_open_counts()} ===")
+            print(f"=== speaker centroid detail (label, opened_by, final_match_count): "
+                  f"{speaker_labeler.centroid_summary()} ===")
 
 
 if __name__ == "__main__":
