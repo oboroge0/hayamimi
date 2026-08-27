@@ -111,12 +111,13 @@ python -m venv .venv
 # Meeting output from BlackHole + your physical microphone, mixed locally
 .venv/bin/python scripts/realtime_transcribe.py --translate ja --serve \
   --device "BlackHole 2ch" --mic-device "MacBook Pro Microphone" \
-  --transcript meeting.txt
+  --transcript meeting.txt --record meeting.wav
 ```
 
 `--device` and `--mic-device` open two Core Audio inputs and mix them locally
-before recognition. Audio is not saved; `--transcript` saves only the refined
-source text and translations. Run with `--list-devices` to find device names or
+before recognition. `--record` saves that exact mixed stream locally as a
+16kHz mono PCM16 WAV and refuses to overwrite an existing file. `--transcript`
+saves the refined source text and translations. Run with `--list-devices` to find device names or
 indices. Keep the meeting application's microphone set to the physical mic and
 its speaker set to the multi-output device that includes BlackHole.
 
@@ -157,6 +158,7 @@ All flags are on `scripts/realtime_transcribe.py`:
 | `--serve [PORT]` | off, 8833 | serve the dashboard + OBS overlay at `http://localhost:PORT` |
 | `--no-refine` | off | disable the second-pass re-decode of utterance groups |
 | `--transcript PATH` | none | append refined transcript lines to this file |
+| `--record WAV_PATH` | none | save the exact mixed ASR input as 16kHz mono PCM16 WAV; never overwrite an existing file |
 | `--hotwords PATH` | none | hotword list (one per line) to bias decoding toward proper nouns -- **currently has no effect on the ja tier** (ReazonSpeech's byte-level BPE tokens.txt can't encode them; a startup warning tells you how many failed). Use `--replace` for ja proper nouns instead |
 | `--replace PATH` | none | user dictionary: `wrong=right` per line, applied to all output |
 | `--lang-switch-guard SEC` | 2.0 | treat a new-language detection shorter than this as noise: it can never count toward confirming a switch (see `--lid-switch-confirm`) and it suppresses the omnilingual fallback on an empty decode (`0` disables) |

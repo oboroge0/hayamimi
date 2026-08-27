@@ -30,6 +30,42 @@ MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 VAD_MODEL = os.path.join(MODELS_DIR, "silero_vad.onnx")
 
 
+class WavRecorder:
+    """Write the exact mono float32 stream sent to VAD/ASR as PCM16 WAV."""
+
+    def __init__(self, path: str, sample_rate: int):
+        self.path = os.path.abspath(path)
+        self.sample_rate = sample_rate
+        self.frames = 0
+        # Never silently destroy an earlier meeting recording.
+        self._raw = open(self.path, "xb")
+        try:
+            self._wav = wave.open(self._raw, "wb")
+            self._wav.setnchannels(1)
+            self._wav.setsampwidth(2)
+            self._wav.setframerate(sample_rate)
+        except Exception:
+            self._raw.close()
+            raise
+
+    def write(self, samples: np.ndarray):
+        mono = np.asarray(samples, dtype=np.float32).reshape(-1)
+        pcm = (np.clip(mono, -1.0, 1.0) * 32767.0).astype("<i2")
+        self._wav.writeframesraw(pcm.tobytes())
+        self.frames += len(mono)
+
+    def close(self):
+        if self._wav is None:
+            return
+        self._wav.close()
+        self._raw.close()
+        self._wav = None
+
+    @property
+    def duration_s(self) -> float:
+        return self.frames / self.sample_rate
+
+
 def read_wave(path: str, target_rate: int = SAMPLE_RATE):
     with wave.open(path, "rb") as f:
         assert f.getsampwidth() == 2, f"{path}: expected 16-bit PCM"
@@ -510,13 +546,15 @@ def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStat
                printer: PartialPrinter, refiner: "Refiner | None" = None,
                history: AudioHistory | None = None,
                translator_worker: "TranslationWorker | None" = None,
-               speaker_labeler=None):
+               speaker_labeler=None, recorder: "WavRecorder | None" = None):
     audio_pos = 0.0
     last_partial = 0.0
     early_lang = None  # LID result computed mid-utterance so finals skip it
     if history is None:
         history = AudioHistory(sample_rate)
     for chunk in chunks:
+        if isinstance(chunk, np.ndarray) and recorder is not None:
+            recorder.write(chunk)
         if not isinstance(chunk, np.ndarray):
             # non-ndarray = a "flush now" signal (ws_ingest.FLUSH on client
             # disconnect): finalize whatever the VAD has in progress instead
@@ -573,6 +611,9 @@ def build_arg_parser():
                     help="disable the second-pass re-decode of utterance groups")
     ap.add_argument("--transcript", metavar="PATH",
                     help="append refined transcript lines to this file")
+    ap.add_argument("--record", metavar="WAV_PATH",
+                    help="save the exact local mixed input as 16kHz mono PCM16 WAV; "
+                         "refuses to overwrite an existing file")
     ap.add_argument("--hotwords", metavar="PATH", default="",
                     help="hotword list (one per line) to bias Japanese decoding")
     ap.add_argument("--replace", metavar="PATH", default="",
@@ -625,6 +666,12 @@ def main():
     input_mode = args.input or ("wav" if args.wav else "mic")
     if input_mode != "mic" and (args.device is not None or args.mic_device is not None):
         ap.error("--device and --mic-device can only be used with microphone input")
+    if args.record:
+        record_path = os.path.abspath(args.record)
+        if os.path.exists(record_path):
+            ap.error(f"recording already exists: {record_path}")
+        if not os.path.isdir(os.path.dirname(record_path)):
+            ap.error(f"recording directory does not exist: {os.path.dirname(record_path)}")
 
     server = None
     if args.serve:
@@ -662,6 +709,10 @@ def main():
     refiner = None if args.no_refine else Refiner(asr, history, SAMPLE_RATE, printer,
                                                   transcript_path=args.transcript,
                                                   translators=translators)
+    try:
+        recorder = WavRecorder(args.record, SAMPLE_RATE) if args.record else None
+    except FileExistsError:
+        ap.error(f"recording already exists: {os.path.abspath(args.record)}")
 
     def finish(sr):
         vad.flush()
@@ -683,7 +734,7 @@ def main():
             samples, sr = read_wave(args.wav)  # resampled to SAMPLE_RATE if needed
             run_stream(wav_chunks(samples, sr, realtime=not args.no_realtime),
                        vad, sr, asr, stats, printer, refiner, history, translator_worker,
-                       speaker_labeler)
+                       speaker_labeler, recorder)
             finish(sr)
         elif input_mode == "ws":
             from ws_ingest import INGEST_PATH, IngestServer
@@ -693,14 +744,18 @@ def main():
             print(f"ws ingest: ws://{args.ws_host}:{args.ws_port}{INGEST_PATH}  "
                   f"(JSON handshake, then binary pcm_s16le frames)", file=sys.stderr)
             run_stream(ws_chunks(ingest), vad, SAMPLE_RATE, asr, stats, printer, refiner,
-                       history, translator_worker, speaker_labeler)
+                       history, translator_worker, speaker_labeler, recorder)
         else:
             run_stream(mic_chunks(args.device, args.mic_device),
                        vad, SAMPLE_RATE, asr, stats, printer, refiner, history,
-                       translator_worker, speaker_labeler)
+                       translator_worker, speaker_labeler, recorder)
     except KeyboardInterrupt:
         finish(SAMPLE_RATE)
     finally:
+        if recorder is not None:
+            recorder.close()
+            print(f"audio recording: {recorder.path} ({recorder.duration_s:.1f}s)",
+                  file=sys.stderr)
         print(f"\n=== session summary: {stats.summary()} ===")
 
 

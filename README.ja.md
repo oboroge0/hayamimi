@@ -105,12 +105,13 @@ python -m venv .venv
 # 会議音声（BlackHole）と自分のマイクを同時に文字起こし・翻訳
 .venv/bin/python scripts/realtime_transcribe.py --translate ja --serve \
   --device "BlackHole 2ch" --mic-device "MacBook Proのマイク" \
-  --transcript meeting.txt
+  --transcript meeting.txt --record meeting.wav
 ```
 
 `--device`を会議音声が届くBlackHole、`--mic-device`を実マイクにすると、2入力を
-hayamimi内でローカル合成して同じ文字起こし経路へ流します。音声ファイルは保存せず、
-`--transcript`を付けた場合だけrefined原文と翻訳をテキスト保存します。利用可能な名前と
+hayamimi内でローカル合成して同じ文字起こし経路へ流します。`--record`を付けると、
+認識へ渡した合成音声を16kHzモノラルPCM16 WAVとしてローカル保存します。
+既存WAVは上書きしません。`--transcript`ではrefined原文と翻訳をテキスト保存します。利用可能な名前と
 番号は`.venv/bin/python scripts/realtime_transcribe.py --list-devices`で確認できます。
 会議アプリ自身のマイクは実マイク、スピーカーはBlackHoleを含む複数出力装置に設定します。
 
@@ -148,6 +149,7 @@ python3.11 -m venv .venv
 | `--serve [PORT]` | オフ、8833 | `http://localhost:PORT`でダッシュボード+OBSオーバーレイを配信 |
 | `--no-refine` | オフ | 発話群の二段パス再デコードを無効化 |
 | `--transcript PATH` | なし | 清書済みトランスクリプト行をこのファイルに追記 |
+| `--record WAV_PATH` | なし | 認識へ渡す合成音声を16kHzモノラルPCM16 WAVへ保存。既存ファイルは上書きしない |
 | `--hotwords PATH` | なし | 固有名詞側にデコードを寄せるホットワード一覧（1行1語）。**現状jaルートには効果なし**（ReazonSpeechのbyte-level BPEなtokens.txtはエンコードできず、起動時に失敗数を警告表示）。jaの固有名詞には`--replace`を使ってください |
 | `--replace PATH` | なし | ユーザー辞書。`誤=正`形式、1行1組。全出力に適用 |
 | `--lang-switch-guard SEC` | 2.0 | この秒数未満の新言語判定はノイズとみなす：スイッチ確定（`--lid-switch-confirm`参照）には一切カウントされず、空デコード時のomnilingualフォールバックも抑制する（`0`で無効） |

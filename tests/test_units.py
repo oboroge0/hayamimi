@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import types
+import wave
 
 import numpy as np
 import pytest
@@ -19,7 +20,8 @@ from realtime_transcribe import (AudioHistory, PREROLL_S, digits_consistent,
                                  build_arg_parser, build_translators,
                                  mix_input_blocks, parse_audio_device,
                                  parse_translation_targets, translate_by_sentence,
-                                 Refiner, TranslationWorker, translators_for_source)
+                                 Refiner, TranslationWorker, translators_for_source,
+                                 WavRecorder)
 from subtitle_server import DASHBOARD_HTML, SubtitleServer
 from translate_m2m import TranslatorM2M
 import asr_engine
@@ -59,6 +61,22 @@ def test_dual_input_cli_options_are_accepted():
     ])
     assert args.device == "BlackHole 2ch"
     assert args.mic_device == "2"
+
+
+def test_wav_recorder_writes_exact_mixed_stream_and_refuses_overwrite(tmp_path):
+    path = tmp_path / "meeting.wav"
+    recorder = WavRecorder(str(path), sample_rate=16000)
+    recorder.write(np.array([-1.0, -0.5, 0.0, 0.5, 1.0], dtype=np.float32))
+    recorder.close()
+
+    with wave.open(str(path), "rb") as saved:
+        assert saved.getnchannels() == 1
+        assert saved.getsampwidth() == 2
+        assert saved.getframerate() == 16000
+        assert saved.getnframes() == 5
+    assert recorder.duration_s == 5 / 16000
+    with pytest.raises(FileExistsError):
+        WavRecorder(str(path), sample_rate=16000)
 
 
 # ---- digit guard -----------------------------------------------------------
