@@ -339,6 +339,80 @@ DER は Miss（参照にある発話を検出できなかった時間）、False
 - 完了条件: 最終DER・RTFが記録され、次の意思決定（overlap対応や
   ストリーミング化をさらに進めるか）ができる状態になる。
 
+## 6. ベースライン実測 (イテレーション①②)
+
+`scripts/make_diarset.py` で AMI headset-mix から dev/test 計5会議
+(各600秒、開始60秒地点からのスライス。冒頭1分は準備中の雑音が多いため除外)
+を `testdata/eval_diar/` に整備し、`scripts/eval_diar.py` で
+現行 `--speakers`（`SpeakerLabeler` のオンライン最近傍割当。VADは
+`realtime_transcribe.build_vad()` と同一設定、ASRデコードは省略し
+VAD+CAM++埋め込みのみの軽量経路で本番の `SpeakerLabeler` クラスを
+そのまま呼び出す）のDERを実測した。採点は `simpleder.DER(ref, hyp,
+collar=0.25)`（NIST RT慣習の0.25秒collar）。
+
+### 会議別DER
+
+| 会議 | split | 話者数(ref) | 話者数(hyp) | ref発話数 | hyp発話数 | DER |
+|---|---|---|---|---|---|---|
+| ES2011a | dev | 4 | 9 | 83 | 78 | 32.1% |
+| IS1008a | dev | 4 | 6 | 107 | 56 | 18.2% |
+| ES2004a | test | 4 | 8 | 131 | 81 | 28.5% |
+| IS1009a | test | 4 | 6 | 145 | 64 | 32.9% |
+| TS3003a | test | 4 | 6 | 62 | 92 | 16.7% |
+| **平均** | | | | | | **25.7%** |
+
+VAD+CAM++埋め込みのみの処理時間は600秒音声あたり約14.5秒
+(RTF ≈ 0.024)で、ASRを含まない分ここは全く問題にならない。
+
+### 観察された壊れ方
+
+1. **話者数の過大推定が一貫している**: 全会議で参照4話者に対し
+   仮説は6〜9話者。予想通り §1限界③（オープンセット・上限なしの
+   新規話者生成）がそのまま表れており、`SIM_THRESHOLD=0.45`が
+   実会議の音響条件（マイク距離差、被り、環境ノイズ）では
+   同一話者の埋め込みゆらぎを「別話者」と誤判定しやすいことを示す。
+   ES2011aが最悪（4→9）、IS1008a/IS1009a/TS3003aは4→6に留まっており、
+   会議ごとの発話スタイル（早い切り替え・被り発話の頻度）に
+   感度が高いと見られる。
+2. **発話数はref/hypでほぼ同オーダーだが、hypがrefを上回る会議もある**
+   (TS3003a: ref62 vs hyp92)。VADの`min_silence_duration=0.35s`
+   基準のセグメント分割がRTTMの発話境界と一致しないケースがあり、
+   1つの参照発話がVAD側で複数セグメントに割れる、または逆に
+   短い間投詞的発話がVADでは1セグメントに吸収される、といった
+   ミスアラインメントがDERのMiss/FA成分に寄与していると考えられる
+   （`simpleder`はMiss/FA/Confusionの内訳を出さないため、
+   §4で触れた`pyannote.metrics`を投入すればここの切り分けが可能）。
+3. **DERのばらつきが大きい (16.7%〜32.9%)**: 会議固有の話し方
+   （TS3003aはターンテイキングが比較的整っているのか良好、
+   IS1009aは被り発話が多いのか悪化）に強く依存しており、
+   単一の閾値`SIM_THRESHOLD`では会議横断で安定しないことが数値でも
+   裏付けられた。これは§3で推薦した「清書パスでのオフライン
+   再分離」（イテレーション③）が対処すべき核心的な弱点そのもの。
+4. **予想レンジ内**: §5の完了条件で見込んだ「20〜40%程度」に
+   平均25.7%は収まった。同時発話非対応・話者数無制限オープンセット
+   という設計上の弱点がそのまま数値に出ている。
+
+### イテレーション③への引き継ぎ
+
+- ベースライン（現行 `SpeakerLabeler` 単体、平均DER 25.7%、
+  話者数過大推定が主要因）に対し、清書パスへの
+  `OfflineSpeakerDiarization`統合後のDERを同じ5会議・同じcollar設定
+  (0.25s) で比較すること。`scripts/eval_diar.py --meeting <ID>`で
+  会議単位の再測定ができる。
+- 話者数過大推定（限界③）が最大の誤り要因である可能性が高いため、
+  ③の実装では `FastClusteringConfig` の `threshold`（またはAHCの
+  停止基準）を、まず現行`SIM_THRESHOLD=0.45`と同等〜やや緩い設定で
+  試し、DERの話者数(`n_hyp_speakers`)がrefの4に近づくかを
+  最初のチェックポイントにするとよい。
+- `pyannote.metrics`（Miss/FA/Confusion内訳）の追加投入は、
+  ③でも過大推定が残る場合に「境界のズレ(Miss/FA)」と
+  「話者取り違え(Confusion)」のどちらが支配的かを切り分けるために
+  イテレーション⑤で検討する。
+- 評価セット (`testdata/eval_diar/`, 5会議・50分) はgit非追跡なので、
+  ③④⑤の実装エージェントは各自 `python scripts/make_diarset.py` を
+  実行してから `eval_diar.py` を使うこと（`--skip-existing`で
+  再ダウンロードを避けられる）。
+
 ## 出典
 
 - [Speaker Diarization — sherpa-onnx docs](https://k2-fsa.github.io/sherpa/onnx/speaker-diarization/index.html)
