@@ -9,6 +9,7 @@ import '../bench/model_file_resolver.dart';
 import '../bench/model_kind.dart';
 import '../routing/routed_recognizer.dart';
 import '../routing/routing_profile.dart';
+import 'draft_pass.dart';
 import 'live_transcript_entry.dart';
 import 'pcm_frame_buffer.dart';
 import 'refine_pass.dart';
@@ -47,12 +48,24 @@ class LiveTranscriber {
   final _decodingController = StreamController<bool>.broadcast();
   final _refineEntriesController =
       StreamController<LiveTranscriptEntry>.broadcast();
+  final _draftController = StreamController<LiveTranscriptEntry>.broadcast();
 
   sherpa_onnx.VoiceActivityDetector? _vad;
   sherpa_onnx.OfflineRecognizer? _recognizer;
   RoutedRecognizerSet? _routed;
   StreamSubscription<Uint8List>? _micSubscription;
   PcmFrameBuffer? _frameBuffer;
+
+  // --- Draft ("発話中の暫定字幕"): while a VAD segment is still in progress,
+  // periodically re-decode what's been captured of it so far and emit a
+  // provisional partial -- see `draft_pass.dart` for the timing/skip logic
+  // and why it's a coarser, cheaper pass than the fast-final/refine ones.
+  bool _busy = false; // true while ANY decode (final/refine/draft) is running
+  final List<Float32List> _draftFrames = [];
+  bool _draftSegmentActive = false;
+  DateTime? _lastDraftAt;
+  bool _debugStreaming = false;
+  bool _debugStreamCancelRequested = false;
 
   // --- Two-pass "refine" (清書): buffer finalized segments' audio and, on
   // demand, re-decode the whole group together for a cleaner result than
@@ -79,7 +92,19 @@ class LiveTranscriber {
   /// since the session started).
   Stream<LiveTranscriptEntry> get refineEntries => _refineEntriesController.stream;
 
+  /// In-progress ("draft") decodes: one per draft re-decode while a VAD
+  /// segment is still open, replaced by the next draft or cleared by the
+  /// segment's eventual [entries] final. Never buffered/stored by this
+  /// class -- purely a live "typewriter" signal for the UI/broadcast.
+  Stream<LiveTranscriptEntry> get drafts => _draftController.stream;
+
   bool get isRunning => _micSubscription != null;
+
+  /// Whether [startDebugWavStream] is currently paced-streaming a wav file
+  /// through the same VAD/draft/final/refine pipeline a live mic session
+  /// uses. See that method's doc for why this exists (emulators have no
+  /// usable microphone).
+  bool get isDebugStreaming => _debugStreaming;
 
   /// The session's current language when running with
   /// [RoutingProfile.jaSenseVoice] (`null` before the first segment
@@ -127,10 +152,52 @@ class LiveTranscriber {
     String? senseVoiceModelDir,
     String? lidModelDir,
   }) async {
-    if (isRunning) {
+    if (isRunning || _debugStreaming) {
       return;
     }
 
+    final hasPermission = await _recorder.hasPermission();
+    if (!hasPermission) {
+      throw LiveTranscriberException('Microphone permission was not granted.');
+    }
+
+    await _buildNativeState(
+      modelKind: modelKind,
+      modelDir: modelDir,
+      vadModelPath: vadModelPath,
+      routingProfile: routingProfile,
+      senseVoiceModelDir: senseVoiceModelDir,
+      lidModelDir: lidModelDir,
+    );
+
+    try {
+      final micStream = await _recorder.startStream(
+        const RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+          sampleRate: sampleRate,
+          numChannels: 1,
+        ),
+      );
+      _micSubscription = micStream.listen(_onMicChunk);
+    } catch (_) {
+      await _teardownNativeState();
+      rethrow;
+    }
+
+    _resetSessionState();
+  }
+
+  /// Shared "load VAD + recognizer(s) from disk" step behind both [start]
+  /// (mic input) and [startDebugWavStream] (paced wav input) -- everything
+  /// except the mic-specific permission check and stream subscription.
+  Future<void> _buildNativeState({
+    required ModelKind modelKind,
+    required String modelDir,
+    required String vadModelPath,
+    required RoutingProfile routingProfile,
+    String? senseVoiceModelDir,
+    String? lidModelDir,
+  }) async {
     if (!modelKind.isImplemented) {
       throw LiveTranscriberException(
         '${modelKind.label} is not implemented yet. Only Zipformer '
@@ -146,11 +213,6 @@ class LiveTranscriber {
     final vadModelFile = File(vadModelPath);
     if (!await vadModelFile.exists()) {
       throw LiveTranscriberException('VAD model not found: $vadModelPath');
-    }
-
-    final hasPermission = await _recorder.hasPermission();
-    if (!hasPermission) {
-      throw LiveTranscriberException('Microphone permission was not granted.');
     }
 
     if (routingProfile.dualConfirmed) {
@@ -210,23 +272,17 @@ class LiveTranscriber {
       bufferSizeInSeconds: 30,
     );
     _frameBuffer = PcmFrameBuffer(frameSize: vadConfig.sileroVad.windowSize);
+  }
 
-    try {
-      final micStream = await _recorder.startStream(
-        const RecordConfig(
-          encoder: AudioEncoder.pcm16bits,
-          sampleRate: sampleRate,
-          numChannels: 1,
-        ),
-      );
-      _micSubscription = micStream.listen(_onMicChunk);
-    } catch (_) {
-      await _teardownNativeState();
-      rethrow;
-    }
-
+  /// Resets per-session bookkeeping (refine buffer, draft state, auto-refine
+  /// timer) once native state is up and audio is about to start flowing --
+  /// shared by [start] and [startDebugWavStream].
+  void _resetSessionState() {
     _refineBuffer.clear();
     _lastSegmentAt = null;
+    _draftFrames.clear();
+    _draftSegmentActive = false;
+    _lastDraftAt = null;
     if (_autoRefineEnabled) {
       _startAutoRefineTimer();
     }
@@ -250,17 +306,47 @@ class LiveTranscriber {
   }
 
   void _onMicChunk(Uint8List bytes) {
-    final vad = _vad;
     final frameBuffer = _frameBuffer;
-    if (vad == null || frameBuffer == null) {
+    if (frameBuffer == null) {
       return;
     }
-
     frameBuffer.add(pcm16BytesToFloat32(bytes));
     for (final frame in frameBuffer.drainFrames()) {
-      vad.acceptWaveform(frame);
+      _processFrame(frame);
     }
+  }
+
+  /// Runs one VAD window of audio through the pipeline: feeds the VAD,
+  /// tracks it for the draft accumulator, drains any now-finalized
+  /// segments, and (if due) fires a draft decode. Shared by the mic path
+  /// ([_onMicChunk]) and the paced wav path ([startDebugWavStream]) so both
+  /// exercise identical logic.
+  void _processFrame(Float32List frame) {
+    final vad = _vad;
+    if (vad == null) {
+      return;
+    }
+    vad.acceptWaveform(frame);
+
+    // Accumulate this VAD window for the draft pass while a segment is in
+    // progress. `isDetected()` has no "current segment audio" accessor in
+    // the Dart bindings (unlike the desktop's `vad.current_segment.samples`
+    // -- see draft_pass.dart's doc comment), so this buffer is built by
+    // hand from the same frames already being fed to the VAD.
+    final detected = vad.isDetected();
+    if (detected && !_draftSegmentActive) {
+      // Just started a new segment: drop anything left over from before
+      // (shouldn't normally happen, since a finalized segment clears this
+      // in _drainReadySegments, but guards against drift either way).
+      _draftFrames.clear();
+    }
+    if (detected) {
+      _draftFrames.add(frame);
+    }
+    _draftSegmentActive = detected;
+
     _drainReadySegments();
+    _maybeEmitDraft();
   }
 
   void _drainReadySegments() {
@@ -271,8 +357,18 @@ class LiveTranscriber {
     while (!vad.isEmpty()) {
       final segment = vad.front();
       vad.pop();
+      // The segment just popped supersedes whatever the draft pass had
+      // accumulated for it -- the real (properly routed/decoded) final is
+      // about to replace any draft the UI was showing.
+      _draftFrames.clear();
+      _draftSegmentActive = false;
       _decodeSegment(segment);
     }
+  }
+
+  void _setBusy(bool value) {
+    _busy = value;
+    _decodingController.add(value);
   }
 
   void _decodeSegment(sherpa_onnx.SpeechSegment segment) {
@@ -290,7 +386,7 @@ class LiveTranscriber {
       return;
     }
 
-    _decodingController.add(true);
+    _setBusy(true);
     final stopwatch = Stopwatch()..start();
     final stream = recognizer.createStream();
     try {
@@ -315,7 +411,7 @@ class LiveTranscriber {
       }
     } finally {
       stream.free();
-      _decodingController.add(false);
+      _setBusy(false);
     }
   }
 
@@ -323,7 +419,7 @@ class LiveTranscriber {
     RoutedRecognizerSet routed,
     sherpa_onnx.SpeechSegment segment,
   ) {
-    _decodingController.add(true);
+    _setBusy(true);
     final stopwatch = Stopwatch()..start();
     try {
       final result = routed.decode(segment.samples);
@@ -345,7 +441,92 @@ class LiveTranscriber {
         );
       }
     } finally {
-      _decodingController.add(false);
+      _setBusy(false);
+    }
+  }
+
+  /// Fires a draft decode if one is due (see [isDraftDue]): enough draft
+  /// audio has accumulated, the interval has elapsed, and nothing else is
+  /// currently decoding. A no-op otherwise -- the next mic/wav frame will
+  /// just check again.
+  void _maybeEmitDraft() {
+    if (_draftFrames.isEmpty) {
+      return;
+    }
+    final now = DateTime.now();
+    final sinceLastDraft = _lastDraftAt == null
+        ? const Duration(days: 1)
+        : now.difference(_lastDraftAt!);
+    if (!isDraftDue(isDecoding: _busy, sinceLastDraft: sinceLastDraft)) {
+      return;
+    }
+    _lastDraftAt = now;
+    unawaited(_runDraftDecode());
+  }
+
+  Future<void> _runDraftDecode() async {
+    // Snapshot now: more frames may arrive (and even a final may pop) while
+    // this decode is in flight, since decoding is async but frame handling
+    // isn't -- decoding off a snapshot avoids racing the live buffer.
+    final frames = List<Float32List>.of(_draftFrames);
+    if (frames.isEmpty) {
+      return;
+    }
+    final combined = concatFloat32Lists(frames);
+    final windowed = capDraftWindow(
+      combined,
+      sampleRate: sampleRate,
+      maxSeconds: defaultDraftWindowSeconds,
+    );
+    if (windowed.length < sampleRate * defaultMinDraftAudioSeconds) {
+      return;
+    }
+
+    _setBusy(true);
+    final stopwatch = Stopwatch()..start();
+    try {
+      String text;
+      String? lang;
+      final routed = _routed;
+      if (routed != null) {
+        // Current-language-only decode, no LID/routing judgment -- see
+        // RoutedRecognizerSet.decodeCurrentLangOnly's doc for why.
+        final result = routed.decodeCurrentLangOnly(windowed);
+        text = result.text.trim();
+        lang = result.lang;
+      } else {
+        final recognizer = _recognizer;
+        if (recognizer == null) {
+          return;
+        }
+        // The plain (non-routed) recognizer already defaults to
+        // `greedy_search` (sherpa_onnx's OfflineRecognizerConfig default) --
+        // unlike the routed set's ReazonSpeech tier, which is explicitly
+        // `modified_beam_search` for fast-final quality. Reusing it here
+        // rather than building a second, lighter recognizer avoids doubling
+        // this session's model memory footprint just for drafts.
+        final stream = recognizer.createStream();
+        try {
+          stream.acceptWaveform(samples: windowed, sampleRate: sampleRate);
+          recognizer.decode(stream);
+          text = recognizer.getResult(stream).text.trim();
+        } finally {
+          stream.free();
+        }
+      }
+      stopwatch.stop();
+      if (text.isNotEmpty) {
+        _draftController.add(
+          LiveTranscriptEntry(
+            text: text,
+            timestamp: DateTime.now(),
+            latencyMs: stopwatch.elapsedMicroseconds / 1000,
+            lang: lang,
+          ),
+        );
+      }
+    } finally {
+      _setBusy(false);
     }
   }
 
@@ -373,7 +554,7 @@ class LiveTranscriber {
     }
     final fastJoined = combineSegmentFastText(segments);
 
-    _decodingController.add(true);
+    _setBusy(true);
     final stopwatch = Stopwatch()..start();
     try {
       var text = '';
@@ -414,7 +595,7 @@ class LiveTranscriber {
         );
       }
     } finally {
-      _decodingController.add(false);
+      _setBusy(false);
     }
   }
 
@@ -441,6 +622,9 @@ class LiveTranscriber {
 
     _refineBuffer.clear();
     _lastSegmentAt = null;
+    _draftFrames.clear();
+    _draftSegmentActive = false;
+    _lastDraftAt = null;
 
     await _teardownNativeState();
   }
@@ -459,10 +643,131 @@ class LiveTranscriber {
   /// the owning widget is disposed.
   Future<void> dispose() async {
     await stop();
+    await stopDebugWavStream();
     await _entriesController.close();
     await _decodingController.close();
     await _refineEntriesController.close();
+    await _draftController.close();
     await _recorder.dispose();
+  }
+
+  /// Debug-only (see `kDebugMode` at the call site in `live_page.dart`):
+  /// streams [wavPath] through the exact same VAD/draft/final/refine
+  /// pipeline a live mic session uses ([_processFrame]), instead of the
+  /// static two-halves comparison [runDebugWavRefineTest] does. This is how
+  /// the draft pass gets verified on an emulator, which has no usable
+  /// microphone: push a recording through at (roughly) real-time pace and
+  /// watch [drafts]/[entries]/[refineEntries] the same way a live session
+  /// would produce them.
+  ///
+  /// [realtime] paces delivery to roughly the wav's own duration (one VAD
+  /// window's worth of audio every ~32ms at 16kHz); pass `false` to stream
+  /// as fast as decoding allows instead, e.g. for a quick smoke test.
+  /// Awaits until the whole file has been fed through and any in-progress
+  /// segment has been flushed and decoded -- same shutdown behavior [stop]
+  /// gives a live session.
+  Future<void> startDebugWavStream({
+    required ModelKind modelKind,
+    required String modelDir,
+    required String vadModelPath,
+    required String wavPath,
+    RoutingProfile routingProfile = RoutingProfile.jaOnly,
+    String? senseVoiceModelDir,
+    String? lidModelDir,
+    bool realtime = true,
+  }) async {
+    if (isRunning || _debugStreaming) {
+      return;
+    }
+
+    final wavFile = File(wavPath);
+    if (!await wavFile.exists()) {
+      throw LiveTranscriberException('WAV file not found: $wavPath');
+    }
+
+    await _buildNativeState(
+      modelKind: modelKind,
+      modelDir: modelDir,
+      vadModelPath: vadModelPath,
+      routingProfile: routingProfile,
+      senseVoiceModelDir: senseVoiceModelDir,
+      lidModelDir: lidModelDir,
+    );
+    _resetSessionState();
+
+    final frameBuffer = _frameBuffer;
+    if (frameBuffer == null) {
+      await _teardownNativeState();
+      return;
+    }
+
+    _debugStreaming = true;
+    _debugStreamCancelRequested = false;
+    try {
+      final wave = sherpa_onnx.readWave(wavPath);
+      if (wave.samples.isEmpty) {
+        throw LiveTranscriberException(
+          'Failed to read WAV file (unsupported format or empty): $wavPath',
+        );
+      }
+      if (wave.sampleRate != sampleRate) {
+        // Unlike runDebugWavRefineTest (which just decodes at the wav's own
+        // rate, no VAD involved), this path feeds the wav through the VAD,
+        // which is configured for a fixed 16kHz -- a mismatched wav would
+        // silently desync the VAD's speech/silence timing from real time.
+        throw LiveTranscriberException(
+          'WAV sample rate ${wave.sampleRate}Hz != required ${sampleRate}Hz '
+          '(resample the test wav to 16kHz mono first): $wavPath',
+        );
+      }
+      // wave.samples is already mono float32 (sherpa-onnx's reader decodes
+      // straight to that), so no pcm16BytesToFloat32 step is needed here
+      // (unlike the mic path) -- feed it straight into the same
+      // PcmFrameBuffer to get fixed-size VAD windows.
+      final frameSize = frameBuffer.frameSize;
+      final samplesPerFrameDuration = Duration(
+        microseconds: (frameSize / sampleRate * 1000000).round(),
+      );
+      var offset = 0;
+      while (offset < wave.samples.length) {
+        if (_debugStreamCancelRequested) {
+          break;
+        }
+        final end = (offset + frameSize).clamp(0, wave.samples.length);
+        final chunk = Float32List.sublistView(wave.samples, offset, end);
+        frameBuffer.add(chunk);
+        for (final frame in frameBuffer.drainFrames()) {
+          _processFrame(frame);
+        }
+        offset = end;
+        if (realtime) {
+          await Future.delayed(samplesPerFrameDuration);
+        }
+      }
+
+      if (!_debugStreamCancelRequested) {
+        _vad?.flush();
+        _drainReadySegments();
+      }
+    } finally {
+      _debugStreaming = false;
+      await _teardownNativeState();
+    }
+  }
+
+  /// Stops an in-progress [startDebugWavStream] early, mid-file. A no-op if
+  /// no debug stream is running.
+  Future<void> stopDebugWavStream() async {
+    if (!_debugStreaming) {
+      return;
+    }
+    _debugStreamCancelRequested = true;
+    // startDebugWavStream's loop checks the flag once per frame delay
+    // (~32ms of wav audio in realtime mode); give it a moment to notice
+    // and tear down before returning.
+    while (_debugStreaming) {
+      await Future.delayed(const Duration(milliseconds: 20));
+    }
   }
 
   /// Debug-only helper (see `kDebugMode` at the call site in `live_page.dart`):

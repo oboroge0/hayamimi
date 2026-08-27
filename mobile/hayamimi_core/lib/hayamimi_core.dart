@@ -22,6 +22,7 @@ export 'bench/manifest_eval_result.dart';
 export 'bench/manifest_eval_runner.dart';
 export 'bench/model_file_resolver.dart';
 export 'bench/model_kind.dart';
+export 'live/draft_pass.dart';
 export 'live/live_transcriber.dart';
 export 'live/pcm_frame_buffer.dart' show pcm16BytesToFloat32, PcmFrameBuffer;
 export 'live/refine_pass.dart';

@@ -26,6 +26,13 @@ class _LivePageState extends State<LivePage> {
   StreamSubscription<LiveTranscriptEntry>? _entriesSubscription;
   StreamSubscription<bool>? _decodingSubscription;
   StreamSubscription<LiveTranscriptEntry>? _refineEntriesSubscription;
+  StreamSubscription<LiveTranscriptEntry>? _draftsSubscription;
+
+  // Draft ("発話中の暫定字幕"): the most recent in-progress decode while a
+  // VAD segment is still open -- see hayamimi_core's live/draft_pass.dart.
+  // Never stored in a list like _entries/_refineEntries; just the latest
+  // one, cleared the moment a real final for that segment arrives.
+  LiveTranscriptEntry? _draftEntry;
 
   final ModelKind _modelKind = ModelKind.zipformerTransducer;
   final List<LiveTranscriptEntry> _entries = [];
@@ -52,6 +59,13 @@ class _LivePageState extends State<LivePage> {
   bool _isRunningDebugWavTest = false;
   String? _debugWavError;
   DebugRefineTestResult? _debugWavResult;
+
+  // Debug-only "wavをリアルタイムペースで流す" path (kDebugMode only): streams a
+  // wav file through LiveTranscriber.startDebugWavStream at (roughly) real
+  // time pace, so the draft pass (and the fast-final/refine passes) can be
+  // exercised end to end on an emulator, which has no usable microphone.
+  final _debugWavStreamPathController = TextEditingController();
+  String? _debugWavStreamError;
 
   // "Other app integration": an in-app HTTP server that mirrors the
   // desktop hayamimi subtitle feed (scripts/subtitle_server.py) so an OBS
@@ -81,6 +95,7 @@ class _LivePageState extends State<LivePage> {
     _refineEntriesSubscription = _transcriber.refineEntries.listen(
       _onRefineEntry,
     );
+    _draftsSubscription = _transcriber.drafts.listen(_onDraft);
   }
 
   Future<void> _prefillDefaultPaths() async {
@@ -99,12 +114,25 @@ class _LivePageState extends State<LivePage> {
           '${docsDir.path}$sep' 'sense_voice';
       _lidModelDirController.text = '${docsDir.path}$sep' 'lid';
       _debugWavPathController.text = '${docsDir.path}${sep}test.wav';
+      _debugWavStreamPathController.text = '${docsDir.path}${sep}test.wav';
     });
+  }
+
+  void _onDraft(LiveTranscriptEntry entry) {
+    if (!mounted) return;
+    setState(() => _draftEntry = entry);
+    if (_broadcastServer.isRunning) {
+      _broadcastServer.broadcast(PartialSubtitleEvent(entry.text));
+    }
   }
 
   void _onEntry(LiveTranscriptEntry entry) {
     if (!mounted) return;
-    setState(() => _entries.add(entry));
+    // The final supersedes whatever draft was showing for this segment.
+    setState(() {
+      _draftEntry = null;
+      _entries.add(entry);
+    });
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!_scrollController.hasClients) return;
       _scrollController.animateTo(
@@ -211,6 +239,43 @@ class _LivePageState extends State<LivePage> {
     }
   }
 
+  Future<void> _startDebugWavStream() async {
+    setState(() => _debugWavStreamError = null);
+    try {
+      // Awaits until the whole file has streamed through -- setState calls
+      // that happen in the meantime (via _onEntry/_onDraft/_onRefineEntry,
+      // each firing as the pipeline produces output) keep the "streaming"
+      // button state and the transcript lists live while this runs.
+      await _transcriber.startDebugWavStream(
+        modelKind: _modelKind,
+        modelDir: _modelDirController.text.trim(),
+        vadModelPath: _vadModelPathController.text.trim(),
+        wavPath: _debugWavStreamPathController.text.trim(),
+        routingProfile: _routingProfile,
+        senseVoiceModelDir: _routingProfile.dualConfirmed
+            ? _senseVoiceModelDirController.text.trim()
+            : null,
+        lidModelDir: _routingProfile.dualConfirmed
+            ? _lidModelDirController.text.trim()
+            : null,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _debugWavStreamError = e.toString());
+    } finally {
+      if (mounted) {
+        setState(() {}); // isDebugStreaming is back to false
+      }
+    }
+  }
+
+  Future<void> _stopDebugWavStream() async {
+    await _transcriber.stopDebugWavStream();
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
   Future<void> _toggleBroadcast() async {
     if (_broadcastServer.isRunning) {
       await _broadcastServer.stop();
@@ -283,6 +348,7 @@ class _LivePageState extends State<LivePage> {
     _entriesSubscription?.cancel();
     _decodingSubscription?.cancel();
     _refineEntriesSubscription?.cancel();
+    _draftsSubscription?.cancel();
     _transcriber.dispose();
     _broadcastServer.stop();
     _modelDirController.dispose();
@@ -290,6 +356,7 @@ class _LivePageState extends State<LivePage> {
     _senseVoiceModelDirController.dispose();
     _lidModelDirController.dispose();
     _debugWavPathController.dispose();
+    _debugWavStreamPathController.dispose();
     _scrollController.dispose();
     super.dispose();
   }
@@ -427,8 +494,26 @@ class _LivePageState extends State<LivePage> {
                 result: _debugWavResult,
                 onRun: _isRunningDebugWavTest ? null : _runDebugWavRefineTest,
               ),
+              const SizedBox(height: 12),
+              _DebugWavStreamCard(
+                pathController: _debugWavStreamPathController,
+                isStreaming: _transcriber.isDebugStreaming,
+                errorText: _debugWavStreamError,
+                onStart: _transcriber.isDebugStreaming
+                    ? null
+                    : _startDebugWavStream,
+                onStop: _transcriber.isDebugStreaming
+                    ? _stopDebugWavStream
+                    : null,
+              ),
             ],
             const SizedBox(height: 16),
+            // Draft ("発話中の暫定字幕"): shown above the finalized list, PC
+            // dashboard-style ("いま聞き取り中"), so the user sees text grow
+            // while still speaking instead of only after a pause.
+            if (isRunning || _transcriber.isDebugStreaming || _draftEntry != null)
+              _DraftStrip(entry: _draftEntry),
+            const SizedBox(height: 8),
             Text('文字起こし', style: Theme.of(context).textTheme.labelLarge),
             const SizedBox(height: 4),
             SizedBox(
@@ -771,6 +856,119 @@ class _DebugResultLine extends StatelessWidget {
             _LangBadge(lang: lang!),
           ],
         ],
+      ),
+    );
+  }
+}
+
+/// "発話中の暫定字幕" strip shown above the finalized transcript list while a
+/// session (or the debug wav stream) is running: the most recent draft
+/// decode, dimmed/italic like the PC dashboard's "いま聞き取り中" panel, or a
+/// waiting placeholder before any draft has arrived yet.
+class _DraftStrip extends StatelessWidget {
+  const _DraftStrip({required this.entry});
+
+  final LiveTranscriptEntry? entry;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final hasDraft = entry != null && entry!.text.isNotEmpty;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (hasDraft && entry!.lang != null) ...[
+            _LangBadge(lang: entry!.lang!),
+            const SizedBox(width: 8),
+          ],
+          Expanded(
+            child: Text(
+              hasDraft ? entry!.text : 'マイクの音声を待っています…',
+              style: theme.textTheme.bodyLarge?.copyWith(
+                fontStyle: FontStyle.italic,
+                color: hasDraft
+                    ? theme.colorScheme.onSurfaceVariant
+                    : theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.6),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Debug-only "wavをリアルタイムペースで流す" card: streams a wav file through
+/// LiveTranscriber.startDebugWavStream so the draft pass (and the fast-final
+/// /refine passes) can be exercised end to end on an emulator, which has no
+/// usable microphone -- see LiveTranscriber.startDebugWavStream's doc.
+class _DebugWavStreamCard extends StatelessWidget {
+  const _DebugWavStreamCard({
+    required this.pathController,
+    required this.isStreaming,
+    required this.errorText,
+    required this.onStart,
+    required this.onStop,
+  });
+
+  final TextEditingController pathController;
+  final bool isStreaming;
+  final String? errorText;
+  final VoidCallback? onStart;
+  final VoidCallback? onStop;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'デバッグ: wavをリアルタイムペースで流す（ドラフト検証用）',
+              style: Theme.of(context).textTheme.labelMedium,
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: pathController,
+              enabled: !isStreaming,
+              decoration: const InputDecoration(
+                labelText: 'wavファイルパス（16kHzモノラル）',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: isStreaming ? onStop : onStart,
+              icon: isStreaming
+                  ? const SizedBox(
+                      height: 16,
+                      width: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.play_arrow),
+              label: Text(isStreaming ? '停止' : 'リアルタイム再生で流す'),
+            ),
+            if (errorText != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  errorText!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }

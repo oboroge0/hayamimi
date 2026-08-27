@@ -654,6 +654,125 @@ missing microphone, same limitation noted above); the manual 清書 button's
 UI path (only the debug test's routed refine call was exercised — the two
 share the same `RoutedRecognizerSet.decode` call, so this is a light gap).
 
+## Draft ("発話中の暫定字幕") partial subtitles
+
+Ported the desktop dashboard's "いま聞き取り中" experience (`scripts/realtime_transcribe.py`'s
+`PartialPrinter`/`PARTIAL_EVERY_S`/`PARTIAL_WINDOW_S`) to mobile: previously the
+Live screen showed nothing while the user was still speaking — only a
+VAD-bounded final, after the pause. Now a provisional line grows while
+speech is in progress and gets replaced by the real final the moment the
+segment closes.
+
+**Design** (`mobile/hayamimi_core/lib/live/draft_pass.dart`,
+`live_transcriber.dart`):
+
+- **Accumulation**: the Dart `sherpa_onnx` VAD bindings have no
+  `current_segment`-style accessor the way the desktop's Python bindings do
+  (`vad.current_segment.samples`), so `LiveTranscriber` builds its own
+  accumulator by hand: every mic/wav frame fed to the VAD is also appended
+  to a `List<Float32List>` while `vad.isDetected()` is true, and cleared the
+  moment a segment finalizes (pops) or a new one starts.
+- **Timing**: `isDraftDue` (pure, unit-tested) fires a draft decode once
+  per `defaultDraftIntervalSeconds` (1.0s — coarser than the desktop's 0.5s,
+  since the draft decode shares the *same* recognizer/CPU as the
+  fast-final and refine passes and every extra decode is phone battery and
+  heat) **and only if nothing else is currently decoding** — `_busy` is one
+  flag shared by the fast-final, refine, *and* draft passes now (previously
+  only fast-final/refine shared it; fixed a latent bug where a draft could
+  have raced a manual/auto refine on the same native recognizer handle).
+  If busy, the draft is skipped outright rather than queued — the next
+  mic/wav frame just checks again, so drafts never pile up behind a slow
+  decode.
+- **Window cap**: `capDraftWindow` caps a draft decode to the trailing
+  `defaultDraftWindowSeconds` (8.0s, mirrors `PARTIAL_WINDOW_S`) of
+  accumulated audio, so a long uninterrupted utterance doesn't make every
+  subsequent draft decode progressively slower.
+- **Cheap decode, deliberately**: draft decodes reuse the *already-loaded*
+  session recognizer(s) rather than building a second, lighter one (would
+  double model memory just for drafts) and skip the routing judgment
+  entirely for `RoutingProfile.jaSenseVoice` sessions —
+  `RoutedRecognizerSet.decodeCurrentLangOnly` decodes with whichever model
+  backs the session's *current* language, no LID/dual-confirm pass. A
+  wrong-language draft only costs a flicker; the properly-routed fast-final
+  replaces it moments later. The plain (non-routed) recognizer already
+  defaults to `greedy_search` for free; the routed set's ReazonSpeech tier
+  stays `modified_beam_search` (built once, at session start, for final
+  quality) — reused as-is for drafts rather than adding a third recognizer
+  instance.
+- **Wiring**: `LiveTranscriber.drafts` → `HayamimiLive.events` as
+  `PartialSubtitleEvent` (same shape as `scripts/subtitle_server.py`'s
+  `{"type":"partial","text":...}`) → `SubtitleBroadcastServer.broadcast()`
+  when 配信サーバー is on, and → the Live screen's new draft strip
+  (`_DraftStrip` in `mobile/lib/live/live_page.dart`, "マイクの音声を待っています…"
+  placeholder when idle). The overlay (`overlay_html.dart`) previously
+  always rendered final+partial inline with no way to isolate one; ported
+  the desktop overlay's `?show=final` / `?show=partial` query param so a
+  phone-hosted OBS overlay can now split them into two browser sources too.
+- **Debug wav streaming** (`LiveTranscriber.startDebugWavStream`,
+  `_DebugWavStreamCard` in `live_page.dart`): the existing
+  "wavから清書テスト" debug path only ever exercised two static halves of a
+  wav through the refine-combine logic — no way to see drafts fire on an
+  emulator, which has no usable microphone. Added a second debug path that
+  paces a 16kHz-mono wav through the *exact* same per-frame pipeline
+  (`_processFrame`) mic input uses — VAD, draft accumulation/timing, fast
+  final, refine buffering — via a refactored `_buildNativeState` shared by
+  both `start()` and `startDebugWavStream()`.
+
+**Verification** (`hayamimi_test` AVD, emulator has no mic so this is the
+only way to exercise a live multi-segment session end to end):
+
+- Model/VAD dirs already on-device at `/data/local/tmp/hy_push/*` from a
+  prior session; copied into the app's docs dir via
+  `adb shell run-as dev.oboroge.hayamimi_mobile cp -r ... files/app_flutter/`
+  (same "not directly `adb push`-able" sandbox constraint noted above), plus
+  `/data/local/tmp/ja_test.wav` (16kHz mono, confirmed via a PowerShell WAV
+  header read since neither `python3` nor `file` were on PATH) copied to
+  `app_flutter/test.wav`, the debug field's default path.
+- `ja only` routing, 配信サーバー ON, `adb forward tcp:8833 tcp:8833`,
+  `curl -sN http://127.0.0.1:8833/events` streaming in the background, then
+  tapped "リアルタイム再生で流す" repeatedly across several runs:
+  - **(a) partial events fire multiple times per segment, confirmed over
+    `/events`**: e.g. one segment produced `{"type":"partial","text":"はい"}`
+    then `{"type":"partial","text":"お願いします"}` before finalizing as
+    `{"type":"final","text":"準備をお願いします","lang":"ja",...}`; another
+    segment produced 3 partials (`"はい"` → `"は"` → `"午後三時から始まります"`)
+    before finalizing `"会議は午後三時から始まります］"`. Confirmed across 3+
+    separate runs, not a one-off.
+  - **(b) draft line visible on screen**: burst-captured screenshots
+    (`screencap` every 0.4s on-device, pulled as a batch) caught the draft
+    strip mid-utterance showing `はい` in dimmed italic above the
+    (not-yet-updated) transcript list, with the debug button showing "停止"
+    — a single `adb shell input tap` + one screenshot round-trip was too
+    slow relative to the ~1-3s segment lengths in this test clip to reliably
+    land inside the draft window, hence the burst approach.
+  - **(c) finals/refine unaffected**: both finalized lines rendered
+    correctly with the `ja` badge in the transcript list; `/events` finals
+    carried the same text; the overlay's `?show=partial`/`?show=final`
+    query params confirmed present in the served HTML via `curl`. (The
+    manual 清書 button itself stays disabled during a debug wav stream — its
+    `onPressed` is gated on `isRunning`, which only a real mic session sets;
+    this is pre-existing, unrelated to the draft change.)
+- **Draft decode latency** (temporarily instrumented with a `print`,
+  reverted before commit): 3 consecutive draft decodes measured 42.2ms,
+  70.9ms, and 78.9ms. This is the **emulator's host CPU** (the AVD's CPU is
+  the Windows PC's own CPU under virtualization, not representative of a
+  phone's ARM SoC — see "On-emulator accuracy parity" above for the same
+  caveat) — real ARM RTF for the draft path is still unmeasured, same gap
+  as the existing fast-final/refine numbers.
+- All 113 `hayamimi_core` unit tests (new: `draft_pass_test.dart`'s
+  `isDraftDue` skip/interval-control cases;
+  `pcm_frame_buffer_test.dart`'s new `concatFloat32Lists`/`capDraftWindow`
+  cases) plus `flutter analyze` (`mobile/` and `mobile/hayamimi_core/`)
+  pass.
+
+**Not covered by this pass**: real ARM device RTF for the draft path;
+`RoutingProfile.jaSenseVoice` draft decoding specifically (verified via
+code review of `decodeCurrentLangOnly`'s language-picking logic and the
+existing `jaOnly` path end-to-end, not via an on-emulator routed run in
+this pass — routed drafts share the same `_runDraftDecode`/`_processFrame`
+plumbing already verified for `jaOnly`, so the delta is small, but it's
+worth a follow-up routed-profile wav-stream run).
+
 ## Next steps for a mobile profile
 
 - Load + accuracy validated on an Android emulator via `sherpa_onnx.dart`

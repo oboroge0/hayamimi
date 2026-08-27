@@ -268,6 +268,24 @@ class RoutedRecognizerSet {
     );
   }
 
+  /// Decodes [samples] with whichever model backs the session's *current*
+  /// language, without running LID or the dual-LID switch policy at all --
+  /// the deliberately cheap path for draft ("発話中の暫定字幕") decodes.
+  ///
+  /// [decode] answers "which language is this?" for every finalized
+  /// segment, which costs a whisper-tiny LID pass (and sometimes a second
+  /// SenseVoice probe) on top of the transcript decode. Running that full
+  /// routing judgment every ~1s while a segment is still in progress would
+  /// multiply the power/heat cost of drafts for no benefit: the draft is
+  /// provisional and gets replaced by the properly-routed fast-final the
+  /// moment the segment actually finalizes, so an occasional wrong-language
+  /// draft costs nothing but a flicker. Falls back to "ja" before any
+  /// segment has resolved a language yet (mirrors [decode]'s bootstrap
+  /// fallback).
+  RoutedDecodeResult decodeCurrentLangOnly(Float32List samples) {
+    return _decodeWith(currentLang ?? 'ja', samples);
+  }
+
   RoutedDecodeResult _decodeWith(
     String lang,
     Float32List samples, {
