@@ -18,6 +18,8 @@ CPUだけでリアルタイム音声認識をやろうとすると、普通はWh
 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)の上で動くため、PyTorchもCUDAも要りません。
 
 実際のテレビ放送の日本語音声で測ると、この方式で**CER 5.8%**が出ます（`docs/SCORECARD.md`）。
+Whisper系・クラウドSTT API・他のローカルモデルとの比較（hayamimiが負けている言語も含めて）は
+`docs/COMPARISON.md`にまとめています。
 同じ音声で`whisper-large-v3-turbo`は13.8%なので、誤りは半分以下。速度は6コアの
 デスクトップCPUで実時間の10〜50倍です。
 
