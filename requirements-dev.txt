@@ -15,3 +15,5 @@ pyarrow==25.0.1   # column-projected remote parquet reads (eval_translate.py, qu
 sacrebleu==2.6.0  # chrF scoring (eval_translate.py)
 onnxconverter-common==1.16.0  # fp16 conversion (quantize_punct.py --variant fp16)
 simpleder==0.0.5  # DER scoring for speaker diarization eval (eval_diar.py)
+pyannote.metrics==4.1  # Miss/FA/Confusion DER breakdown, eval_diar.py --breakdown (heavier
+                        # dep than simpleder -- pulls in pandas/scikit-learn -- so opt-in only)
