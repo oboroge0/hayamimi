@@ -92,6 +92,27 @@ REMAP_THRESHOLD = 0.35
 MERGE_THRESHOLD = 0.80
 HYSTERESIS_MIN_HITS = 2
 
+# GitHub issue #11 / docs/DIARIZATION_PLAN.md section 10.8's option B: a
+# DISPLAY-ONLY mitigation for the same speaker-count-overestimation problem
+# section 9 tried (and rejected) two assignment-changing fixes for. Unlike
+# those, this one never touches which centroid an embedding gets assigned to
+# -- match_embedding()/label() keep returning the exact same canonical
+# "S{n}" they always have, and every caller that groups or votes on those
+# labels (Refiner's majority vote, eval_diar.py's DER hypothesis) keeps
+# working on the unchanged canonical value. is_provisional()/display_label()
+# are a pure read of _counts, applied by a caller only at the moment it
+# actually prints/publishes a label, to decide whether to show it as
+# provisional. A centroid is provisional from the moment it opens
+# (final_match_count == 1, section 10.8's "one-off outlier" case) until it
+# is matched a second time (final_match_count >= 2, a real recurring
+# voice) -- at which point it's confirmed permanently (_counts never
+# decreases). Rows already printed while a label was provisional are not
+# retroactively rewritten (no mechanism to revise console/SSE output
+# already sent -- same constraint section 9 documented for merge_history());
+# they stay as printed, which is why the session summary also reports how
+# many labels never made it past provisional by the time the session ended.
+PROVISIONAL_CONFIRM_HITS = 2
+
 
 class SpeakerLabeler:
     def __init__(self, threads: int = 2, threshold: float = SIM_THRESHOLD,
@@ -290,6 +311,55 @@ class SpeakerLabeler:
              self._counts[i])
             for i in range(len(self._centroids))
         ]
+
+    # --- issue #11 (docs/DIARIZATION_PLAN.md section 10.8, option B):
+    # display-only provisional labeling ---
+
+    def _index_for_label(self, label: str) -> int | None:
+        """Parse an "S{n}" label back into its centroid index, or None for
+        anything that isn't one (e.g. the empty string when no speaker was
+        assigned)."""
+        if not label.startswith("S"):
+            return None
+        try:
+            idx = int(label[1:]) - 1
+        except ValueError:
+            return None
+        if idx < 0 or idx >= len(self._counts):
+            return None
+        return idx
+
+    def is_provisional(self, label: str) -> bool:
+        """True if `label`'s centroid has matched fewer than
+        PROVISIONAL_CONFIRM_HITS times so far (still just its opening hit,
+        i.e. exactly the "one-off outlier" case section 10.8 diagnosed).
+        A label this returns False for stays False forever (_counts only
+        grows), so a caller doesn't need to remember past decisions."""
+        idx = self._index_for_label(label)
+        if idx is None:
+            return False
+        return self._counts[idx] < PROVISIONAL_CONFIRM_HITS
+
+    def display_label(self, label: str) -> str:
+        """`label` as it should be shown to a user right now: unchanged once
+        confirmed, or suffixed "?" while provisional (e.g. "S5?"). Assignment
+        is untouched by this -- callers should keep using the plain `label`
+        (from label()/match_embedding()) for grouping, majority votes, and
+        any other internal bookkeeping, and only call display_label() at the
+        point where a line is actually printed or published."""
+        return f"{label}?" if self.is_provisional(label) else label
+
+    def provisional_label_count(self) -> int:
+        """How many centroids are still provisional (never matched a second
+        time) -- for a session-end summary line reporting how many
+        displayed labels never got past their tentative "S{n}?" form.
+        Skips centroids merged away by merge_centroids() (merge_enabled
+        default False, so normally a no-op filter): once merged, matches
+        resolve to the surviving centroid's label, so the merged-away
+        index's own label is never displayed again and its provisional
+        status is moot."""
+        return sum(1 for i in range(len(self._centroids))
+                   if i not in self._alias and self._counts[i] < PROVISIONAL_CONFIRM_HITS)
 
     # --- iteration 6: new-speaker hysteresis (docs/DIARIZATION_PLAN.md section 9) ---
 

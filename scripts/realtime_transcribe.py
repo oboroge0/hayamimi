@@ -247,25 +247,35 @@ def drain_segments(vad, sample_rate: int, asr: RoutedASR, stats: SessionStats,
         if not result["text"].strip():
             continue  # non-speech (jingle/SFX): no line, no speaker, no span
 
-        speaker = ""
+        # canonical_speaker ("S{n}", never "?") is what flows into the
+        # refiner's spans -- majority voting and any other grouping logic
+        # must only ever see the assignment SpeakerLabeler actually made.
+        # display_speaker is the same label with issue #11's provisional
+        # "?" suffix applied (docs/DIARIZATION_PLAN.md section 10.8, option
+        # B) and is used ONLY for what gets printed/published right here --
+        # assignment is untouched.
+        canonical_speaker = ""
+        display_speaker = ""
         if speaker_labeler is not None:
-            speaker = speaker_labeler.label(samples, sample_rate, source="fast") + "|"
+            canonical_speaker = speaker_labeler.label(samples, sample_rate, source="fast")
+            display_speaker = speaker_labeler.display_label(canonical_speaker)
+        speaker_tag = f"{display_speaker}|" if display_speaker else ""
 
         stats.segments += 1
         stats.latencies_ms.append(latency_ms)
         printer.clear()
         if printer.server is not None:
-            printer.server.final(result["text"], result["lang"], speaker.rstrip("|"),
+            printer.server.final(result["text"], result["lang"], display_speaker,
                                  latency_ms, result.get("tier", ""))
         probe_part = f", probe={result['probe_ms']:.0f}ms" if result.get("probe_ms") else ""
-        print(f"[{speaker}{result['lang']}/{result.get('tier', '?')}] {result['text']}  "
+        print(f"[{speaker_tag}{result['lang']}/{result.get('tier', '?')}] {result['text']}  "
               f"(seg={seg_s:.1f}s, lid={result['lid_ms']:.0f}ms{probe_part}, "
               f"decode={result['decode_ms']:.0f}ms, latency={latency_ms:.0f}ms)", flush=True)
         if translator_worker is not None and result["lang"] == "ja" and result["text"].strip():
             translator_worker.submit(result["text"])
         if refiner is not None:
             refiner.add_span(seg_start, seg_end, result["lang"], result["text"],
-                             speaker.rstrip("|"))
+                             canonical_speaker)
     return drained
 
 
@@ -518,11 +528,15 @@ class Refiner:
             return False
 
         for label, turn_text in outputs:
-            tag = f"{label}|{refine_lang}" if label else refine_lang
+            # label is the canonical assignment from match_embedding() above
+            # (unchanged); disp is only for what actually gets printed here
+            # -- issue #11 / section 10.8 option B.
+            disp = self.speaker_labeler.display_label(label) if label else label
+            tag = f"{disp}|{refine_lang}" if disp else refine_lang
             print(f"[refine/{tag}] {turn_text}", flush=True)
             if self.printer.server is not None:
                 self.printer.server.publish({"type": "refine", "text": turn_text,
-                                             "lang": refine_lang, "speaker": label})
+                                             "lang": refine_lang, "speaker": disp})
             outs = []
             if self.translators and refine_lang == "ja":
                 for tlang, tr in self.translators.items():
@@ -531,7 +545,7 @@ class Refiner:
                         print(f"[refine→{tlang}] {out}", flush=True)
                         outs.append((tlang, out))
             if self._transcript is not None:
-                prefix = f"{label}: " if label else ""
+                prefix = f"{disp}: " if disp else ""
                 self._transcript.write(prefix + turn_text + "\n")
                 for tlang, out in outs:
                     self._transcript.write(f"  →{tlang} {out}\n")
@@ -665,11 +679,16 @@ class Refiner:
             if not mixed and self._emit_turns(buf, refine_lang, fast_joined):
                 return
 
-            tag = f"{speaker}|{refine_lang}" if speaker else refine_lang
+            # speaker is the majority vote over the group's canonical
+            # per-segment labels (unchanged); disp is only for display --
+            # issue #11 / section 10.8 option B.
+            disp = (self.speaker_labeler.display_label(speaker)
+                    if speaker and self.speaker_labeler is not None else speaker)
+            tag = f"{disp}|{refine_lang}" if disp else refine_lang
             print(f"[refine/{tag}] {text}", flush=True)
             if self.printer.server is not None:
                 self.printer.server.publish({"type": "refine", "text": text, "lang": refine_lang,
-                                             "speaker": speaker})
+                                             "speaker": disp})
             outs = []
             if self.translators and refine_lang == "ja":
                 # synchronous here (we're already off the hot path) so the
@@ -682,7 +701,7 @@ class Refiner:
                         print(f"[refine→{tlang}] {out}", flush=True)
                         outs.append((tlang, out))
             if self._transcript is not None:
-                prefix = f"{speaker}: " if speaker else ""
+                prefix = f"{disp}: " if disp else ""
                 self._transcript.write(prefix + text + "\n")
                 for tlang, out in outs:
                     self._transcript.write(f"  →{tlang} {out}\n")
@@ -1008,6 +1027,14 @@ def main():
                   f"{speaker_labeler.centroid_open_counts()} ===")
             print(f"=== speaker centroid detail (label, opened_by, final_match_count): "
                   f"{speaker_labeler.centroid_summary()} ===")
+            # issue #11 / docs/DIARIZATION_PLAN.md section 10.8 option B: how
+            # many labels never got past their provisional "S{n}?" display
+            # (never matched a second time by session end) -- rows already
+            # printed under that provisional form are not retroactively
+            # rewritten, so this is how a reader sees how many stayed that
+            # way for the whole session.
+            print(f"=== speaker labels still provisional at session end: "
+                  f"{speaker_labeler.provisional_label_count()} ===")
 
 
 if __name__ == "__main__":
