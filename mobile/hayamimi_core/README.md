@@ -69,15 +69,22 @@ working example of both.
 
 ## Minimal example: on-device subtitles
 
+See [`example/`](example/) for a full, runnable Flutter app built from
+nothing but this snippet's shape (pub.dev's standard `example/` layout) —
+useful as a copy-pasteable starting point, since the fragment below elides
+error handling and widget wiring for brevity:
+
 ```dart
 import 'package:hayamimi_core/hayamimi_core.dart';
 
-final live = HayamimiLive()..lang = 'ja';
+final live = HayamimiLive();
 
 live.events.listen((event) {
   switch (event) {
-    case FinalSubtitleEvent(:final text):
-      print('final: $text');
+    case PartialSubtitleEvent(:final text):
+      print('draft: $text');
+    case FinalSubtitleEvent(:final text, :final lang):
+      print('final [$lang]: $text');
     case RefineSubtitleEvent(:final text):
       print('refine (清書): $text');
     default:
@@ -88,6 +95,11 @@ live.events.listen((event) {
 await live.start(
   modelDir: '/path/to/model',        // encoder/decoder/joiner/tokens.txt
   vadModelPath: '/path/to/silero_vad.onnx',
+  // Optional multilingual routing: each segment goes to ReazonSpeech (ja)
+  // or SenseVoice (en/zh/ko/yue) instead of one fixed-language model.
+  routingProfile: RoutingProfile.jaSenseVoice,
+  senseVoiceModelDir: '/path/to/sense_voice',
+  lidModelDir: '/path/to/lid',
 );
 
 // ... later, e.g. on a button tap:
@@ -170,6 +182,11 @@ live.events.listen(broadcast.broadcast); // events are already SubtitleEvent
 
 ## Consumers
 
+- [`example/`](example/) — a minimal, runnable Flutter app built from
+  nothing but this package's public API (`hayamimi_core.dart`'s export
+  list): one dependency, one `HayamimiLive` instance, a draft line + a
+  language-tagged transcript list. Start here if you're embedding this
+  package into your own app.
 - `mobile/` in this repo — the reference app: three tabs (Bench/Live/
   Remote) built directly on this package, useful as a fuller worked example
   than the snippets above (permission handling, error states, debug-only
