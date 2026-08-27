@@ -125,6 +125,44 @@ class HayamimiLive {
   /// nothing if there's too little buffered audio.
   Future<void> refineNow() => _transcriber.refineNow();
 
+  /// Whether [startDebugWavStream] is currently paced-streaming a wav file
+  /// through the pipeline instead of the mic.
+  bool get isDebugStreaming => _transcriber.isDebugStreaming;
+
+  /// Streams [wavPath] (16kHz mono) through the exact same VAD/draft/final/
+  /// refine pipeline [start] uses, at (roughly) real-time pace, instead of
+  /// mic input. Emits the same [events] a live mic session would.
+  ///
+  /// Exists so this facade can be exercised end to end without a real
+  /// microphone -- e.g. on an Android emulator, which has none. Awaits
+  /// until the whole file has been fed through and any in-progress segment
+  /// has been flushed and decoded.
+  Future<void> startDebugWavStream({
+    required String modelDir,
+    required String vadModelPath,
+    required String wavPath,
+    ModelKind modelKind = ModelKind.zipformerTransducer,
+    RoutingProfile routingProfile = RoutingProfile.jaOnly,
+    String? senseVoiceModelDir,
+    String? lidModelDir,
+    bool realtime = true,
+  }) {
+    return _transcriber.startDebugWavStream(
+      modelKind: modelKind,
+      modelDir: modelDir,
+      vadModelPath: vadModelPath,
+      wavPath: wavPath,
+      routingProfile: routingProfile,
+      senseVoiceModelDir: senseVoiceModelDir,
+      lidModelDir: lidModelDir,
+      realtime: realtime,
+    );
+  }
+
+  /// Stops an in-progress [startDebugWavStream] early, mid-file. A no-op if
+  /// no debug stream is running.
+  Future<void> stopDebugWavStream() => _transcriber.stopDebugWavStream();
+
   /// Releases everything, including the mic recorder. Call once when the
   /// owner is done with this instance.
   Future<void> dispose() async {

@@ -1,0 +1,30 @@
+name: hayamimi_core_example
+description: >-
+  Minimal example: embedding hayamimi_core's live subtitle engine into a
+  third-party Flutter app in one dependency + a few dozen lines. See
+  lib/main.dart and this directory's README.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.13.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # The one dependency a host app adds to embed hayamimi's subtitle engine.
+  hayamimi_core:
+    path: ../
+  # Needed directly only for sherpa_onnx.initBindings() (see main()) and to
+  # resolve on-device model paths; hayamimi_core itself doesn't need these
+  # re-exported.
+  sherpa_onnx: ^1.13.6
+  path_provider: ^2.1.6
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
