@@ -383,3 +383,32 @@ scripts/eval_engine.py で本番経路（LID込み）を初めて採点（docs/S
   2. BGM下の長い日本語がen判定→ラテン文字ガベージ（タグと文字種が「整合」してしまい補正不能。LID信頼度が取れない以上原理的限界）
   3. 両LID（whisper-tiny・SenseVoice）が揃って誤る電話音声
   → いずれもrefine側で大部分回復しており、安価な追加対策は存在しないと判断。ここを現設計の到達点とする。
+
+## 2026-08-27: hayamimi vs faster-whisper large-v3-turbo — 5言語 完全比較
+
+同一クリップ・同一採点でのガチンコ比較を全5言語で完成させた。CPU (Ryzen 5 5600, 6スレッド) 実測。
+
+- **hayamimi側**: docs/SCORECARD.md の本番経路（LID→ルーティング→デコード→ja句読点）の値をそのまま転記。
+  ja/en は `testdata/eval_real`、zh/ko は `testdata/eval_real_zhko`、yue は `testdata/eval_real_yue`。
+- **turbo側**: `scripts/eval_turbo_zhko_yue.py`（新規、ja/enは既存の `docs/EVAL_REAL.md` の値を流用）で、
+  faster-whisper large-v3-turbo INT8 (CPU, `language=`強制, `beam_size=1`) を**同一クリップ**に対して実行。
+- **採点**: 両者とも `scripts/eval_accuracy.py` の `cer_ja`（NFKC正規化+句読点/空白除去+レーベンシュタイン距離、
+  en は jiwer WER）を使用。yue は opencc `t2s` で簡体字正規化してからCER算出（`scripts/eval_engine.py` と同じ規約）。
+  hayamimi側はエンジンのLID込みエンドツーエンド、turbo側は言語ヒントを与えた単体デコード（turboに有利な条件）。
+
+| lang | clips | hayamimi err | hayamimi RTF | turbo err | turbo RTF | 判定 |
+|---|---|---|---|---|---|---|
+| ja | 15 | CER 7.5% | 0.071 | CER 13.75% | 1.392 | hayamimi勝ち（誤り率約1/2、19倍速） |
+| en | 15 | WER 2.3% | 0.109 | WER 2.16% | 1.383 | **turboがわずかに勝ち**（0.14pt差）、hayamimiは13倍速 |
+| zh | 12 | CER 5.3% | 0.102 | CER 4.0% | 1.107 | **turboが勝ち**（1.3pt差）、hayamimiは11倍速 |
+| ko | 12 | CER 8.1% | 0.062 | CER 6.8% | 1.063 | **turboが勝ち**（1.3pt差）、hayamimiは17倍速 |
+| yue | 12 | CER 6.1% | 0.061 | CER 15.5% | 1.034 | hayamimi勝ち（誤り率約1/2.5、17倍速） |
+
+- **速度は全言語でhayamimiが圧勝**（11〜19倍速、CPU上でturboはRTF>1＝非リアルタイム、hayamimiは全言語RTF<0.11でリアルタイム余裕あり）。
+- **精度は言語で分かれた**: ja/yueはhayamimiが明確に上回るが、en/zh/koはturboがわずかに上回る（0.1〜1.3pt差）。
+  turboはzh/ko/yueへの言語指定＋beam_size=1の単体デコードという有利条件、hayamimiはLID込み本番経路という不利条件での比較である点に注意
+  （SCORECARD.mdの通りLID自体は全言語100%正解のため、この差はデコード精度そのものの差）。
+- yueの誤り率差が最も大きい（6.1% vs 15.5%）: turboは繁体字クリップに対し簡体字混じり・誤字が多く出た
+  （例: `yue_04.wav` 参照「然後由拉卡．辛領銜帶唱拜讚歌」→turbo「然后由拉卡申寧下帆唱拜赞歌」）。
+  hayamimi側はyueをSenseVoice内蔵LID仲裁＋t2s正規化採点で拾っており、専用チューニングの効果が出ている。
+- 詳細ログ・全クリップの生出力は `scripts/eval_turbo_zhko_yue.py` の実行結果（本コミットでは非保存、再実行で再現可能）を参照。
