@@ -544,7 +544,11 @@ def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStat
             cur = np.asarray(vad.current_segment.samples, dtype=np.float32)
             if len(cur) > int(PARTIAL_WINDOW_S * sample_rate):
                 cur = cur[-int(PARTIAL_WINDOW_S * sample_rate):]
-            if early_lang is None and len(cur) >= int(2.0 * sample_rate):
+            # --mode single (asr.forced_lang set): every segment is forced to
+            # one language, so the early-LID probe (whisper-tiny plus a
+            # background model prefetch) would just be wasted work -- asr.partial()
+            # already routes straight to forced_lang without needing a hint.
+            if asr.forced_lang is None and early_lang is None and len(cur) >= int(2.0 * sample_rate):
                 early_lang = asr.identify(cur, sample_rate)
             if printer.enabled and len(cur) >= sample_rate // 2:
                 printer.show(asr.partial(cur, sample_rate, lang_hint=early_lang))

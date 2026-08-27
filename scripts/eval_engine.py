@@ -54,6 +54,15 @@ def main():
     rows = []
     for rel, _ in MANIFESTS:
         mdir = os.path.join(ROOT, rel)
+        # Each manifest is an independent recording set, not a continuation
+        # of the previous one's session -- reset the sticky-LID state so the
+        # engine's language-switch hysteresis (RoutedASR.transcribe /
+        # resolve_dual_confirm / resolve_sticky_lang in asr_engine.py)
+        # doesn't charge the first clip of eval_real_zhko or eval_real_yue
+        # for "switching away" from whatever language the previous
+        # manifest's last clip happened to end on. Same convention as
+        # eval_noise.py's per-language-block reset.
+        asr.reset_session()
         with open(os.path.join(mdir, "manifest.json"), encoding="utf-8") as f:
             for e in json.load(f):
                 samples, sr = sf.read(os.path.join(mdir, e["wav"]), dtype="float32")

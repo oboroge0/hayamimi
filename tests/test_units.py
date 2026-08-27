@@ -320,6 +320,38 @@ def test_sticky_alternating_misfires_never_accumulate():
     assert (pend2, cnt2) == ("zh", 1)  # candidate reset to the new guess
 
 
+def test_partial_forced_lang_routes_directly_without_lid_or_sv_probe():
+    # --mode single (forced_lang set): partial() must never touch LID or the
+    # SenseVoice probe -- it should route straight to the forced language,
+    # exactly like transcribe() does. Regression for a bug where partial()
+    # ignored forced_lang entirely and ran the full sticky/SenseVoice probe
+    # path on every draft.
+    class _Stub:
+        forced_lang = "ko"
+        last_lang = "en"  # deliberately different, to prove it's ignored
+
+        def _route(self, lang):
+            assert lang == "ko"
+            return ("ko-recognizer", "sv")
+
+        def _decode(self, rec, samples, sample_rate):
+            assert rec == "ko-recognizer"
+            return "raw text"
+
+        def _replace(self, text):
+            return text
+
+        def _get(self, name):
+            raise AssertionError("partial() must not touch the SenseVoice probe when forced_lang is set")
+
+        def _decode_full(self, *a, **kw):
+            raise AssertionError("partial() must not touch the SenseVoice probe when forced_lang is set")
+
+    stub = _Stub()
+    result = asr_engine.RoutedASR.partial(stub, np.zeros(1600, dtype=np.float32), 16000)
+    assert result == "raw text"
+
+
 def test_reset_session_clears_sticky_state():
     # reset_session() only touches plain attributes (no model calls), so it
     # can be exercised against a bare stand-in without loading any models.
@@ -461,6 +493,73 @@ def test_dual_confirm_ignores_sub_probe_length_even_on_agreement():
     lang, switched = asr_engine.resolve_dual_confirm("en", "ja", 0.3, "en")
     assert lang == "ja"
     assert switched is False
+
+
+def test_dual_confirm_zh_whisper_yue_sensevoice_switches_to_yue():
+    # whisper-tiny can never emit "yue" (it folds Cantonese into "zh"), so a
+    # "zh"-vs-"yue" split between the two LIDs on the same audio is whisper's
+    # only possible way of "agreeing" with a yue probe. Must resolve to
+    # "yue", not stay stuck on the current language or fall back to "zh".
+    lang, switched = asr_engine.resolve_dual_confirm("zh", "en", 3.0, "yue")
+    assert (lang, switched) == ("yue", True)
+
+
+def test_transcribe_bootstrap_too_short_decodes_but_does_not_seed_last_lang():
+    # A too-short (<MIN_PROBE_S) segment opening a brand new session (e.g. a
+    # jingle/SFX misfire) must still get a best-effort decode, but must NOT
+    # seed self.last_lang -- otherwise a single noise blip on segment 1
+    # would lock the whole session onto whatever language it happened to
+    # guess, contradicting resolve_dual_confirm's own "never confirms a
+    # switch" docstring for too-short candidates.
+    class _Stub:
+        forced_lang = None
+        dual_confirm = True
+        last_lang = None
+        _pending_lang = None
+        _pending_count = 0
+        _unavailable = set()
+
+        def _decode_full(self, rec, samples, sample_rate):
+            return ("hi", "<|en|>0.9")
+
+        def _get(self, name):
+            return "sv-recognizer"
+
+        def _route(self, lang):
+            assert lang == "en"
+            return ("en-recognizer", "v3")
+
+        def _decode(self, rec, samples, sample_rate):
+            return "hi there"
+
+        def _replace(self, text):
+            return text
+
+    stub = _Stub()
+    result = asr_engine.RoutedASR.transcribe(
+        stub, np.zeros(4800, dtype=np.float32), 16000,
+        known_lang="en", speech_s=0.3, live=True)
+    assert result["text"] == "hi there"
+    assert result["lang"] == "en"
+    # the decode succeeded, but the bootstrap candidate was too short to
+    # confirm -- the session must remain "no language established yet"
+    assert stub.last_lang is None
+
+
+def test_dual_confirm_session_switches_from_each_stuck_lang_to_yue():
+    # Integration-style check across the whole "yue gets stuck" bug report:
+    # a session that has already settled on en, ja, or ko must still be able
+    # to switch to "yue" once whisper-tiny says "zh" (its only spelling of
+    # Cantonese) and SenseVoice's own probe says "yue" on the same audio.
+    for starting_lang in ("en", "ja", "ko"):
+        lang, switched = asr_engine.resolve_dual_confirm(
+            "zh", starting_lang, 3.0, "yue")
+        assert (lang, switched) == ("yue", True), starting_lang
+        # and the session holds on "yue" afterwards (same-lang no-op) rather
+        # than bouncing back.
+        held_lang, held_switched = asr_engine.resolve_dual_confirm(
+            "yue", lang, 3.0, "yue")
+        assert (held_lang, held_switched) == ("yue", False)
 
 
 def test_dual_confirm_mismatch_at_bootstrap_falls_back_to_whisper_guess():

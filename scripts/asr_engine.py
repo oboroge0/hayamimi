@@ -197,7 +197,14 @@ def resolve_dual_confirm(
     the first segment must decode as "ja", not "zh", not silence).
 
     A candidate shorter than MIN_PROBE_S is presumed non-speech noise and
-    never confirms a switch, even on agreement.
+    never confirms a switch, even on agreement. This still applies at
+    bootstrap: this function still returns a best-effort `resolved` for the
+    caller to decode THIS segment with, but callers must not treat a
+    too-short bootstrap resolution as the session's confirmed language --
+    RoutedASR.transcribe() checks `speech_s < MIN_PROBE_S` on the same
+    bootstrap call and skips seeding self.last_lang from it, so a lone
+    jingle/SFX misfire on segment 1 can't lock the whole session onto
+    whatever it happened to guess.
 
     Returns (resolved_lang, switched) -- `switched` is True only when this
     call is the reason the session's language changed (both LIDs agreed on
@@ -215,6 +222,13 @@ def resolve_dual_confirm(
         return last_lang, False
     if sv_lang == lang:
         return lang, True
+    if lang == "zh" and sv_lang == "yue":
+        # whisper-tiny cannot emit "yue" as a candidate -- it folds Cantonese
+        # into "zh" (see DUAL_CONFIRM_LANGS docstring above). When SenseVoice's
+        # own LID says "yue" on the same audio, that's whisper's only possible
+        # spelling of agreement, so treat it as a confirmed switch to "yue"
+        # rather than "zh".
+        return "yue", True
     return last_lang, False
 
 
@@ -696,7 +710,15 @@ class RoutedASR:
         either, the tier-0 ja/en model drafts. Fixes Korean drafts staying
         blank after an English section (the sticky en model returns nothing
         for Korean speech).
+
+        --mode single (self.forced_lang set) skips all of the above: the
+        draft always routes straight to the forced language, same as
+        transcribe(), with no LID/SenseVoice probing at all.
         """
+        if self.forced_lang is not None:
+            rec, _ = self._route(self.forced_lang)
+            return self._replace(self._decode(rec, samples, sample_rate))
+
         if lang_hint is not None:
             # this utterance's language is confirmed: use its specialist
             rec, _ = self._route(lang_hint)
@@ -783,6 +805,14 @@ class RoutedASR:
         probe_ms = 0.0
         sv_probe = None  # (text, raw_tag) if a SenseVoice confirmation probe already ran
         bootstrap_probe_lang = None  # SenseVoice's tag for THIS audio, bootstrap only
+        # True only for a too-short (<MIN_PROBE_S) segment that opens a brand
+        # new session: this decode is a best-effort guess for THIS segment
+        # only, not a confirmed session language, so it must not seed
+        # self.last_lang below (see the docstring note on resolve_dual_confirm's
+        # too_short handling -- a jingle/SFX misfire on segment 1 must not
+        # lock the whole session onto whatever it happened to guess).
+        suppress_bootstrap_seed = False
+        was_bootstrap = self.last_lang is None
         if self.forced_lang is not None or not live:
             pass  # out-of-band decode / forced single-language: no switch resolution
         else:
@@ -822,6 +852,8 @@ class RoutedASR:
                         probe_ms += (time.perf_counter() - t0) * 1000
                     lang, switched = resolve_dual_confirm(lang, self.last_lang, speech_s, sv_lang)
                     suppress_fallback = speech_s is not None and speech_s < MIN_PROBE_S
+                    if was_bootstrap and suppress_fallback:
+                        suppress_bootstrap_seed = True
                     if switched:
                         # a confirmed dual-LID switch supersedes any hysteresis
                         # candidate the fallback (non-SV) path was accumulating
@@ -930,7 +962,9 @@ class RoutedASR:
                 pass  # a punctuation failure must never lose the transcription
         decode_ms = (time.perf_counter() - t0) * 1000
 
-        if live and text.strip():  # empty results must not poison the sticky language
+        if live and text.strip() and not suppress_bootstrap_seed:
+            # empty results must not poison the sticky language; neither
+            # must a too-short bootstrap noise blip (suppress_bootstrap_seed)
             self.last_lang = lang
         return {"text": text, "lang": lang, "tier": tier, "lid_ms": lid_ms,
                 "decode_ms": decode_ms, "probe_ms": probe_ms}
