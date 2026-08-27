@@ -12,6 +12,8 @@
 /// `live_transcriber.dart`.
 library;
 
+import 'dart:typed_data';
+
 /// How often (wall-clock) a draft re-decode should fire while a VAD segment
 /// is in progress. Coarser than the desktop's `PARTIAL_EVERY_S` (0.5s):
 /// on a phone the draft decode competes with the *same* recognizer/CPU the
@@ -39,6 +41,34 @@ const double defaultMinDraftAudioSeconds = 0.25;
 /// would only delay whichever decode actually matters (the next final).
 /// The caller is expected to just try again on the next timer tick, which
 /// naturally catches up once the in-flight decode finishes.
+/// Drops whole frames off the front of [frames] until their total sample
+/// count is within [maxSeconds] of [sampleRate] audio (or exactly one frame
+/// remains, even if that single frame alone exceeds the budget).
+///
+/// [LiveTranscriber] calls this every time a new frame is appended to its
+/// draft accumulator, so the accumulator itself never grows past this
+/// window. Without it, a long uninterrupted utterance made the accumulator
+/// -- and therefore the concatFloat32Lists pass over the whole thing that
+/// [_runDraftDecode] repeated on every draft tick -- grow without bound,
+/// even though [capDraftWindow] only ever decodes the trailing
+/// [defaultDraftWindowSeconds] of it anyway: total work across the
+/// utterance was effectively O(n^2) in its length. Trimming at the source
+/// keeps each tick's concatenation cheap and bounded instead.
+List<Float32List> slideDraftFrames(
+  List<Float32List> frames, {
+  required int sampleRate,
+  double maxSeconds = defaultDraftWindowSeconds,
+}) {
+  final maxSamples = (maxSeconds * sampleRate).round();
+  var total = frames.fold<int>(0, (sum, f) => sum + f.length);
+  var start = 0;
+  while (total > maxSamples && start < frames.length - 1) {
+    total -= frames[start].length;
+    start++;
+  }
+  return start == 0 ? frames : frames.sublist(start);
+}
+
 bool isDraftDue({
   required bool isDecoding,
   required Duration sinceLastDraft,

@@ -219,12 +219,65 @@ class RoutedRecognizerSet {
     }
 
     // A candidate outside SenseVoice's coverage has no specialist tier
-    // loaded here (see routing_profile.dart) -- hold the current language
-    // (or fall back to "ja" at bootstrap, the common case for this app).
+    // loaded here (see routing_profile.dart) -- hold the current language.
     if (!jaSenseVoiceLangs.contains(whisperLang)) {
-      final held = currentLang ?? 'ja';
-      currentLang = held;
-      return _decodeWith(held, samples);
+      if (currentLang == null) {
+        // Bootstrap: whisper-tiny's very first guess is a language this app
+        // has no tier for at all (e.g. "fr", "ru") -- blindly defaulting to
+        // "ja" here would repeat the same mistake the desktop pipeline fixed
+        // for its own bootstrap path (see asr_engine.py's
+        // resolve_sticky_lang bootstrap_probe_lang and docs/LID.md): a
+        // single whisper-tiny misfire on segment 1 seeding the whole
+        // session with the wrong language. Probe with SenseVoice's own
+        // internal LID on this exact audio and arbitrate with the same
+        // [resolveDualConfirm] policy the 5-language coverage case below
+        // uses, instead of blindly trusting whisper-tiny's out-of-coverage
+        // guess.
+        final svStream = _senseVoice.createStream();
+        final String probeText;
+        final String probeLang;
+        try {
+          svStream.acceptWaveform(samples: samples, sampleRate: sampleRate);
+          _senseVoice.decode(svStream);
+          final result = _senseVoice.getResult(svStream);
+          probeText = result.text.trim();
+          probeLang = svLidTag(result.lang);
+        } finally {
+          svStream.free();
+        }
+        final confirm = resolveDualConfirm(
+          lang: whisperLang,
+          lastLang: null,
+          speechSeconds: speechSeconds,
+          svLang: probeLang,
+        );
+        if (!jaSenseVoiceLangs.contains(confirm.lang)) {
+          // Neither LID landed on a language this app has a tier for
+          // (whisper-tiny said e.g. "fr" and SenseVoice's own probe agreed
+          // or gave nothing usable) -- there's no specialist to route to,
+          // so fall back to "ja" same as the pre-fix behavior.
+          currentLang = 'ja';
+          return _decodeWith('ja', samples, switched: true);
+        }
+        currentLang = confirm.lang;
+        if (confirm.lang == 'ja') {
+          // Reuse-avoidance: the probe above decoded through SenseVoice,
+          // not ReazonSpeech -- re-decode with the production ja tier.
+          return _decodeWith('ja', samples, switched: confirm.switched);
+        }
+        if (confirm.lang == probeLang && probeText.isNotEmpty) {
+          // resolveDualConfirm picked the SenseVoice probe's own language --
+          // the probe decode above already produced this transcript, so
+          // reuse it instead of decoding twice.
+          return RoutedDecodeResult(
+            text: probeText,
+            lang: confirm.lang,
+            switched: confirm.switched,
+          );
+        }
+        return _decodeWith(confirm.lang, samples, switched: confirm.switched);
+      }
+      return _decodeWith(currentLang!, samples);
     }
 
     // Candidate is one of the 5 SenseVoice-covered languages and disagrees

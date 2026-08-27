@@ -86,6 +86,26 @@ void main() {
       expect(r.switched, false);
     });
 
+    test('bootstrap with an out-of-coverage whisper guess still resolves '
+        'via the SenseVoice probe', () {
+      // Mobile-specific scenario (routed_recognizer.dart): whisper-tiny's
+      // very first guess is a language with no loaded tier at all (e.g.
+      // "fr" -- outside jaSenseVoiceLangs), and SenseVoice's own probe on
+      // the same audio says "ja". Must resolve to "ja", not blindly default
+      // there without ever consulting the probe, and not get stuck decoding
+      // "fr" forever (same semantics as the desktop's resolve_sticky_lang
+      // bootstrap_probe_lang fix, ported here as of the routed_recognizer.dart
+      // bootstrap fix).
+      final r = resolveDualConfirm(
+        lang: 'fr',
+        lastLang: null,
+        speechSeconds: 3.0,
+        svLang: 'ja',
+      );
+      expect(r.lang, 'ja');
+      expect(r.switched, false); // the two LIDs disagreed, not a confirmed match
+    });
+
     test('mismatch at bootstrap falls back to whisper guess', () {
       // No SenseVoice tag at all (svLang empty) -- bootstrap must still
       // resolve to something.
