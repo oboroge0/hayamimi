@@ -140,6 +140,7 @@ All flags are on `scripts/realtime_transcribe.py`:
 | `--transcript PATH` | none | append refined transcript lines to this file |
 | `--hotwords PATH` | none | hotword list (one per line) to bias decoding toward proper nouns -- **currently has no effect on the ja tier** (ReazonSpeech's byte-level BPE tokens.txt can't encode them; a startup warning tells you how many failed). Use `--replace` for ja proper nouns instead |
 | `--replace PATH` | none | user dictionary: `wrong=right` per line, applied to all output |
+| `--mode {single,balanced,fast}` | `balanced` | language-switching preset. `balanced` switches only when both language detectors agree (see `docs/LID.md`); `single` pins the language given by `--lang` and never switches; `fast` switches on every detection, matching pre-v0.2.0 behavior. Individual flags below override the preset |
 | `--lang-switch-guard SEC` | 2.0 | treat a new-language detection shorter than this as noise: it can never count toward confirming a switch (see `--lid-switch-confirm`) and it suppresses the omnilingual fallback on an empty decode (`0` disables) |
 | `--lid-switch-confirm N` | 2 | consecutive new-language detections (each >= `--lang-switch-guard` long) required before the session actually switches language; raise for stickier single-language sessions |
 | `--speakers` | off | label utterances with speaker ids (S1, S2, ...); the refine pass re-diarizes each group with pyannote segmentation-3.0 |
