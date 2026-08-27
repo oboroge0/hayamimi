@@ -50,6 +50,108 @@ MANIFEST_PATH = os.path.join(EVAL_DIR, "manifest.json")
 
 TARGET_MARKS = ("、", "。", "？")
 
+# FLEURS ja config/splits used for the larger re-verification eval set (see
+# docs/MOBILE.md, "Punctuation model INT8" -- the n=15 testdata/eval_real
+# sample was only ever a provisional check). FLEURS' ja_jp raw_transcription
+# already carries natural 、/。/？ punctuation (unlike the ASR-oriented
+# eval_real refs, FLEURS text wasn't written for this repo, so no filtering
+# assumption should be taken on faith -- see build_fleurs_refs, which checks).
+FLEURS_REPO = "google/fleurs"
+FLEURS_REVISION = "refs%2Fconvert%2Fparquet"
+FLEURS_JA_CONFIG = "ja_jp"
+FLEURS_SPLITS = ("validation", "test")
+FLEURS_DEFAULT_N = 250
+FLEURS_DEFAULT_SEED = 0
+FLEURS_MAX_CHARS = 450  # margin under the model's ~500-char practical limit
+
+
+def _fleurs_parquet_url(config: str, split: str) -> str:
+    return (
+        f"https://huggingface.co/datasets/{FLEURS_REPO}/resolve/"
+        f"{FLEURS_REVISION}/{config}/{split}/0000.parquet"
+    )
+
+
+def _load_fleurs_split(split: str) -> "dict[int, str]":
+    """id -> raw_transcription for one FLEURS ja split, via a column-projected
+    remote parquet read (no audio bytes fetched) -- same technique as
+    scripts/eval_translate.py::load_fleurs_texts."""
+    import fsspec
+    import pyarrow.parquet as pq
+
+    url = _fleurs_parquet_url(FLEURS_JA_CONFIG, split)
+    with fsspec.open(url, "rb") as f:
+        pf = pq.ParquetFile(f)
+        table = pf.read(columns=["id", "raw_transcription"])
+    ids = table.column("id").to_pylist()
+    texts = table.column("raw_transcription").to_pylist()
+    return {i: t for i, t in zip(ids, texts) if t and t.strip()}
+
+
+def build_fleurs_refs(n: int = FLEURS_DEFAULT_N, seed: int = FLEURS_DEFAULT_SEED):
+    """Build a length-diverse set of up to n punctuated ja reference
+    sentences from FLEURS validation+test (raw_transcription already carries
+    natural 、/。/？ punctuation). Filters to sentences that actually contain
+    at least one target mark and fit under FLEURS_MAX_CHARS, then samples
+    with length-decile stratification so the set isn't skewed toward the
+    (more numerous) short sentences.
+    """
+    import random
+
+    pool: dict[int, str] = {}
+    for split in FLEURS_SPLITS:
+        pool.update(_load_fleurs_split(split))
+
+    seen_text = set()
+    candidates = []
+    for text in pool.values():
+        norm = text.strip()
+        if not norm or norm in seen_text:
+            continue
+        if not any(m in norm for m in TARGET_MARKS):
+            continue
+        if len(norm) > FLEURS_MAX_CHARS:
+            continue
+        seen_text.add(norm)
+        candidates.append(norm)
+
+    if not candidates:
+        raise RuntimeError("No usable FLEURS ja sentences found (empty pool or all filtered out).")
+
+    candidates.sort(key=len)
+    n = min(n, len(candidates))
+
+    # Stratify by length decile so short/medium/long sentences are all
+    # represented roughly proportionally to their share of the pool, rather
+    # than a plain random sample happening to skew toward the far more
+    # numerous short sentences.
+    num_buckets = 10
+    buckets = [[] for _ in range(num_buckets)]
+    for idx, text in enumerate(candidates):
+        b = min(idx * num_buckets // len(candidates), num_buckets - 1)
+        buckets[b].append(text)
+
+    rng = random.Random(seed)
+    for b in buckets:
+        rng.shuffle(b)
+
+    base = n // num_buckets
+    remainder = n % num_buckets
+    chosen = []
+    leftover = []
+    for i, b in enumerate(buckets):
+        take = base + (1 if i < remainder else 0)
+        chosen.extend(b[:take])
+        leftover.extend(b[take:])
+    # if some buckets were smaller than their quota (only possible with a
+    # very small/uneven pool), top up from whatever's left over elsewhere
+    if len(chosen) < n:
+        rng.shuffle(leftover)
+        chosen.extend(leftover[: n - len(chosen)])
+
+    rng.shuffle(chosen)
+    return chosen[:n]
+
 
 def do_quantize():
     from onnxruntime.quantization import QuantType, quantize_dynamic
@@ -146,23 +248,31 @@ def punct_cer(ref: str, hyp: str):
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate(onnx_filename: str, label: str):
+def load_eval_real_refs():
+    """ja reference transcripts (already punctuated) from the original
+    15-clip testdata/eval_real/manifest.json sample."""
     with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
         manifest = json.load(f)
-    manifest = [e for e in manifest if e["lang"] == "ja"]
+    return [(e["wav"], e["ref"]) for e in manifest if e["lang"] == "ja"]
 
+
+def evaluate(onnx_filename: str, label: str, refs, latency: bool = False):
+    """refs: list of (id, ref_text) pairs, ref_text already punctuated."""
     punctuator = PunctuatorJa(model_dir=MODEL_DIR, onnx_filename=onnx_filename)
 
     tp = fp = fn = 0
     total_dist = 0
     total_denom = 0
     rows = []
-    for entry in manifest:
-        ref = entry["ref"]
+    latencies = []
+    for ref_id, ref in refs:
         stripped, ref_marks = strip_marks(ref)
         if not stripped:
             continue
+        t0 = time.time()
         hyp = punctuator.restore(stripped)
+        if latency:
+            latencies.append(time.time() - t0)
         hyp_marks = marks_from_restored(hyp, len(stripped))
 
         for rm, hm in zip(ref_marks, hyp_marks):
@@ -178,18 +288,21 @@ def evaluate(onnx_filename: str, label: str):
         rate, dist, denom = punct_cer(ref, hyp)
         total_dist += dist
         total_denom += denom
-        rows.append({"wav": entry["wav"], "ref": ref, "hyp": hyp, "cer": rate})
-        print(f"  [{label}] {entry['wav']}: cer={rate:.4f}")
-        print(f"      ref: {ref}")
-        print(f"      hyp: {hyp}")
+        rows.append({"wav": ref_id, "ref": ref, "hyp": hyp, "cer": rate})
 
     precision = tp / (tp + fp) if (tp + fp) else 0.0
     recall = tp / (tp + fn) if (tp + fn) else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
     micro_cer = total_dist / total_denom if total_denom else float("nan")
+    mean_latency_ms = (sum(latencies) / len(latencies) * 1000) if latencies else None
+
+    print(f"  [{label}] n={len(rows)} P={precision:.4f} R={recall:.4f} "
+          f"F1={f1:.4f} CER={micro_cer:.4f}"
+          + (f" mean_latency={mean_latency_ms:.2f}ms" if mean_latency_ms is not None else ""))
 
     return {
         "label": label,
+        "n": len(rows),
         "precision": precision,
         "recall": recall,
         "f1": f1,
@@ -197,6 +310,7 @@ def evaluate(onnx_filename: str, label: str):
         "tp": tp,
         "fp": fp,
         "fn": fn,
+        "mean_latency_ms": mean_latency_ms,
         "rows": rows,
     }
 
@@ -204,6 +318,15 @@ def evaluate(onnx_filename: str, label: str):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--skip-quantize", action="store_true")
+    ap.add_argument("--source", choices=["eval_real", "fleurs"], default="eval_real",
+                     help="reference set to evaluate against (default eval_real, the "
+                          "original 15-clip sample; fleurs is the larger re-verification set)")
+    ap.add_argument("--n", type=int, default=FLEURS_DEFAULT_N,
+                     help=f"max sentences to use from --source=fleurs (default {FLEURS_DEFAULT_N})")
+    ap.add_argument("--seed", type=int, default=FLEURS_DEFAULT_SEED,
+                     help="RNG seed for fleurs length-stratified sampling")
+    ap.add_argument("--latency", action="store_true",
+                     help="also measure mean per-call restore() latency")
     args = ap.parse_args()
 
     sizes = existing_sizes() if args.skip_quantize else do_quantize()
@@ -212,25 +335,49 @@ def main():
     for k, v in sizes.items():
         print(f"  {k}: {v} ({v / 1e6:.1f} MB)")
 
+    if args.source == "fleurs":
+        print(f"\n[source] building FLEURS ja eval set (n={args.n}, seed={args.seed})...")
+        texts = build_fleurs_refs(n=args.n, seed=args.seed)
+        refs = [(f"fleurs_{i:04d}", t) for i, t in enumerate(texts)]
+        print(f"[source] {len(refs)} FLEURS ja sentences "
+              f"(chars: min={min(len(t) for t in texts)}, "
+              f"median={sorted(len(t) for t in texts)[len(texts) // 2]}, "
+              f"max={max(len(t) for t in texts)})")
+    else:
+        refs = load_eval_real_refs()
+        print(f"\n[source] {len(refs)} testdata/eval_real ja clips")
+
     results = {}
     for filename, label in [("punct_bert.onnx", "fp32"),
                              (os.path.join("quantized_ort", INT8_NAME), "int8")]:
         print(f"\n=== evaluating {label} ===")
-        results[label] = evaluate(filename, label)
+        results[label] = evaluate(filename, label, refs, latency=args.latency)
 
     print("\n=== summary ===")
     for label, r in results.items():
-        print(f"  {label}: P={r['precision']:.4f} R={r['recall']:.4f} "
-              f"F1={r['f1']:.4f} CER={r['cer']:.4f}")
+        line = f"  {label}: n={r['n']} P={r['precision']:.4f} R={r['recall']:.4f} F1={r['f1']:.4f} CER={r['cer']:.4f}"
+        if r["mean_latency_ms"] is not None:
+            line += f" latency={r['mean_latency_ms']:.2f}ms"
+        print(line)
+
+    fp32_f1 = results["fp32"]["f1"]
+    int8_f1 = results["int8"]["f1"]
+    delta = int8_f1 - fp32_f1
+    print(f"\n[verdict] int8 F1 - fp32 F1 = {delta:+.4f} "
+          f"({'PASS' if delta >= -0.02 else 'FAIL'}, threshold -0.02)")
 
     out = {
+        "source": args.source,
+        "n": len(refs),
         "sizes": sizes,
         "results": {
-            k: {"precision": v["precision"], "recall": v["recall"], "f1": v["f1"], "cer": v["cer"]}
+            k: {"n": v["n"], "precision": v["precision"], "recall": v["recall"],
+                "f1": v["f1"], "cer": v["cer"], "mean_latency_ms": v["mean_latency_ms"]}
             for k, v in results.items()
         },
+        "f1_delta_int8_minus_fp32": delta,
     }
-    out_path = os.path.join(ROOT, "scratch_quantize_punct_results.json")
+    out_path = os.path.join(ROOT, f"scratch_quantize_punct_results_{args.source}.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
     print(f"\nwrote {out_path}")
