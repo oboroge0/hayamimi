@@ -147,6 +147,7 @@ python -m venv .venv
 | `--transcript PATH` | なし | 清書済みトランスクリプト行をこのファイルに追記 |
 | `--hotwords PATH` | なし | 固有名詞側にデコードを寄せるホットワード一覧（1行1語）。**現状jaルートには効果なし**（ReazonSpeechのbyte-level BPEなtokens.txtはエンコードできず、起動時に失敗数を警告表示）。jaの固有名詞には`--replace`を使ってください |
 | `--replace PATH` | なし | ユーザー辞書。`誤=正`形式、1行1組。全出力に適用 |
+| `--mode {single,balanced,fast}` | `balanced` | 言語切替のプリセット。`balanced`は2つの言語判定器が一致した時だけ切り替える（`docs/LID.md`参照）。`single`は`--lang`で指定した言語に固定し自動切替を行わない。`fast`は判定のたびに即切り替えるv0.2.0以前相当の動作。下の個別フラグはプリセットより優先される |
 | `--lang-switch-guard SEC` | 2.0 | この秒数未満の新言語判定はノイズとみなす：スイッチ確定（`--lid-switch-confirm`参照）には一切カウントされず、空デコード時のomnilingualフォールバックも抑制する（`0`で無効） |
 | `--lid-switch-confirm N` | 2 | セッション言語を実際に切り替えるのに必要な、連続した新言語判定の回数（各判定は`--lang-switch-guard`秒以上）。大きくするほど切り替えが粘る |
 | `--speakers` | オフ | 発話に話者ID（S1, S2, ...）をラベル付け。清書パスでpyannote segmentation-3.0による再分離をかけ直す |
