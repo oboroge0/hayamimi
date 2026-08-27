@@ -135,6 +135,16 @@ def test_check_hotwords_encodable_empty_path():
 
 # ---- M2M-100 target acceptance / validation tiers ---------------------------
 
+# These read the real model's vocabulary file (models/ is untracked), so they
+# only run where the M2M-100 model has been downloaded -- not on minimal CI.
+_m2m_vocab_available = translate_m2m.is_supported_target("ja")
+needs_m2m_vocab = pytest.mark.skipif(
+    not _m2m_vocab_available,
+    reason="M2M-100 model vocabulary not downloaded (models/ absent)",
+)
+
+
+@needs_m2m_vocab
 def test_is_supported_target_accepts_known_m2m100_codes():
     # __zh__ / __ko__ / __es__ / __fr__ all exist in the model's own vocabulary.
     assert translate_m2m.is_supported_target("zh")
@@ -143,6 +153,7 @@ def test_is_supported_target_accepts_known_m2m100_codes():
     assert translate_m2m.is_supported_target("fr")
 
 
+@needs_m2m_vocab
 def test_is_supported_target_rejects_unknown_code():
     assert not translate_m2m.is_supported_target("xx")
     assert not translate_m2m.is_supported_target("not-a-lang-code")
@@ -153,6 +164,7 @@ def test_is_supported_target_missing_model_dir_returns_false():
     assert not translate_m2m.is_supported_target("zh", model_dir="/no/such/dir")
 
 
+@needs_m2m_vocab
 def test_validated_targets_are_a_subset_of_supported():
     for lang in translate_m2m.VALIDATED_TARGETS:
         assert translate_m2m.is_supported_target(lang), f"{lang} is VALIDATED but not accepted by the model"
