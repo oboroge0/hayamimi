@@ -262,7 +262,11 @@ Headline numbers from that log:
   (live-pass-only labeling) to 13.9%. Reference speaker count is 4 per
   meeting; hayamimi's hypothesis still overestimates it (4-8 speakers),
   so `--speakers` should be read as good-enough turn labeling, not a
-  reliable speaker-count source.
+  reliable speaker-count source. To keep that overcount from flooding the
+  screen with one-off labels, a speaker's first appearance shows as
+  provisional (`S5?`) and only resolves to a plain `S{n}` once it recurs; a
+  label that never recurs stays `?` for the rest of the session (see
+  `docs/DIARIZATION_PLAN.md` section 11).
 - **Translation quality has a real ceiling**, not just a tuning one.
   FuguMT (ja->en) and M2M-100 (ja->zh/ko) are small models; repetition loops
   are suppressed but not eliminated, and numeric values are not reliably

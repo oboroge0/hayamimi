@@ -20,7 +20,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
-from speaker_id import EMBED_MODEL, SpeakerLabeler
+from speaker_id import EMBED_MODEL, PROVISIONAL_CONFIRM_HITS, SpeakerLabeler
 
 
 def make_labeler(threshold: float = 0.45, merge_enabled: bool = False,
@@ -141,6 +141,99 @@ def test_centroid_summary_flags_one_off_opens_with_a_final_match_count_of_one():
         ("S1", "fast", 2),
         ("S2", "fast", 1),
     ]
+
+
+# ---------------------------------------------------------------------------
+# issue #11 (docs/DIARIZATION_PLAN.md section 10.8, option B): display-only
+# provisional labeling. Unlike section 9's hysteresis, this must NEVER
+# change what match_embedding()/label() return (assignment) -- only what a
+# caller shows via display_label() at print time.
+# ---------------------------------------------------------------------------
+
+def test_new_centroid_is_provisional_until_second_hit():
+    labeler = make_labeler(threshold=0.9)
+    label = labeler.match_embedding(unit([1.0, 0.0]))  # opens S1, 1st hit
+    assert label == "S1"  # assignment: plain canonical label, no "?"
+    assert labeler.is_provisional("S1") is True
+    assert labeler.display_label("S1") == "S1?"
+
+    label2 = labeler.match_embedding(unit([0.99, 0.01]))  # 2nd hit on S1
+    assert label2 == "S1"  # assignment unchanged by provisional status
+    assert labeler.is_provisional("S1") is False
+    assert labeler.display_label("S1") == "S1"
+
+
+def test_confirmed_centroid_stays_confirmed_after_more_hits():
+    labeler = make_labeler(threshold=0.9)
+    labeler.match_embedding(unit([1.0, 0.0]))
+    labeler.match_embedding(unit([0.99, 0.01]))  # confirms S1 (count=2)
+    labeler.match_embedding(unit([0.98, 0.02]))  # a 3rd hit
+    assert labeler.is_provisional("S1") is False
+    assert labeler.display_label("S1") == "S1"
+
+
+def test_display_label_does_not_affect_which_centroid_is_assigned():
+    """The core invariant: display_label() is purely a read of _counts, so
+    calling it (or is_provisional()) any number of times, in any order,
+    must never change _centroids/_counts/_alias -- the assignment a later
+    match_embedding() call makes is unaffected."""
+    labeler = make_labeler(threshold=0.9)
+    labeler.match_embedding(unit([1.0, 0.0]))
+    before_centroids = [c.copy() for c in labeler._centroids]
+    before_counts = list(labeler._counts)
+
+    labeler.display_label("S1")
+    labeler.is_provisional("S1")
+    labeler.display_label("S1")
+
+    assert [c.tolist() for c in labeler._centroids] == [c.tolist() for c in before_centroids]
+    assert labeler._counts == before_counts
+
+    # and a real assignment call afterwards behaves exactly as it would have
+    # with no display_label()/is_provisional() calls in between.
+    label = labeler.match_embedding(unit([0.0, 1.0]))
+    assert label == "S2"
+
+
+def test_display_label_empty_string_passthrough():
+    labeler = make_labeler(threshold=0.9)
+    assert labeler.is_provisional("") is False
+    assert labeler.display_label("") == ""
+
+
+def test_display_label_out_of_range_label_passthrough():
+    """A label for a centroid this labeler has never opened (e.g. stale
+    state from a caller bug) must not raise -- treated as not provisional."""
+    labeler = make_labeler(threshold=0.9)
+    assert labeler.is_provisional("S9") is False
+    assert labeler.display_label("S9") == "S9"
+
+
+def test_provisional_confirm_hits_constant_is_two():
+    # Guards the "confirmed on the 2nd occurrence" spec in issue #11 against
+    # an accidental constant change silently altering behavior.
+    assert PROVISIONAL_CONFIRM_HITS == 2
+
+
+def test_provisional_label_count_counts_only_still_provisional_centroids():
+    labeler = make_labeler(threshold=0.9)
+    labeler.match_embedding(unit([1.0, 0.0]))   # S1: 1 hit, provisional
+    labeler.match_embedding(unit([0.99, 0.01]))  # confirms S1
+    labeler.match_embedding(unit([0.0, 1.0]))   # S2: 1 hit, provisional
+    labeler.match_embedding(unit([-1.0, 0.0]))  # S3: 1 hit, provisional
+    assert labeler.provisional_label_count() == 2  # S2, S3
+
+
+def test_provisional_label_count_skips_merged_away_centroids():
+    labeler = make_labeler(merge_enabled=True, merge_threshold=0.9)
+    labeler._centroids = [unit([1.0, 0.0]), unit([0.99, 0.1411])]  # both 1-hit, provisional
+    labeler._counts = [1, 1]
+    labeler._confirmed = [True, True]
+    labeler.merge_centroids()  # folds S2 into S1; S2's slot is now aliased/dead
+    # _merge_into() sums both centroids' counts (1+1=2), so the survivor is
+    # confirmed by the merge itself; the aliased S2 slot must not be
+    # separately counted as still-provisional.
+    assert labeler.provisional_label_count() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +406,49 @@ def test_fast_path_default_finds_both_real_speakers():
 
     assert len(set(labels)) >= 2, (
         f"expected >=2 distinct global labels for a real 2-speaker recording, got {labels}"
+    )
+
+
+@_needs_embed_model
+@_needs_two_speakers_wav
+def test_provisional_display_does_not_reproduce_section_9s_swallowing_bug():
+    """Issue #11's display-only mitigation must NOT reproduce section 9's
+    hysteresis failure mode (test_hysteresis_can_swallow_a_rare_real_speaker
+    above): since display_label() never changes which centroid an embedding
+    is assigned to, the rare second speaker (one ~3s segment among four)
+    still gets their own distinct canonical label -- it just displays with
+    a "?" suffix (never confirmed by a 2nd hit) instead of a bare "S2".
+    Structurally this can't regress to the section-9 bug because assignment
+    is untouched, but this test fixes that as an explicit guard.
+    """
+    from diarize import SEGMENTATION_MODEL, GroupDiarizer
+
+    if not os.path.exists(SEGMENTATION_MODEL):
+        pytest.skip("pyannote segmentation-3.0 model not downloaded")
+
+    samples, sr = _read_wav_float32(TWO_SPEAKERS_WAV)
+    segments = sorted(GroupDiarizer().process(samples, sr), key=lambda t: t[1])
+
+    labeler = SpeakerLabeler()  # defaults: hysteresis/merge both off
+    canonical_labels = []
+    display_labels = []
+    for _local_spk, start_s, end_s in segments:
+        start, end = int(start_s * sr), int(end_s * sr)
+        if end - start < int(0.3 * sr):
+            continue
+        label = labeler.label(samples[start:end], sr)
+        canonical_labels.append(label)
+        display_labels.append(labeler.display_label(label))
+
+    # assignment: unchanged from the pre-existing fast-path regression test
+    assert len(set(canonical_labels)) >= 2, (
+        f"expected >=2 distinct canonical labels, got {canonical_labels}"
+    )
+    # display: still >=2 distinct strings shown to the user -- the rare
+    # speaker isn't silently absorbed into the other one's label, unlike
+    # section 9's rejected hysteresis approach.
+    assert len(set(display_labels)) >= 2, (
+        f"expected >=2 distinct displayed labels, got {display_labels}"
     )
 
 
