@@ -396,6 +396,10 @@ class Refiner:
             task = self._task_queue.get()
             try:
                 task()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                sys.stderr.flush()
             finally:
                 self._task_queue.task_done()
 
@@ -923,6 +927,18 @@ def main():
                        speaker_labeler=speaker_labeler)
         if refiner is not None:
             refiner.maybe_refine(0, force=True)
+            # maybe_refine(force=True) only blocks on the ONE task it just
+            # enqueued; it returns instantly without enqueueing anything if
+            # self.spans was already empty (the last group closed earlier,
+            # asynchronously, during run_stream). On long --speakers audio
+            # the worker thread routinely lags behind the fast path (per-
+            # group diarization + per-turn re-decode is much slower than a
+            # plain refine), so a backlog of already-queued-but-not-yet-run
+            # groups can still be sitting in _task_queue at shutdown. Since
+            # the worker is a daemon thread, exiting here would kill it
+            # mid-backlog and silently drop those groups' refine output.
+            # Block until every already-queued task has actually run.
+            refiner._task_queue.join()
 
     input_mode = args.input or ("wav" if args.wav else "mic")
 
