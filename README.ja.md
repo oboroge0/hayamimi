@@ -101,7 +101,18 @@ python -m venv .venv
 
 # 英語音声 -> 英語原文 + 日本語訳（macOS/Linux）
 .venv/bin/python scripts/realtime_transcribe.py --translate ja --serve
+
+# 会議音声（BlackHole）と自分のマイクを同時に文字起こし・翻訳
+.venv/bin/python scripts/realtime_transcribe.py --translate ja --serve \
+  --device "BlackHole 2ch" --mic-device "MacBook Proのマイク" \
+  --transcript meeting.txt
 ```
+
+`--device`を会議音声が届くBlackHole、`--mic-device`を実マイクにすると、2入力を
+hayamimi内でローカル合成して同じ文字起こし経路へ流します。音声ファイルは保存せず、
+`--transcript`を付けた場合だけrefined原文と翻訳をテキスト保存します。利用可能な名前と
+番号は`.venv/bin/python scripts/realtime_transcribe.py --list-devices`で確認できます。
+会議アプリ自身のマイクは実マイク、スピーカーはBlackHoleを含む複数出力装置に設定します。
 
 Apple Silicon Macで前提ツールがない場合は先に導入します。
 
@@ -124,6 +135,9 @@ python3.11 -m venv .venv
 | `--wav PATH` | マイク入力 | マイクの代わりに16kHzモノラルWAVファイルからのストリーミングをシミュレート |
 | `--no-realtime` | オフ | `--wav`使用時、チャンク間でスリープしない（高速バッチ処理） |
 | `--input {mic,wav,ws}` | mic、`--wav`指定時はwav | 音声入力元。`ws`はネットワーク経由で音声を受け付ける（上記参照） |
+| `--device NAME_OR_INDEX` | システム入力 | `BlackHole 2ch`などの主Core Audio入力 |
+| `--mic-device NAME_OR_INDEX` | なし | `--device`とローカル合成する2つ目のCore Audio入力 |
+| `--list-devices` | オフ | 利用可能な音声デバイス名と番号を表示して終了 |
 | `--ws-host HOST` | `0.0.0.0` | `--input ws`の`/ingest`エンドポイントのバインドホスト |
 | `--ws-port PORT` | 8766 | `--input ws`の`/ingest`エンドポイントのポート |
 | `--threads N` | 4 | モデルごとの推論スレッド数 |

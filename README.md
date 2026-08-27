@@ -107,7 +107,18 @@ python -m venv .venv
 
 # English speech -> English transcript + Japanese translation (macOS/Linux)
 .venv/bin/python scripts/realtime_transcribe.py --translate ja --serve
+
+# Meeting output from BlackHole + your physical microphone, mixed locally
+.venv/bin/python scripts/realtime_transcribe.py --translate ja --serve \
+  --device "BlackHole 2ch" --mic-device "MacBook Pro Microphone" \
+  --transcript meeting.txt
 ```
+
+`--device` and `--mic-device` open two Core Audio inputs and mix them locally
+before recognition. Audio is not saved; `--transcript` saves only the refined
+source text and translations. Run with `--list-devices` to find device names or
+indices. Keep the meeting application's microphone set to the physical mic and
+its speaker set to the multi-output device that includes BlackHole.
 
 On a new Apple Silicon Mac, install the prerequisites first if they are
 missing:
@@ -133,6 +144,9 @@ All flags are on `scripts/realtime_transcribe.py`:
 | `--wav PATH` | mic input | simulate streaming from a 16kHz mono WAV file instead of the microphone |
 | `--no-realtime` | off | with `--wav`, don't sleep between chunks (fast batch processing) |
 | `--input {mic,wav,ws}` | mic, or wav if `--wav` is given | audio source; `ws` accepts audio over the network (see below) |
+| `--device NAME_OR_INDEX` | system input | primary Core Audio input, such as `BlackHole 2ch` |
+| `--mic-device NAME_OR_INDEX` | none | second Core Audio input mixed locally with `--device` |
+| `--list-devices` | off | list available audio device names and indices, then exit |
 | `--ws-host HOST` | `0.0.0.0` | bind host for `--input ws`'s `/ingest` endpoint |
 | `--ws-port PORT` | 8766 | port for `--input ws`'s `/ingest` endpoint |
 | `--threads N` | 4 | inference threads per model |

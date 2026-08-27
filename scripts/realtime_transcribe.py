@@ -8,6 +8,7 @@ Usage:
     python scripts/realtime_transcribe.py                                 # live microphone
 """
 import argparse
+import contextlib
 import os
 import queue
 import sys
@@ -82,18 +83,64 @@ def wav_chunks(samples: np.ndarray, sample_rate: int, realtime: bool):
         pos += WINDOW_SIZE
 
 
-def mic_chunks():
+def parse_audio_device(value: str | None):
+    """Return a sounddevice-compatible device name or numeric index."""
+    if value is None:
+        return None
+    value = value.strip()
+    return int(value) if value.isdigit() else value
+
+
+def mix_input_blocks(blocks: list[np.ndarray]) -> np.ndarray:
+    """Mix synchronized mono input blocks without wrapping on overload."""
+    if len(blocks) == 1:
+        return blocks[0]
+    return np.clip(np.sum(blocks, axis=0), -1.0, 1.0).astype(np.float32)
+
+
+def mic_chunks(device: str | int | None = None,
+               mic_device: str | int | None = None):
+    """Yield one input, or a local mix of meeting audio and a second mic.
+
+    Each Core Audio input is opened independently at the same sample rate and
+    block size. Reading one block from every queue keeps the streams aligned
+    closely enough for speech recognition while allowing BlackHole and a
+    physical microphone to use their own devices.
+    """
     import sounddevice as sd
 
-    q: "queue.Queue[np.ndarray]" = queue.Queue()
+    devices = [parse_audio_device(device)]
+    if mic_device is not None:
+        devices.append(parse_audio_device(mic_device))
+    if len(devices) == 2 and devices[0] == devices[1]:
+        raise ValueError("--device and --mic-device must select different inputs")
 
-    def callback(indata, frames, time_info, status):
-        q.put(indata[:, 0].copy())
+    queues: list["queue.Queue[np.ndarray]"] = [queue.Queue() for _ in devices]
 
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                         blocksize=WINDOW_SIZE, callback=callback):
+    def make_callback(q):
+        def callback(indata, frames, time_info, status):
+            if status:
+                print(f"audio input status: {status}", file=sys.stderr)
+            q.put(indata[:, 0].copy())
+        return callback
+
+    with contextlib.ExitStack() as stack:
+        for i, (selected, q) in enumerate(zip(devices, queues)):
+            role = "meeting" if len(devices) == 2 and i == 0 else "microphone"
+            try:
+                info = sd.query_devices(selected, "input")
+            except (ValueError, sd.PortAudioError) as exc:
+                label = selected if selected is not None else "system default"
+                raise RuntimeError(f"cannot open {role} input {label!r}: {exc}") from exc
+            print(f"{role} input: {info['name']}", file=sys.stderr)
+            stream = sd.InputStream(
+                device=selected, samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                blocksize=WINDOW_SIZE, callback=make_callback(q),
+            )
+            stack.enter_context(stream)
+
         while True:
-            yield q.get()
+            yield mix_input_blocks([q.get() for q in queues])
 
 
 def ws_chunks(ingest):
@@ -547,6 +594,13 @@ def build_arg_parser():
                          "en=FuguMT, ja/zh/ko=M2M-100")
     ap.add_argument("--input", choices=["mic", "wav", "ws"], default=None,
                     help="audio source; default is mic, or wav if --wav is given")
+    ap.add_argument("--device", metavar="NAME_OR_INDEX",
+                    help="primary Core Audio input device (default: system input)")
+    ap.add_argument("--mic-device", metavar="NAME_OR_INDEX",
+                    help="second Core Audio input mixed locally with --device; use this "
+                         "for your physical microphone when --device is BlackHole")
+    ap.add_argument("--list-devices", action="store_true",
+                    help="list audio devices and exit without loading models")
     ap.add_argument("--ws-host", default="0.0.0.0", metavar="HOST",
                     help="bind host for --input ws (default 0.0.0.0, so an ESP32/phone "
                          "on the LAN can reach it; use 127.0.0.1 to restrict to localhost)")
@@ -558,11 +612,19 @@ def build_arg_parser():
 def main():
     ap = build_arg_parser()
     args = ap.parse_args()
+    if args.list_devices:
+        import sounddevice as sd
+
+        print(sd.query_devices())
+        return
     if args.translate:
         try:
             parse_translation_targets(args.translate)
         except ValueError as exc:
             ap.error(str(exc))
+    input_mode = args.input or ("wav" if args.wav else "mic")
+    if input_mode != "mic" and (args.device is not None or args.mic_device is not None):
+        ap.error("--device and --mic-device can only be used with microphone input")
 
     server = None
     if args.serve:
@@ -612,8 +674,6 @@ def main():
         if translator_worker is not None:
             translator_worker.wait()
 
-    input_mode = args.input or ("wav" if args.wav else "mic")
-
     try:
         if server is not None:
             server.publish({"type": "session_start"})
@@ -635,7 +695,8 @@ def main():
             run_stream(ws_chunks(ingest), vad, SAMPLE_RATE, asr, stats, printer, refiner,
                        history, translator_worker, speaker_labeler)
         else:
-            run_stream(mic_chunks(), vad, SAMPLE_RATE, asr, stats, printer, refiner, history,
+            run_stream(mic_chunks(args.device, args.mic_device),
+                       vad, SAMPLE_RATE, asr, stats, printer, refiner, history,
                        translator_worker, speaker_labeler)
     except KeyboardInterrupt:
         finish(SAMPLE_RATE)

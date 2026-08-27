@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from realtime_transcribe import (AudioHistory, PREROLL_S, digits_consistent,
                                  build_arg_parser, build_translators,
+                                 mix_input_blocks, parse_audio_device,
                                  parse_translation_targets, translate_by_sentence,
                                  Refiner, TranslationWorker, translators_for_source)
 from subtitle_server import DASHBOARD_HTML, SubtitleServer
@@ -32,6 +33,32 @@ class FakeTranslator:
     def translate(self, text):
         self.calls.append(text)
         return self.mapping.get(text, text)
+
+
+# ---- local audio input mixing --------------------------------------------
+
+def test_parse_audio_device_accepts_index_or_name():
+    assert parse_audio_device("0") == 0
+    assert parse_audio_device(" BlackHole 2ch ") == "BlackHole 2ch"
+    assert parse_audio_device(None) is None
+
+
+def test_mix_input_blocks_preserves_single_input_and_clips_two_inputs():
+    meeting = np.array([0.25, 0.8, -0.8], dtype=np.float32)
+    microphone = np.array([0.5, 0.7, -0.7], dtype=np.float32)
+    assert mix_input_blocks([meeting]) is meeting
+    np.testing.assert_allclose(
+        mix_input_blocks([meeting, microphone]),
+        np.array([0.75, 1.0, -1.0], dtype=np.float32),
+    )
+
+
+def test_dual_input_cli_options_are_accepted():
+    args = build_arg_parser().parse_args([
+        "--device", "BlackHole 2ch", "--mic-device", "2", "--translate", "ja",
+    ])
+    assert args.device == "BlackHole 2ch"
+    assert args.mic_device == "2"
 
 
 # ---- digit guard -----------------------------------------------------------
