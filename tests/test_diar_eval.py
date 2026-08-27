@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
-from eval_diar import parse_rttm, segments_to_der_tuples
+from eval_diar import group_segments, parse_rttm, segments_to_der_tuples
 
 
 # ---- parse_rttm -------------------------------------------------------------
@@ -132,3 +132,46 @@ def test_der_end_to_end_from_parsed_rttm(tmp_path):
     )
     ref = segments_to_der_tuples(parse_rttm(str(rttm)))
     assert simpleder.DER(ref, ref, collar=0.25) == pytest.approx(0.0)
+
+
+# ---- group_segments (iteration 3-4 Refiner-style grouping) ------------------
+
+SR = 16000  # sample rate used to convert the group_gap_s/group_max_s knobs
+
+
+def test_group_segments_single_segment():
+    segs = [(0, SR, "S1")]
+    groups = group_segments(segs, SR, group_gap_s=2.0, group_max_s=25.0)
+    assert groups == [[(0, SR, "S1")]]
+
+
+def test_group_segments_merges_close_segments():
+    # two 1s segments 0.5s apart: gap (0.5s) < group_gap_s (2.0s) -> one group
+    segs = [(0, SR, "S1"), (int(1.5 * SR), int(2.5 * SR), "S1")]
+    groups = group_segments(segs, SR, group_gap_s=2.0, group_max_s=25.0)
+    assert len(groups) == 1
+    assert groups[0] == segs
+
+
+def test_group_segments_splits_on_silence_gap():
+    # 3s gap between segments >= group_gap_s (2.0s) -> two groups
+    segs = [(0, SR, "S1"), (int(4 * SR), int(5 * SR), "S1")]
+    groups = group_segments(segs, SR, group_gap_s=2.0, group_max_s=25.0)
+    assert groups == [[(0, SR, "S1")], [(int(4 * SR), int(5 * SR), "S1")]]
+
+
+def test_group_segments_splits_on_max_length():
+    # a group already at/over group_max_s must be closed before folding in
+    # the next segment, even with no silence gap between them (mirrors
+    # Refiner.maybe_refine()'s "due" check running on the already-
+    # accumulated spans).
+    segs = [
+        (0, 26 * SR, "S1"),           # single 26s span, already >= 25s
+        (26 * SR, 27 * SR, "S1"),     # back-to-back, no gap
+    ]
+    groups = group_segments(segs, SR, group_gap_s=2.0, group_max_s=25.0)
+    assert groups == [segs[:1], segs[1:]]
+
+
+def test_group_segments_empty_input():
+    assert group_segments([], SR, group_gap_s=2.0, group_max_s=25.0) == []

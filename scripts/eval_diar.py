@@ -141,23 +141,156 @@ def generate_speaker_hypothesis(wav_path: str, min_silence: float = 0.35,
 
 
 # ---------------------------------------------------------------------------
+# New (iteration 3-4) hypothesis: VAD -> fast label -> Refiner-style groups
+# -> per-group offline diarization -> local-to-global remap
+# ---------------------------------------------------------------------------
+
+def group_segments(fast_segments: list[tuple[int, int, str]], sample_rate: int,
+                   group_gap_s: float, group_max_s: float) -> list[list[tuple[int, int, str]]]:
+    """Pure grouping logic, factored out of generate_diarize_hypothesis() for
+    unit testing: replicates realtime_transcribe.Refiner.maybe_refine()'s
+    "due" condition (silence gap >= group_gap_s OR accumulated length >=
+    group_max_s closes a group) over a flat list of (start_sample,
+    end_sample, label) VAD segments, minus the language-boundary split
+    (there's no decoded text here to split on).
+    """
+    groups: list[list[tuple[int, int, str]]] = []
+    cur: list[tuple[int, int, str]] = []
+    for seg in fast_segments:
+        if cur:
+            first_start, last_end = cur[0][0], cur[-1][1]
+            gap = seg[0] - last_end
+            length = last_end - first_start
+            if gap >= int(group_gap_s * sample_rate) or length >= int(group_max_s * sample_rate):
+                groups.append(cur)
+                cur = []
+        cur.append(seg)
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
+                                max_speech: float = 12.0,
+                                diar_threshold: float = None) -> tuple[list[tuple[str, float, float]], dict]:
+    """Score the new method: same VAD + fast SpeakerLabeler as the baseline,
+    but grouped exactly the way production's Refiner groups utterances
+    (silence gap >= GROUP_GAP_S or accumulated length >= GROUP_MAX_S closes
+    a group -- see realtime_transcribe.Refiner.add_span/maybe_refine), then
+    each closed group's audio is re-diarized with
+    scripts/diarize.GroupDiarizer (pyannote segmentation + CAM++ + FastClustering)
+    exactly as realtime_transcribe.Refiner._emit_turns() does, remapping
+    local clusters onto a session-global SpeakerLabeler via match_embedding().
+
+    This reuses the *real* Refiner grouping/remap policy (same constants,
+    same classes) but skips ASR entirely -- the hypothesis only needs
+    speaker labels and turn timing, and running ASR would just slow down
+    the AMI sweep for no scoring benefit.
+
+    Returns (hyp, stats) where stats carries diarization wall-clock time
+    and call count, for the RTF measurement docs/DIARIZATION_PLAN.md
+    iteration 3 asks for.
+    """
+    import numpy as np
+    from realtime_transcribe import GROUP_GAP_S, GROUP_MAX_S, SAMPLE_RATE, AudioHistory, build_vad, read_wave, wav_chunks
+    from speaker_id import SpeakerLabeler
+    from diarize import DEFAULT_THRESHOLD, GroupDiarizer
+
+    samples, sr = read_wave(wav_path, target_rate=SAMPLE_RATE)
+    vad = build_vad(min_silence, max_speech)
+    history = AudioHistory(sr)
+    labeler = SpeakerLabeler()  # the single session-global centroid set
+    diarizer = GroupDiarizer(threshold=DEFAULT_THRESHOLD if diar_threshold is None else diar_threshold)
+
+    fast_segments: list[tuple[int, int, str]] = []  # (start_sample, end_sample, fast S{n})
+
+    def drain():
+        while not vad.empty():
+            segment = vad.front
+            seg_samples = np.asarray(segment.samples, dtype=np.float32)
+            seg_start, seg_end = segment.start, segment.start + len(seg_samples)
+            labeled_samples = history.with_preroll(seg_start, seg_samples)
+            vad.pop()
+            label = labeler.label(labeled_samples, sr)
+            fast_segments.append((seg_start, seg_end, label))
+
+    for chunk in wav_chunks(samples, sr, realtime=False):
+        vad.accept_waveform(chunk)
+        history.push(chunk)
+        drain()
+    vad.flush()
+    drain()
+
+    groups = group_segments(fast_segments, sr, GROUP_GAP_S, GROUP_MAX_S)
+
+    hyp: list[tuple[str, float, float]] = []
+    diar_time = 0.0
+    for group in groups:
+        g_start, g_end = group[0][0], group[-1][1]
+        buf = samples[g_start:g_end]
+        fast_labels = [lbl for _, _, lbl in group]
+        majority = max(set(fast_labels), key=fast_labels.count) if fast_labels else ""
+
+        t0 = time.time()
+        try:
+            raw = diarizer.process(buf, sr)
+        except Exception:
+            raw = []
+        diar_time += time.time() - t0
+
+        turns = [(lid, s, e) for lid, s, e in raw if e - s >= 0.3]
+        if len({lid for lid, _, _ in turns}) < 2:
+            # single speaker (or diarizer declined): same fallback
+            # Refiner._emit_turns() takes -- one majority-vote span.
+            hyp.append((majority, g_start / sr, g_end / sr))
+            continue
+
+        local_ids = sorted({t[0] for t in turns})
+        global_label: dict[int, str] = {}
+        for local_id in local_ids:
+            pieces = [buf[int(round(s * sr)):int(round(e * sr))]
+                      for lid, s, e in turns if lid == local_id]
+            cluster_audio = np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)
+            if len(cluster_audio) == 0:
+                global_label[local_id] = majority
+                continue
+            emb = labeler.embed(cluster_audio, sr)
+            global_label[local_id] = labeler.match_embedding(emb, update=True)
+
+        for local_id, s, e in turns:
+            hyp.append((global_label[local_id], (g_start + s * sr) / sr, (g_start + e * sr) / sr))
+
+    stats = {
+        "diar_time_s": diar_time,
+        "n_groups": len(groups),
+        "audio_s": len(samples) / sr,
+    }
+    return hyp, stats
+
+
+# ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
 
 def score_meeting(wav_path: str, rttm_path: str, collar: float,
-                  min_silence: float = 0.35, max_speech: float = 12.0) -> dict:
+                  min_silence: float = 0.35, max_speech: float = 12.0,
+                  method: str = "baseline", diar_threshold: float = None) -> dict:
     import simpleder
 
     ref = segments_to_der_tuples(parse_rttm(rttm_path))
     t0 = time.time()
-    hyp_raw = generate_speaker_hypothesis(wav_path, min_silence, max_speech)
+    extra = {}
+    if method == "refine_diarize":
+        hyp_raw, extra = generate_diarize_hypothesis(wav_path, min_silence, max_speech, diar_threshold)
+    else:
+        hyp_raw = generate_speaker_hypothesis(wav_path, min_silence, max_speech)
     decode_s = time.time() - t0
     hyp = segments_to_der_tuples(hyp_raw)
 
     der = simpleder.DER(ref, hyp, collar=collar)
     ref_speakers = {s for s, _, _ in ref}
     hyp_speakers = {s for s, _, _ in hyp}
-    return {
+    result = {
         "der": der,
         "n_ref_speakers": len(ref_speakers),
         "n_hyp_speakers": len(hyp_speakers),
@@ -165,6 +298,8 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
         "n_hyp_segments": len(hyp),
         "decode_s": decode_s,
     }
+    result.update(extra)
+    return result
 
 
 def main():
@@ -179,6 +314,13 @@ def main():
                     help="VAD min_silence_duration, same knob as realtime_transcribe.py")
     ap.add_argument("--max-speech", type=float, default=12.0,
                     help="VAD max_speech_duration, same knob as realtime_transcribe.py")
+    ap.add_argument("--method", choices=["baseline", "refine_diarize"], default="baseline",
+                    help="baseline: current --speakers (SpeakerLabeler only, docs/"
+                         "DIARIZATION_PLAN.md section 6). refine_diarize: iteration "
+                         "3-4's Refiner-group offline diarization + global remap")
+    ap.add_argument("--diar-threshold", type=float, default=None, metavar="T",
+                    help="FastClusteringConfig.threshold for --method refine_diarize "
+                         "(default: diarize.DEFAULT_THRESHOLD)")
     args = ap.parse_args()
 
     if not os.path.exists(args.manifest):
@@ -199,11 +341,17 @@ def main():
     for entry in manifest:
         wav_path = os.path.join(mdir, entry["wav"])
         rttm_path = os.path.join(mdir, entry["rttm"])
-        result = score_meeting(wav_path, rttm_path, args.collar, args.min_silence, args.max_speech)
+        result = score_meeting(wav_path, rttm_path, args.collar, args.min_silence, args.max_speech,
+                               method=args.method, diar_threshold=args.diar_threshold)
+        extra = ""
+        if "diar_time_s" in result and result.get("audio_s"):
+            rtf = result["diar_time_s"] / result["audio_s"]
+            extra = (f"  diar={result['diar_time_s']:.1f}s over {result['n_groups']} groups "
+                     f"(diar_rtf={rtf:.3f})")
         print(f"[{entry['meeting']}] DER={result['der'] * 100:.1f}%  "
               f"ref_speakers={result['n_ref_speakers']} hyp_speakers={result['n_hyp_speakers']}  "
               f"ref_turns={result['n_ref_turns']} hyp_segments={result['n_hyp_segments']}  "
-              f"decode={result['decode_s']:.1f}s")
+              f"decode={result['decode_s']:.1f}s{extra}")
         rows.append({**entry, **result})
 
     if rows:
