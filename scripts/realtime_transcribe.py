@@ -337,7 +337,8 @@ class TranslationWorker:
 
 
 from asr_engine import (  # shared with the engine's live correction / refine dual-LID confirm
-    ModelUnavailable, REFINE_MIN_REGROUP_S, resolve_refine_lang, script_corrected_lang, sv_lid_tag,
+    ModelUnavailable, REFINE_MIN_REGROUP_S, SV_LANGS, resolve_refine_lang, script_corrected_lang,
+    sv_lid_tag,
 )
 
 GROUP_GAP_S = 2.0   # this much true silence closes an utterance group
@@ -451,17 +452,37 @@ class Refiner:
                     group_duration_s = len(buf) / self.sr
                     detected = self.asr._identify_lang(buf, self.sr)
                     sv_lang = ""
+                    probe_text = None
                     if detected != lang and group_duration_s >= REFINE_MIN_REGROUP_S:
                         try:
                             sv_rec = self.asr._get("sv")
-                            _, sv_tag = self.asr._decode_full(sv_rec, buf, self.sr)
+                            probe_text, sv_tag = self.asr._decode_full(sv_rec, buf, self.sr)
                             sv_lang = sv_lid_tag(sv_tag)
                         except ModelUnavailable:
                             sv_lang = ""  # minimal install: no probe possible, no override
                     resolved, changed = resolve_refine_lang(lang, detected, sv_lang, group_duration_s)
                     if changed:
-                        text = self.asr.transcribe(buf, self.sr, known_lang=resolved,
-                                                    live=False)["text"]
+                        if resolved in SV_LANGS and probe_text is not None:
+                            # resolve_refine_lang only sets changed=True when
+                            # sv_lang == whisper_lang == resolved, so the SenseVoice
+                            # probe above already decoded this exact buffer through
+                            # the same route transcribe() would take for `resolved`
+                            # (ko/yue both route to SenseVoice) -- reuse its text
+                            # instead of a second SV pass, same reuse pattern as
+                            # the live path's dual-LID confirmation probe. Apply
+                            # the same post-processing transcribe() would (text
+                            # replacements, and Kiwi ko word-spacing) so the
+                            # result matches what a fresh transcribe() call would
+                            # have produced.
+                            text = self.asr._replace(probe_text)
+                            if resolved == "ko" and text.strip() and self.asr.ko_spacer is not None:
+                                try:
+                                    text = self.asr.ko_spacer.space(text, reset_whitespace=True)
+                                except Exception:
+                                    pass
+                        else:
+                            text = self.asr.transcribe(buf, self.sr, known_lang=resolved,
+                                                        live=False)["text"]
                         if text.strip():
                             refine_lang = resolved
                         else:

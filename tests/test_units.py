@@ -13,8 +13,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
-from realtime_transcribe import (AudioHistory, PREROLL_S, Refiner, digits_consistent,
-                                 translate_by_sentence)
+from realtime_transcribe import (AudioHistory, PartialPrinter, PREROLL_S, Refiner,
+                                 digits_consistent, translate_by_sentence)
 import asr_engine
 import translate_m2m
 
@@ -667,6 +667,52 @@ def test_refine_agreement_below_length_gate_still_does_not_override():
     # from noise yet at that length for several languages.
     lang, changed = asr_engine.resolve_refine_lang("ko", "ja", "ja", 2.0)
     assert (lang, changed) == ("ko", False)
+
+
+def test_refine_reuses_sv_probe_text_for_ko_yue_instead_of_redecoding():
+    # resolve_refine_lang only accepts a correction when SenseVoice's probe
+    # on the merged group audio agrees with whisper-tiny's re-judgment, so
+    # for ko/yue (both routed to SenseVoice) that probe already decoded the
+    # exact text a second self.asr.transcribe() call would produce. The
+    # refine worker must reuse it instead of a redundant SenseVoice pass --
+    # regression for the redundant re-decode found in code review.
+    class _FakeAsr:
+        def __init__(self):
+            self.transcribe_calls = 0
+            self.decode_full_calls = 0
+            self.ko_spacer = None
+
+        def _identify_lang(self, buf, sr):
+            return "ko"
+
+        def _get(self, name):
+            assert name == "sv"
+            return "sv-rec"
+
+        def _decode_full(self, rec, buf, sr):
+            self.decode_full_calls += 1
+            return ("코리안 텍스트 refine 예시입니다", "<|ko|>0.9")
+
+        def _replace(self, text):
+            return text
+
+        def transcribe(self, buf, sr, known_lang=None, live=False):
+            self.transcribe_calls += 1
+            raise AssertionError(
+                "transcribe() must not be called when the SV probe result is reused")
+
+    sr = 16000
+    history = AudioHistory(sr, keep_s=30.0)
+    history.push(np.zeros(60000, dtype=np.float32))
+    printer = PartialPrinter(enabled=False)
+    asr = _FakeAsr()
+    refiner = Refiner(asr, history, sr, printer)
+    refiner.add_span(0, 48000, "en", "some english text", "")
+    refiner.maybe_refine(48000, force=True, force_sync=True)
+
+    assert asr.decode_full_calls == 1, (
+        f"expected exactly one SenseVoice probe decode, got {asr.decode_full_calls}")
+    assert asr.transcribe_calls == 0
 
 
 # ---- Refiner.add_span: groups must not cross a language boundary ----------
