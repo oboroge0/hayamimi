@@ -4,22 +4,39 @@ No model loaded: SpeakerLabeler.__init__ pulls in the real CAM++ ONNX
 extractor, which these tests don't need -- match_embedding() only touches
 _centroids/_counts/_threshold, so tests build a bare instance with
 object.__new__() and set just those attributes directly.
+
+The two real-audio tests at the bottom of this file (fast-path regression
+check + the hysteresis two_speakers.wav failure mode, docs/
+DIARIZATION_PLAN.md section 9 / iteration 6) DO load the real CAM++ model
+and, for the second one, scripts/diarize.py's GroupDiarizer (which also
+needs the pyannote segmentation-3.0 model) -- both skip cleanly if their
+model/fixture is missing, same pattern as tests/test_diarize.py.
 """
 import os
 import sys
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
-from speaker_id import SpeakerLabeler
+from speaker_id import EMBED_MODEL, SpeakerLabeler
 
 
-def make_labeler(threshold: float = 0.45) -> SpeakerLabeler:
+def make_labeler(threshold: float = 0.45, merge_enabled: bool = False,
+                 merge_threshold: float = 0.8, hysteresis_enabled: bool = False,
+                 hysteresis_min_hits: int = 2) -> SpeakerLabeler:
     labeler = object.__new__(SpeakerLabeler)
     labeler._threshold = threshold
     labeler._centroids = []
     labeler._counts = []
+    labeler._merge_enabled = merge_enabled
+    labeler._merge_threshold = merge_threshold
+    labeler._alias = {}
+    labeler._merge_history = {}
+    labeler._hysteresis_enabled = hysteresis_enabled
+    labeler._hysteresis_min_hits = hysteresis_min_hits
+    labeler._confirmed = []
     return labeler
 
 
@@ -75,3 +92,211 @@ def test_match_embedding_picks_nearest_of_several_centroids():
     labeler.match_embedding(unit([0.0, 1.0, 0.0]))       # S2
     label = labeler.match_embedding(unit([0.05, 0.95, 0.0]))  # closest to S2
     assert label == "S2"
+
+
+# ---------------------------------------------------------------------------
+# iteration 6 (docs/DIARIZATION_PLAN.md section 9): new-speaker hysteresis
+# ---------------------------------------------------------------------------
+
+def test_hysteresis_first_speaker_confirmed_immediately():
+    labeler = make_labeler(threshold=0.9, hysteresis_enabled=True)
+    label = labeler.match_embedding(unit([1.0, 0.0]))
+    assert label == "S1"
+    assert labeler._confirmed == [True]  # nothing to fall back to yet
+
+
+def test_hysteresis_provisional_speaker_falls_back_to_nearest_confirmed():
+    labeler = make_labeler(threshold=0.9, hysteresis_enabled=True, hysteresis_min_hits=2)
+    labeler.match_embedding(unit([1.0, 0.0]))          # S1, confirmed
+    label = labeler.match_embedding(unit([0.0, 1.0]))  # miss -> opens provisional 2nd centroid
+    assert label == "S1"  # displayed under nearest confirmed speaker, not a new "S2"
+    assert len(labeler._centroids) == 2  # still opened its own centroid internally
+    assert labeler._confirmed == [True, False]
+
+
+def test_hysteresis_confirms_after_min_hits_and_gets_own_label():
+    labeler = make_labeler(threshold=0.9, hysteresis_enabled=True, hysteresis_min_hits=2)
+    labeler.match_embedding(unit([1.0, 0.0]))              # S1
+    labeler.match_embedding(unit([0.0, 1.0]))              # opens provisional, shown as S1
+    label = labeler.match_embedding(unit([0.01, 0.9999]))  # 2nd hit on the provisional centroid
+    assert label == "S2"  # now confirmed
+    assert labeler._confirmed == [True, True]
+
+
+def test_hysteresis_disabled_opens_new_speaker_immediately():
+    labeler = make_labeler(threshold=0.9, hysteresis_enabled=False)
+    labeler.match_embedding(unit([1.0, 0.0]))
+    label = labeler.match_embedding(unit([0.0, 1.0]))
+    assert label == "S2"  # unchanged behavior when the flag is off
+
+
+# ---------------------------------------------------------------------------
+# iteration 6 (docs/DIARIZATION_PLAN.md section 9): periodic centroid merging
+# ---------------------------------------------------------------------------
+
+def test_merge_centroids_folds_similar_speakers():
+    labeler = make_labeler(merge_enabled=True, merge_threshold=0.9)
+    labeler._centroids = [unit([1.0, 0.0]), unit([0.99, 0.1411])]  # cos sim ~0.99
+    labeler._counts = [1, 1]
+    labeler._confirmed = [True, True]
+
+    merged = labeler.merge_centroids()
+
+    assert merged == {"S2": "S1"}
+    assert labeler._alias == {1: 0}
+    assert labeler.merge_history() == {"S2": "S1"}
+
+
+def test_merge_centroids_below_threshold_does_nothing():
+    labeler = make_labeler(merge_threshold=0.99)
+    labeler._centroids = [unit([1.0, 0.0]), unit([0.0, 1.0])]  # orthogonal
+    labeler._counts = [1, 1]
+    labeler._confirmed = [True, True]
+
+    merged = labeler.merge_centroids()
+
+    assert merged == {}
+    assert labeler._alias == {}
+    assert labeler.merge_history() == {}
+
+
+def test_maybe_merge_centroids_is_noop_when_disabled():
+    labeler = make_labeler(merge_enabled=False, merge_threshold=0.9)
+    labeler._centroids = [unit([1.0, 0.0]), unit([0.99, 0.1411])]
+    labeler._counts = [1, 1]
+    labeler._confirmed = [True, True]
+
+    merged = labeler.maybe_merge_centroids()
+
+    assert merged == {}
+    assert labeler._alias == {}  # merge_enabled=False never touches state
+
+
+def test_merged_centroid_absorbs_future_matches():
+    labeler = make_labeler(threshold=0.5, merge_enabled=True, merge_threshold=0.9)
+    labeler._centroids = [unit([1.0, 0.0]), unit([0.99, 0.1411])]
+    labeler._counts = [1, 1]
+    labeler._confirmed = [True, True]
+    labeler.merge_centroids()  # folds S2 into S1
+
+    label = labeler.match_embedding(unit([0.0, 1.0]))  # would have been nearest to old S2
+
+    assert label != "S2"  # S2's slot is dead; nothing should ever be labeled S2 again
+    assert len(labeler._centroids) == 3  # opened a brand-new (3rd) centroid instead
+    assert label == "S3"
+
+
+def test_merge_history_flattens_across_calls():
+    """A speaker merged away in one call, whose survivor is itself merged
+    away in a later call, should map straight to the final survivor -- not
+    leave callers to walk a merge_history() chain themselves."""
+    labeler = make_labeler(merge_threshold=0.9)
+    labeler._centroids = [unit([1.0, 0.0]), unit([0.5, 0.8660]), unit([0.49, 0.8717])]
+    labeler._counts = [1, 1, 1]
+    labeler._confirmed = [True, True, True]
+
+    first = labeler.merge_centroids()  # S2, S3 are near-identical -> S3 merges into S2
+    assert first == {"S3": "S2"}
+
+    # Simulate the merged S2 centroid later drifting close to S1 (e.g. more
+    # audio folded in over the session).
+    labeler._centroids[1] = unit([0.95, 0.3122])
+    second = labeler.merge_centroids()  # now S2 merges into S1
+    assert second == {"S2": "S1"}
+
+    assert labeler.merge_history() == {"S3": "S1", "S2": "S1"}
+
+
+# ---------------------------------------------------------------------------
+# real-audio regression: fast path on a genuine short two-speaker recording
+# (docs/DIARIZATION_PLAN.md section 9 / iteration 6's speaker-count work
+# must not regress the module's stated use case -- "turn-taking
+# conversations", commonly just 1-2 speakers, per the module docstring)
+# ---------------------------------------------------------------------------
+
+TESTDATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "testdata")
+TWO_SPEAKERS_WAV = os.path.join(TESTDATA_DIR, "two_speakers.wav")
+
+_needs_embed_model = pytest.mark.skipif(
+    not os.path.exists(EMBED_MODEL), reason="campplus_sv.onnx not downloaded"
+)
+_needs_two_speakers_wav = pytest.mark.skipif(
+    not os.path.exists(TWO_SPEAKERS_WAV), reason="testdata/two_speakers.wav not present"
+)
+
+
+def _read_wav_float32(path: str):
+    import wave
+
+    with wave.open(path, "rb") as f:
+        sr = f.getframerate()
+        data = f.readframes(f.getnframes())
+    samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+    return samples, sr
+
+
+@_needs_embed_model
+@_needs_two_speakers_wav
+def test_fast_path_default_finds_both_real_speakers():
+    """Default SpeakerLabeler() (hysteresis_enabled=False, section 9's
+    conclusion) must still tell testdata/two_speakers.wav's two real
+    speakers apart when fed their utterances in chronological order --
+    the ground truth this module exists to serve. Segment boundaries come
+    from GroupDiarizer's own offline diarization (already asserted correct
+    for this fixture in tests/test_diarize.py) so this test is purely
+    about SpeakerLabeler.label(), not diarization quality.
+    """
+    from diarize import SEGMENTATION_MODEL, GroupDiarizer
+
+    if not os.path.exists(SEGMENTATION_MODEL):
+        pytest.skip("pyannote segmentation-3.0 model not downloaded")
+
+    samples, sr = _read_wav_float32(TWO_SPEAKERS_WAV)
+    segments = sorted(GroupDiarizer().process(samples, sr), key=lambda t: t[1])
+
+    labeler = SpeakerLabeler()
+    labels = []
+    for _local_spk, start_s, end_s in segments:
+        start, end = int(start_s * sr), int(end_s * sr)
+        if end - start < int(0.3 * sr):
+            continue
+        labels.append(labeler.label(samples[start:end], sr))
+
+    assert len(set(labels)) >= 2, (
+        f"expected >=2 distinct global labels for a real 2-speaker recording, got {labels}"
+    )
+
+
+@_needs_embed_model
+@_needs_two_speakers_wav
+def test_hysteresis_can_swallow_a_rare_real_speaker():
+    """Documents why hysteresis_enabled defaults to False (see speaker_id.py's
+    HYSTERESIS_MIN_HITS comment): testdata/two_speakers.wav's second
+    speaker only speaks once (one ~3s segment among four), so with
+    hysteresis on they never accumulate hysteresis_min_hits and are
+    permanently displayed under the first speaker's label instead of
+    their own -- collapsing a genuine 2-speaker recording down to 1
+    reported speaker. This is a reproduction/regression guard, not an
+    endorsement -- if this ever starts passing with >=2 labels, the
+    trade-off that kept hysteresis off by default may be worth revisiting.
+    """
+    from diarize import SEGMENTATION_MODEL, GroupDiarizer
+
+    if not os.path.exists(SEGMENTATION_MODEL):
+        pytest.skip("pyannote segmentation-3.0 model not downloaded")
+
+    samples, sr = _read_wav_float32(TWO_SPEAKERS_WAV)
+    segments = sorted(GroupDiarizer().process(samples, sr), key=lambda t: t[1])
+
+    labeler = SpeakerLabeler(hysteresis_enabled=True)  # opt-in, off by default
+    labels = []
+    for _local_spk, start_s, end_s in segments:
+        start, end = int(start_s * sr), int(end_s * sr)
+        if end - start < int(0.3 * sr):
+            continue
+        labels.append(labeler.label(samples[start:end], sr))
+
+    assert len(set(labels)) == 1, (
+        f"expected the known under-count failure mode (all one label), got {labels} -- "
+        "if this now finds >=2 speakers, revisit hysteresis_enabled's default"
+    )

@@ -474,6 +474,13 @@ class Refiner:
             global_label[local_id] = self.speaker_labeler.match_embedding(
                 emb, update=True, threshold=self.speaker_labeler.remap_threshold)
 
+        # iteration 6 (docs/DIARIZATION_PLAN.md section 9): this refine
+        # group's remap is the natural "clean copy" boundary -- give
+        # maybe_merge_centroids() a chance to fold any two global speakers
+        # that have drifted together before the next group opens more.
+        # No-op unless --speaker-merge was passed.
+        self.speaker_labeler.maybe_merge_centroids()
+
         outputs = []  # (global_label, turn_text), in chronological turn order
         for local_id, start, end in turns:
             turn_text = self.asr.transcribe(buf[start:end], self.sr, known_lang=refine_lang,
@@ -785,6 +792,27 @@ def main():
                          "global remap (speaker_id.SpeakerLabeler.remap_threshold), independent "
                          "of the fast-path SIM_THRESHOLD. Default: same as the fast path "
                          "(speaker_id.SIM_THRESHOLD). See docs/DIARIZATION_PLAN.md section 8.")
+    ap.add_argument("--speaker-merge", action="store_true",
+                    help="iteration 6 (docs/DIARIZATION_PLAN.md section 9) mitigation for "
+                         "speaker-count overestimation: after each refine group's remap, fold "
+                         "together any two global speaker centroids that have drifted close "
+                         "enough to look like the same person. Off by default.")
+    ap.add_argument("--speaker-merge-threshold", type=float, default=None, metavar="T",
+                    help="cosine similarity above which two global centroids merge, when "
+                         "--speaker-merge. Default: speaker_id.MERGE_THRESHOLD.")
+    ap.add_argument("--speaker-hysteresis", action=argparse.BooleanOptionalAction, default=None,
+                    help="iteration 6 (docs/DIARIZATION_PLAN.md section 9) mitigation for "
+                         "speaker-count overestimation: a newly opened global speaker displays "
+                         "under its nearest confirmed speaker's label until it has recurred "
+                         "--speaker-hysteresis-min-hits times. Default: speaker_id."
+                         "SpeakerLabeler's own default (False -- clean on the AMI meeting sweep "
+                         "but rejected after testdata/two_speakers.wav showed it can "
+                         "permanently swallow a real speaker who only speaks once, see "
+                         "speaker_id.py). Pass --speaker-hysteresis to opt in anyway; useful "
+                         "mainly for many-speaker meetings, not short 1-2 speaker sessions.")
+    ap.add_argument("--speaker-hysteresis-min-hits", type=int, default=None, metavar="N",
+                    help="hits required to confirm a provisional speaker, when "
+                         "--speaker-hysteresis. Default: speaker_id.HYSTERESIS_MIN_HITS.")
     ap.add_argument("--translate", nargs="?", const="en", default=None, metavar="LANGS",
                     help="translate Japanese lines to these languages, comma-separated "
                          "(default en). en=FuguMT; any other M2M-100 target code "
@@ -844,9 +872,23 @@ def main():
         # not "same as the fast-path threshold" -- only pass remap_threshold
         # through when --speaker-remap-threshold was actually given, so the
         # SpeakerLabeler constructor's own default applies otherwise.
-        speaker_kwargs = {}
+        # --speaker-merge is a plain store_true: its class default (False,
+        # not adopted -- see speaker_id.py section 9) is exactly what
+        # omitting the flag should give, so there's nothing to distinguish
+        # from "not passed". --speaker-hysteresis is tri-state
+        # (None/True/False) for the same reason as --speaker-remap-threshold
+        # above, even though its class default is also False (not adopted):
+        # kept tri-state so --no-speaker-hysteresis stays available to
+        # force it off explicitly if the class default ever changes.
+        speaker_kwargs = {"merge_enabled": args.speaker_merge}
+        if args.speaker_hysteresis is not None:
+            speaker_kwargs["hysteresis_enabled"] = args.speaker_hysteresis
         if args.speaker_remap_threshold is not None:
             speaker_kwargs["remap_threshold"] = args.speaker_remap_threshold
+        if args.speaker_merge_threshold is not None:
+            speaker_kwargs["merge_threshold"] = args.speaker_merge_threshold
+        if args.speaker_hysteresis_min_hits is not None:
+            speaker_kwargs["hysteresis_min_hits"] = args.speaker_hysteresis_min_hits
         speaker_labeler = SpeakerLabeler(**speaker_kwargs)
         try:
             from diarize import GroupDiarizer
@@ -911,6 +953,15 @@ def main():
         finish(SAMPLE_RATE)
     finally:
         print(f"\n=== session summary: {stats.summary()} ===")
+        if speaker_labeler is not None:
+            merges = speaker_labeler.merge_history()
+            if merges:
+                # docs/DIARIZATION_PLAN.md section 9 (design A): merges fold
+                # centroids together but don't retroactively rewrite labels
+                # already printed under the merged-away S{n} -- this table
+                # is how a reader reconciles those older lines by hand.
+                pairs = ", ".join(f"{old}->{new}" for old, new in sorted(merges.items()))
+                print(f"=== speaker merges (old->current label): {pairs} ===")
 
 
 if __name__ == "__main__":

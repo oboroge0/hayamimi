@@ -27,10 +27,77 @@ MAX_EMBED_SECONDS = 6.0  # embeddings saturate; cap input length
 # still overestimating, but the single biggest lever found so far).
 REMAP_THRESHOLD = 0.35
 
+# docs/DIARIZATION_PLAN.md section 8's "残課題" identified the fast path
+# (label(), SIM_THRESHOLD=0.45) as the root cause of the remaining
+# speaker-count overestimation: it keeps opening a fresh global centroid
+# any time one VAD segment's embedding falls short of 0.45 against every
+# existing centroid, with no mechanism to notice later that two of its
+# centroids actually belong to the same speaker (voice drift across a
+# meeting, a noisy single segment, etc.). Section 9 (iteration 6) added
+# two independent, off-by-default mitigations for that:
+#
+#   A. Periodic centroid merging (merge_enabled): at each refine-path
+#      "clean copy" boundary (Refiner._emit_turns() / eval_diar.py's
+#      generate_diarize_hypothesis(), once per closed utterance group),
+#      call maybe_merge_centroids() to fold together any two global
+#      centroids whose cosine similarity has drifted above
+#      merge_threshold. Past emitted labels are not rewritten (that would
+#      need re-sending already-printed lines -- out of scope, see
+#      docs/DIARIZATION_PLAN.md section 9), but every later label for
+#      either speaker converges on the surviving (lower-numbered) one.
+#      merge_history() exposes the old->new label map for a session
+#      summary.
+#   B. New-speaker hysteresis (hysteresis_enabled): a centroid opened by
+#      a fast-path miss starts "provisional" and is displayed under its
+#      nearest already-confirmed speaker's label instead of a brand-new
+#      S{n} until it has itself been the best match
+#      hysteresis_min_hits times (a real recurring voice, not a one-off
+#      embedding outlier). The very first speaker of a session has no
+#      confirmed speaker to fall back to, so it is confirmed immediately.
+#
+# Both are independently toggleable, and BOTH default to off as of section
+# 9 -- neither survived the full evaluation (AMI sweep + a real short
+# two-speaker recording) cleanly enough to flip on by default:
+#
+#   A rejected: docs/DIARIZATION_PLAN.md section 9's dev sweep (ES2011a,
+#   IS1008a) found merging fragile -- its effective threshold range is a
+#   knife-edge (0.55-0.60 catastrophically merged *unrelated* speakers on
+#   ES2011a, DER 49-50%; 0.65-0.75 either matched baseline exactly or
+#   barely nudged the count; IS1008a never merged anything at any
+#   threshold tried). No threshold gave a safe, reliable win.
+#
+#   B rejected: hysteresis (min_hits=2) looked promising on the AMI sweep
+#   -- it cut speaker-count overestimation on 2 of 5 meetings (IS1008a dev
+#   7->5, TS3003a test 7->5) with no DER regression anywhere in the
+#   dev+test sweep (min_hits=3 was tried too and caused a real regression
+#   on ES2004a, +6.9pp DER, for no count improvement there). But testing
+#   it against testdata/two_speakers.wav (a real, short two-speaker
+#   recording -- tests/test_diarize.py's fixture) surfaced a worse
+#   failure mode than the one it fixes: that recording's second speaker
+#   only speaks once (one ~3s segment among four), so with min_hits=2 the
+#   fast path never accumulates enough hits to confirm them -- they get
+#   permanently displayed under the *other* speaker's label instead of
+#   getting their own. For the module's stated use case ("turn-taking
+#   conversations", commonly just 1-2 speakers -- see the module
+#   docstring), silently merging a real second speaker into the first one
+#   is a worse user-facing bug than overcounting extra S{n} labels in a
+#   many-speaker meeting. See tests/test_speaker_id.py's
+#   test_hysteresis_can_swallow_a_rare_real_speaker for the reproduction.
+#
+# Both mitigations stay implemented and available (a caller who mainly
+# runs multi-speaker meetings and doesn't mind this trade-off can still
+# opt in), but neither is recommended, and speaker-count overestimation
+# in meetings remains open for a future iteration -- see
+# docs/DIARIZATION_PLAN.md section 9's "残課題".
+MERGE_THRESHOLD = 0.80
+HYSTERESIS_MIN_HITS = 2
+
 
 class SpeakerLabeler:
     def __init__(self, threads: int = 2, threshold: float = SIM_THRESHOLD,
-                 remap_threshold: float | None = REMAP_THRESHOLD):
+                 remap_threshold: float | None = REMAP_THRESHOLD,
+                 merge_enabled: bool = False, merge_threshold: float = MERGE_THRESHOLD,
+                 hysteresis_enabled: bool = False, hysteresis_min_hits: int = HYSTERESIS_MIN_HITS):
         """threshold governs the fast path (label()/match_embedding() calls
         that don't pass their own threshold -- one embedding per VAD
         segment, called often). remap_threshold governs calls that pass
@@ -52,6 +119,17 @@ class SpeakerLabeler:
         Section 8 found lowering remap_threshold alone (fast path left at
         SIM_THRESHOLD=0.45) beat lowering both thresholds together, so that
         is the default here -- see REMAP_THRESHOLD's comment above.
+
+        merge_enabled/merge_threshold and hysteresis_enabled/
+        hysteresis_min_hits are the two section-9 (iteration 6) mitigations
+        for the speaker-count overestimation left after section 8 -- see
+        the module-level comment above MERGE_THRESHOLD for what each does.
+        Both default to off: merging had a catastrophic failure mode on
+        the AMI sweep, and hysteresis -- though clean on that sweep --
+        turned out able to permanently swallow a real speaker who only
+        speaks once in a short conversation (testdata/two_speakers.wav
+        regression). Available as an opt-in for callers mainly running
+        multi-speaker meetings who accept that trade-off.
         """
         cfg = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
             model=EMBED_MODEL, num_threads=threads
@@ -61,6 +139,24 @@ class SpeakerLabeler:
         self._remap_threshold = threshold if remap_threshold is None else remap_threshold
         self._centroids: list[np.ndarray] = []  # running mean per speaker
         self._counts: list[int] = []
+
+        # --- iteration 6 (docs/DIARIZATION_PLAN.md section 9) ---
+        self._merge_enabled = merge_enabled
+        self._merge_threshold = merge_threshold
+        # index -> canonical (surviving) index, for centroids merged away by
+        # merge_centroids(). Never removed from _centroids/_counts (that
+        # would shift every later index and break already-emitted labels);
+        # instead skipped whenever match_embedding() searches for the
+        # nearest centroid, so its slot just becomes permanently unused.
+        self._alias: dict[int, int] = {}
+        self._merge_history: dict[str, str] = {}  # old S{n} -> surviving S{n}, cumulative
+
+        self._hysteresis_enabled = hysteresis_enabled
+        self._hysteresis_min_hits = hysteresis_min_hits
+        # index-aligned with _centroids/_counts; always maintained (even
+        # with hysteresis off, where every centroid is confirmed on
+        # creation) so merge_centroids() can fold this flag unconditionally.
+        self._confirmed: list[bool] = []
 
     def embed(self, samples: np.ndarray, sample_rate: int) -> np.ndarray:
         """Compute an L2-normalized CAM++ embedding for one audio buffer.
@@ -110,6 +206,8 @@ class SpeakerLabeler:
         thr = self._threshold if threshold is None else threshold
         best, best_sim = -1, -1.0
         for i, c in enumerate(self._centroids):
+            if i in self._alias:  # merged away (iteration 6); dead slot
+                continue
             sim = float(np.dot(emb, c) / (np.linalg.norm(c) + 1e-9))
             if sim > best_sim:
                 best, best_sim = i, sim
@@ -119,14 +217,125 @@ class SpeakerLabeler:
                 n = self._counts[best]
                 self._centroids[best] = (self._centroids[best] * n + emb) / (n + 1)
                 self._counts[best] = n + 1
-            return f"S{best + 1}"
+                if self._hysteresis_enabled and not self._confirmed[best]:
+                    if self._counts[best] >= self._hysteresis_min_hits:
+                        self._confirmed[best] = True
+            return self._label_for(best)
 
         if not update:
             return ""
         self._centroids.append(emb)
         self._counts.append(1)
-        return f"S{len(self._centroids)}"
+        new_idx = len(self._centroids) - 1
+        if self._hysteresis_enabled:
+            has_confirmed = any(
+                self._confirmed[i] for i in range(new_idx) if i not in self._alias
+            )
+            # No confirmed speaker yet to fall back to (typically the very
+            # first speaker of the session) -- confirm immediately instead
+            # of displaying a label that doesn't exist.
+            self._confirmed.append(not has_confirmed)
+        else:
+            self._confirmed.append(True)
+        return self._label_for(new_idx)
 
     def label(self, samples: np.ndarray, sample_rate: int) -> str:
         emb = self.embed(samples, sample_rate)
         return self.match_embedding(emb, update=True)
+
+    # --- iteration 6: new-speaker hysteresis (docs/DIARIZATION_PLAN.md section 9) ---
+
+    def _label_for(self, idx: int) -> str:
+        """Display label for global centroid `idx`.
+
+        Confirmed centroids (the normal case, and always the case with
+        hysteresis_enabled=False) get their own S{idx+1}. A provisional
+        centroid displays under its nearest already-confirmed speaker
+        instead, until enough hits promote it (see match_embedding()).
+        """
+        if not self._hysteresis_enabled or self._confirmed[idx]:
+            return f"S{idx + 1}"
+        fallback = self._nearest_confirmed(idx)
+        return f"S{fallback + 1}" if fallback is not None else f"S{idx + 1}"
+
+    def _nearest_confirmed(self, idx: int) -> int | None:
+        emb = self._centroids[idx]
+        best, best_sim = None, -1.0
+        for i, c in enumerate(self._centroids):
+            if i == idx or i in self._alias or not self._confirmed[i]:
+                continue
+            sim = float(np.dot(emb, c) / (np.linalg.norm(c) + 1e-9))
+            if sim > best_sim:
+                best, best_sim = i, sim
+        return best
+
+    # --- iteration 6: periodic centroid merging (docs/DIARIZATION_PLAN.md section 9) ---
+
+    def maybe_merge_centroids(self) -> dict[str, str]:
+        """No-op unless merge_enabled; see merge_centroids()."""
+        if not self._merge_enabled:
+            return {}
+        return self.merge_centroids()
+
+    def merge_centroids(self, threshold: float | None = None) -> dict[str, str]:
+        """Fold together any two (non-aliased) global centroids whose
+        cosine similarity is >= threshold (default self._merge_threshold).
+
+        Meant to be called at a natural "clean copy" boundary -- once per
+        closed refine group (realtime_transcribe.Refiner._emit_turns()) or
+        eval group (eval_diar.py's generate_diarize_hypothesis) -- not per
+        VAD segment, so it stays cheap (O(n^2) over the *global* speaker
+        count, which is small, not over segments).
+
+        Merging is transitive within one call (if a merges into b and the
+        resulting b then qualifies to merge into c, that happens too) and
+        always keeps the lower-numbered (earlier-created) centroid as the
+        survivor, so S1 never disappears mid-session. Returns this call's
+        {old_label: surviving_label} map; the cumulative map across all
+        calls is available via merge_history().
+        """
+        thr = self._merge_threshold if threshold is None else threshold
+        merged_map: dict[str, str] = {}
+        changed = True
+        while changed:
+            changed = False
+            roots = [i for i in range(len(self._centroids)) if i not in self._alias]
+            for a in range(len(roots)):
+                i = roots[a]
+                for b in range(a + 1, len(roots)):
+                    j = roots[b]
+                    sim = float(
+                        np.dot(self._centroids[i], self._centroids[j])
+                        / (np.linalg.norm(self._centroids[i]) * np.linalg.norm(self._centroids[j]) + 1e-9)
+                    )
+                    if sim >= thr:
+                        self._merge_into(i, j)
+                        merged_map[f"S{j + 1}"] = f"S{i + 1}"
+                        changed = True
+                        break
+                if changed:
+                    break
+        self._merge_history.update(merged_map)
+        return merged_map
+
+    def _merge_into(self, root: int, other: int) -> None:
+        n_r, n_o = self._counts[root], self._counts[other]
+        total = max(n_r + n_o, 1)
+        merged = (self._centroids[root] * n_r + self._centroids[other] * n_o) / total
+        merged /= np.linalg.norm(merged) + 1e-9
+        self._centroids[root] = merged
+        self._counts[root] = n_r + n_o
+        self._alias[other] = root
+        self._confirmed[root] = self._confirmed[root] or self._confirmed[other]
+        # Any label already pointing at `other` (via an earlier merge)
+        # should now point at `root` too, so merge_history() stays flat
+        # (old_label -> current survivor) instead of a chain callers would
+        # have to walk themselves.
+        for old, survivor in self._merge_history.items():
+            if survivor == f"S{other + 1}":
+                self._merge_history[old] = f"S{root + 1}"
+
+    def merge_history(self) -> dict[str, str]:
+        """Cumulative {old_label: surviving_label} map from every
+        merge_centroids() call so far, for a session summary."""
+        return dict(self._merge_history)
