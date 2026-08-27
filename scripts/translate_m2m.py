@@ -44,8 +44,6 @@ import os
 import sys
 import time
 
-import ctranslate2
-import sentencepiece as spm
 
 _MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "mojicast-m2m100-ct2")
 
@@ -145,6 +143,12 @@ class TranslatorM2M:
         self.model_dir = model_dir
         self._target_token = f"__{target_lang}__"
         self._beam_size = BEAM_SIZE_BY_TARGET.get(target_lang, DEFAULT_BEAM_SIZE)
+
+        # Imported lazily so vocabulary-only helpers (is_supported_target)
+        # work in environments without the translation runtime installed
+        # (e.g. minimal CI).
+        import ctranslate2
+        import sentencepiece as spm
 
         sp_path = os.path.join(model_dir, "sentencepiece.model")
         self._sp = spm.SentencePieceProcessor(model_file=sp_path)
