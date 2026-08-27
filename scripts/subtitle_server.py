@@ -72,7 +72,7 @@ DASHBOARD_HTML = '<!doctype html>\n<html lang="ja">\n<meta charset="utf-8">\n<me
 
 
 def _with_line_bound_translations(html: str) -> str:
-    """Bind async translation events to their originating final card.
+    """Render translations beside their originating final or refined text.
 
     DASHBOARD_HTML is intentionally stored as one compact literal above, so
     keep the small behavior patch readable here instead of duplicating the
@@ -100,6 +100,26 @@ def _with_line_bound_translations(html: str) -> str:
         (
             "      lastCard.appendChild(tr); stick(feed);\n",
             "      sourceCard.appendChild(tr); stick(feed);\n",
+        ),
+        (
+            "  .refine-p .meta i { font-style: normal; color: var(--shu); }\n",
+            "  .refine-p .meta i { font-style: normal; color: var(--shu); }\n"
+            "  .refine-trans { display: block; margin-top: .35rem; font-family: \"Zen Kaku Gothic New\", sans-serif;\n"
+            "    font-size: .86rem; font-weight: 400; line-height: 1.55; color: var(--paper-dim); }\n"
+            "  .refine-trans b { font-family: var(--mono); font-size: .6rem; color: var(--shu);\n"
+            "    margin-right: .45em; letter-spacing: .1em; }\n",
+        ),
+        (
+            "      p.appendChild(meta); p.appendChild(document.createTextNode(ev.text));\n"
+            "      refined.appendChild(p); stick(refined);\n",
+            "      p.appendChild(meta); p.appendChild(document.createTextNode(ev.text));\n"
+            "      (ev.translations || []).forEach(item => {\n"
+            "        const tr = document.createElement(\"span\"); tr.className = \"refine-trans\";\n"
+            "        const b = document.createElement(\"b\"); b.textContent = \"→\" + item.lang;\n"
+            "        tr.appendChild(b); tr.appendChild(document.createTextNode(item.text));\n"
+            "        p.appendChild(tr);\n"
+            "      });\n"
+            "      refined.appendChild(p); stick(refined);\n",
         ),
     )
     for old, new in replacements:

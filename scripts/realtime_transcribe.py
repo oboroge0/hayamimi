@@ -427,9 +427,6 @@ class Refiner:
                     return
                 tag = f"{speaker}|{lang}" if speaker else lang
                 print(f"[refine/{tag}] {text}")
-                if self.printer.server is not None:
-                    self.printer.server.publish({"type": "refine", "text": text, "lang": lang,
-                                                 "speaker": speaker})
                 outs = []
                 if self.translators:
                     # synchronous here (we're already off the hot path) so the
@@ -441,6 +438,14 @@ class Refiner:
                         if out and out != text:
                             print(f"[refine→{tlang}] {out}")
                             outs.append((tlang, out))
+                if self.printer.server is not None:
+                    self.printer.server.publish({
+                        "type": "refine", "text": text, "lang": lang,
+                        "speaker": speaker,
+                        "translations": [
+                            {"lang": tlang, "text": out} for tlang, out in outs
+                        ],
+                    })
                 if self._transcript is not None:
                     prefix = f"{speaker}: " if speaker else ""
                     self._transcript.write(prefix + text + "\n")

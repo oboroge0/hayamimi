@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from realtime_transcribe import (AudioHistory, PREROLL_S, digits_consistent,
                                  build_arg_parser, build_translators,
                                  parse_translation_targets, translate_by_sentence,
-                                 TranslationWorker, translators_for_source)
+                                 Refiner, TranslationWorker, translators_for_source)
 from subtitle_server import DASHBOARD_HTML, SubtitleServer
 from translate_m2m import TranslatorM2M
 import asr_engine
@@ -145,6 +145,8 @@ def test_m2m_english_to_japanese_uses_language_tokens():
 def test_dashboard_and_final_events_bind_translation_by_line_id():
     assert "cardsById.set(ev.line_id, card)" in DASHBOARD_HTML
     assert "cardsById.get(ev.line_id)" in DASHBOARD_HTML
+    assert "(ev.translations || []).forEach" in DASHBOARD_HTML
+    assert 'tr.className = "refine-trans"' in DASHBOARD_HTML
     server = SubtitleServer()
     q = server.subscribe()
     server.final("Hello", lang="en", line_id="final-7")
@@ -173,6 +175,35 @@ def test_translation_worker_filters_source_and_preserves_line_id():
     assert server.events == [{
         "type": "translation", "lang": "ja", "text": "こんにちは",
         "source_lang": "en", "line_id": "final-9",
+    }]
+
+
+def test_refiner_publishes_source_and_local_translation_together():
+    class FakeASR:
+        def transcribe(self, samples, sample_rate, known_lang=None, live=False):
+            return {"text": "Hello world."}
+
+    class RecordingServer:
+        def __init__(self):
+            self.events = []
+
+        def publish(self, event):
+            self.events.append(event)
+
+    server = RecordingServer()
+    printer = types.SimpleNamespace(server=server)
+    history = types.SimpleNamespace(buf=np.zeros(20, dtype=np.float32), offset=0)
+    translator = FakeTranslator({"Hello world.": "こんにちは世界。"})
+    translator.source_lang = "en"
+    refiner = Refiner(FakeASR(), history, sample_rate=10, printer=printer,
+                      translators={"ja": translator})
+    refiner.spans = [(0, 10, "en", "Hello world.", "S1")]
+
+    refiner.maybe_refine(now_sample=10, force=True)
+
+    assert server.events == [{
+        "type": "refine", "text": "Hello world.", "lang": "en", "speaker": "S1",
+        "translations": [{"lang": "ja", "text": "こんにちは世界。"}],
     }]
 
 

@@ -47,7 +47,7 @@ same clips, while running at 10-50x realtime on a 6-core desktop CPU.
 - **`http://localhost:8833/dashboard`** -- the live dashboard: a partial-text
   strip for in-progress speech, a finals feed with language badges, speaker
   chips, and per-line latency, inline translations under each line, and a
-  second column with the refined (two-pass) transcript as it lands.
+  second column with the refined (two-pass) transcript and its translations as they land.
 - **`http://localhost:8833/`** -- a minimal OBS browser-source overlay
   (add this URL as a Browser Source in OBS for stream captions).
 - **`http://localhost:8833/transcript`** -- plain scrolling transcript
