@@ -35,14 +35,18 @@ OVERLAY_HTML = """<!doctype html>
   const es = new EventSource("/events");
   es.onmessage = (e) => {
     const ev = JSON.parse(e.data);
+    // Any message -- partial included -- means the session is still live,
+    // so postpone clearing the confirmed line: a run of partials right
+    // after a final (the speaker keeps talking) must not let the 6s timer
+    // wipe the final out from under them.
+    if (clearTimer) { clearTimeout(clearTimer); clearTimer = null; }
     if (ev.type === "partial") {
       par.textContent = ev.text;
     } else if (ev.type === "final") {
-      if (clearTimer) { clearTimeout(clearTimer); clearTimer = null; }
       fin.textContent = ev.text;
       par.textContent = "";
-      clearTimer = setTimeout(() => { fin.textContent = ""; }, 6000);
     }
+    clearTimer = setTimeout(() => { fin.textContent = ""; }, 6000);
   };
 </script>
 """
