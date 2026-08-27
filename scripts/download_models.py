@@ -34,6 +34,7 @@ GITHUB_RELEASES = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
 ASR_TAG = "asr-models"
 # Yes, "recongition" -- that's the actual (misspelled) tag name upstream.
 SPEAKER_TAG = "speaker-recongition-models"
+SEGMENTATION_TAG = "speaker-segmentation-models"
 HF_RESOLVE = "https://huggingface.co/{repo}/resolve/main/{path}"
 
 
@@ -229,6 +230,18 @@ def main():
         f"{GITHUB_RELEASES}/{SPEAKER_TAG}/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
         os.path.join(MODELS_DIR, "campplus_sv.onnx"),
         "CAM++ speaker embedding (--speakers)")
+
+    # pyannote segmentation-3.0 (MIT license, ~6.6MB compressed -- much smaller
+    # than campplus_sv.onnx above): speaker-change/voice-activity detection
+    # for the --speakers refine-pass re-diarization (scripts/diarize.py's
+    # GroupDiarizer). Only used when --speakers is on; realtime_transcribe.py
+    # degrades gracefully to fast-path-only labeling (majority-vote per
+    # refine group, no per-turn split) if this directory is missing, so it's
+    # not fatal to skip. See docs/DIARIZATION_PLAN.md sections 2-3 and 7-8.
+    download_and_extract_tarbz2(
+        f"{GITHUB_RELEASES}/{SEGMENTATION_TAG}/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2",
+        "sherpa-onnx-pyannote-segmentation-3-0",
+        "pyannote segmentation-3.0 (speaker-turn detection for --speakers refine pass)")
 
     download_hf_repo(
         "ishiki-emo/mojicast-m2m100-ct2",

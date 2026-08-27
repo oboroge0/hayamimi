@@ -32,7 +32,7 @@ same clips, while running at 10-50x realtime on a 6-core desktop CPU.
 | Partial subtitles | in-progress draft text updates every ~0.5s while you're still speaking |
 | Fast finals | a finalized line typically lands ~100ms after you stop talking (ja; see `docs/GOALS.md` for other languages) |
 | Two-pass refinement | after 2s of silence, recent utterances are batch re-decoded for a higher-accuracy "clean" transcript (ja real-broadcast CER 15.5% -> 12.0%) |
-| Speaker labels | `--speakers` tags each utterance S1/S2/... using CAM++ speaker embeddings (turn-taking, not full diarization) |
+| Speaker labels | `--speakers` tags each utterance S1/S2/... live via CAM++ nearest-centroid matching, then the refine pass re-diarizes each group with pyannote segmentation-3.0 and remaps clusters onto the same S{n} labels (mean DER 25.7% -> 13.9% on 5 AMI meetings, see Limitations) |
 | Translation | `--translate en,zh,ko,es,...` translates Japanese lines live (en via FuguMT; any other M2M-100 target code is accepted if the model's vocabulary supports it -- zh/ko/es have measured quality, see docs/TRANSLATE_M2M.md) |
 | Hotwords / user dictionary | `--hotwords` biases decoding toward proper nouns (currently has no effect on the ja tier -- see Limitations); `--replace` does post-hoc find/replace and works everywhere |
 | OBS overlay + dashboard | `--serve` starts a local HTTP server with a browser-source overlay and a live dashboard |
@@ -246,10 +246,22 @@ Headline numbers from that log:
   for ja proper nouns instead. A real fix needs either a matching
   `bpe.model` for the ReazonSpeech release (not currently shipped) or a
   from-scratch byte-BPE hotword encoder -- tracked as future work.
-- **Two overlapping speakers are not separated.** `--speakers` does
-  turn-taking speaker labeling (one embedding per finalized VAD segment,
-  nearest-centroid assignment), not true diarization -- simultaneous speech
-  gets one label.
+- **Two overlapping speakers are not separated**, even after the refine
+  pass -- pyannote segmentation-3.0 can flag overlap regions, but hayamimi
+  doesn't do overlap-aware transcription (whichever speaker's turn is
+  processed first wins). What the refine pass *does* do now: instead of
+  a plain majority vote across a group's live-pass labels, each finalized
+  group (silence gap or 25s length) is re-diarized with pyannote
+  segmentation-3.0 + the same CAM++ embeddings `--speakers`'s live pass
+  uses, and the resulting local clusters are remapped onto the session's
+  global S{n} labels -- so a group containing several speaker turns keeps
+  a separate `[refine/S{n}]` line per turn instead of collapsing to one.
+  Measured on 5 AMI meetings (50 min total, CC BY 4.0, collar 0.25s; see
+  `docs/DIARIZATION_PLAN.md` section 8), this cut mean DER from 25.7%
+  (live-pass-only labeling) to 13.9%. Reference speaker count is 4 per
+  meeting; hayamimi's hypothesis still overestimates it (4-8 speakers),
+  so `--speakers` should be read as good-enough turn labeling, not a
+  reliable speaker-count source.
 - **Translation quality has a real ceiling**, not just a tuning one.
   FuguMT (ja->en) and M2M-100 (ja->zh/ko) are small models; repetition loops
   are suppressed but not eliminated, and numeric values are not reliably
