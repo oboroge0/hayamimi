@@ -43,6 +43,11 @@ SemaphoreHandle_t displayMutex; // guards canvas draw + push
 
 volatile bool wsConnected = false;
 volatile bool handshakeSent = false;
+// Set by webSocketEvent(WStype_CONNECTED) (called synchronously from inside
+// webSocket.loop(), i.e. while loop() already holds wsMutex) and consumed by
+// loop() itself, once wsMutex has been released. See sendHandshake() for why
+// the handshake can't be sent directly from the event callback.
+volatile bool needHandshake = false;
 
 M5Canvas canvas(&M5.Display);
 
@@ -110,6 +115,12 @@ void handleEventJson(const uint8_t *payload, size_t len) {
   // other event types (e.g. session_start) are ignored
 }
 
+// IMPORTANT: never call this from inside webSocketEvent() (or anywhere else
+// that may already hold wsMutex). webSocketEvent() is invoked synchronously
+// from within webSocket.loop(), which loop() calls while holding wsMutex;
+// since wsMutex is a plain (non-recursive) mutex, taking it again here would
+// deadlock loop() forever. Callers must already hold wsMutex, or -- as
+// loop() does -- call this only after releasing it.
 void sendHandshake() {
   JsonDocument doc;
   doc["sr"] = SAMPLE_RATE;
@@ -126,12 +137,17 @@ void sendHandshake() {
 }
 
 void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
+  // NOTE: this callback fires synchronously from inside webSocket.loop(),
+  // which loop() calls while holding wsMutex. Never take wsMutex from here
+  // (directly or via a function like sendHandshake()) -- it would deadlock
+  // against loop(). Defer any such work with a flag that loop() polls after
+  // releasing wsMutex (see needHandshake below).
   switch (type) {
     case WStype_CONNECTED:
       wsConnected = true;
       handshakeSent = false;
+      needHandshake = true;
       setStatus("ws connected, handshaking...");
-      sendHandshake();
       break;
     case WStype_DISCONNECTED:
       wsConnected = false;
@@ -227,6 +243,14 @@ void loop() {
   if (xSemaphoreTake(wsMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     webSocket.loop();
     xSemaphoreGive(wsMutex);
+  }
+
+  // Handled here, after releasing wsMutex, because webSocketEvent() may have
+  // set this from inside the webSocket.loop() call above while wsMutex was
+  // still held -- see the comment on sendHandshake().
+  if (needHandshake) {
+    needHandshake = false;
+    sendHandshake();
   }
 
   delay(2);
