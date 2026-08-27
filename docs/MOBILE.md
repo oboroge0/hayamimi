@@ -296,34 +296,108 @@ PC numbers are not a stand-in for ARM timing — only the size and
 "does the graph still restore punctuation correctly" checks transfer with
 confidence; RTF/latency needs re-measurement on-device.
 
-### Verdict: PASS — candidate for mobile deployment
+### Provisional verdict on the 15-clip sample (superseded below)
 
-Both the size win (75% smaller, 363.5MB → 91.4MB) and the accuracy check
-(no measurable degradation vs fp32 on this sample; int8 was in fact
-marginally better) support using the self-quantized INT8 punctuation model
-for the phone-deployable ("スマホ搭載完全版") profile, replacing the
-currently-mandatory fp32 file. Recommended before shipping:
-- Re-verify on a larger/more diverse ja reference set (15 short TV-news
-  sentences is a thin sample, same caveat as the ASR CER above).
-- Re-measure latency on an actual ARM device (Android emulator load +
-  accuracy parity check, following the same procedure as "On-emulator
-  accuracy parity" above, is the natural next step since text-only
-  scoring doesn't need audio pushed to the device).
-- Wire the int8 path into `PunctuatorJa` as a selectable/default option
-  (currently `onnx_filename` must be passed explicitly; `scripts/punct_ja.py`
-  still defaults to fp32) once a decision is made to ship it.
+On the original 15-reference `testdata/eval_real` sample, both the size win
+(75% smaller, 363.5MB → 91.4MB) and the accuracy check (no measurable
+degradation vs fp32; int8 was in fact marginally better) looked like a
+candidate for replacing the mandatory fp32 file on the phone-deployable
+profile. That write-up flagged the obvious risk in its own "recommended
+before shipping" list: *"Re-verify on a larger/more diverse ja reference
+set (15 short TV-news sentences is a thin sample)"* — see "Large-scale
+re-verification" immediately below, which did exactly that and reversed
+the call.
+
+### Large-scale re-verification (FLEURS ja, n=250) — REGRESSION FOUND, default stays fp32
+
+The 15-clip sample above was drawn entirely from TV-news captions
+(`testdata/eval_real`) — a narrow domain and a thin sample for a
+pass/fail accuracy call. This step re-ran the same fp32-vs-int8 comparison
+on a much larger and differently-sourced set: **250 ja sentences sampled
+from FLEURS (`google/fleurs`, `ja_jp` config, `validation`+`test` splits,
+456-sentence combined pool after de-duplication)**, using
+`raw_transcription`, which already carries natural `、`/`。`/`？`
+punctuation — read out loud for the FLEURS speech corpus, so a different
+register (formal/written-style, encyclopedic and news-wire sentences)
+than the eval_real TV captions. Sentences were fetched via the same
+column-projected remote-parquet technique `scripts/eval_translate.py`
+uses (`fsspec` + `pyarrow`, `id`+`raw_transcription` columns only, no
+audio), filtered to sentences containing at least one target mark and
+under 450 characters, then length-decile-stratified sampled (seed 0) so
+the set isn't skewed toward the shorter sentences that dominate the raw
+pool (25 sentences from each of 10 length buckets covering the full
+21–137 character range, median 52 chars). Implemented in
+`scripts/quantize_punct.py::build_fleurs_refs`, invoked with
+`--source fleurs --n 250`. Scoring method (punct-position F1, punct-
+inclusive CER) is unchanged from the 15-clip method above; latency is now
+also measured per this run (`--latency`).
+
+**Pre-declared pass criterion** (stated before running the larger eval):
+int8 F1 within **−0.02** of fp32 F1 → promote int8 to the `PunctuatorJa`
+default (fp32 kept as an explicit opt-in). Worse than that → fail, default
+stays fp32.
+
+| variant | n | precision | recall | F1 | punct-inclusive CER | mean latency |
+|---|---|---|---|---|---|---|
+| fp32 | 250 | 0.8724 | 0.4831 | 0.6218 | 2.81% | 41.04 ms |
+| int8 (ours) | 250 | 0.9638 | 0.3757 | 0.5407 | 3.25% | 22.94 ms |
+
+**int8 F1 − fp32 F1 = −0.0812 → FAILS the −0.02 threshold.** The direction
+of the earlier 15-clip result (int8 ≥ fp32) does **not** hold at this
+sample size/domain — it reverses hard. The mechanism is visible in
+precision vs. recall: int8's precision is *higher* than fp32's (0.964 vs
+0.872 — it makes fewer wrong-mark insertions), but its recall collapses
+(0.376 vs 0.483 — it misses far more of the marks that should be there).
+On the 15 short TV-caption clips, fp32's few extra false positives were
+enough to make int8 look at least as good; on 250 longer, more varied
+FLEURS sentences, int8's systematic under-prediction of commas/periods
+dominates and drags F1 well past the pre-declared tolerance. Read together
+with the ASR-side result above (INT8 quantization landed within noise on
+the zipformer transducer, CER ±0.34pp on 15 clips), this is a reminder
+that a 15-clip sample genuinely wasn't enough to catch a real regression
+in this BERT-char model — the earlier "no regression, marginally better"
+conclusion for punctuation specifically should be treated as retracted by
+this larger run, not as a second confirming data point.
+
+Latency did hold up in the same direction as before (int8 ~1.8x faster,
+22.94ms vs 41.04ms mean `restore()` call on this PC/CPU) — the speed
+benefit from quantizing this model is real and reproduces at scale; it's
+the accuracy side that didn't survive a bigger, more diverse sample.
+
+### Verdict: FAIL — int8 does not replace fp32 as the default
+
+`scripts/punct_ja.py`'s `PunctuatorJa` **keeps fp32 (`punct_bert.onnx`) as
+the default**, unchanged. The self-quantized int8 file remains available
+as an explicit opt-in (`onnx_filename="quantized_ort/punct_bert.int8.onnx"`)
+for callers who value the ~4x size reduction and ~1.8x speedup enough to
+accept a real, now-measured recall/F1 hit on punctuation restoration — it
+is not a drop-in accuracy-neutral replacement. If this is revisited later:
+- The recall gap (int8 misses marks fp32 catches) is the thing to dig
+  into first — e.g. per-mark-type breakdown (comma vs period vs question)
+  or a lower comma/period decision threshold for the int8 variant
+  specifically, rather than assuming dynamic INT8 is a dead end for this
+  model altogether.
+- Static/calibrated quantization (as opposed to the dynamic quantization
+  used here) is the natural next experiment, same as noted for the ASR
+  encoder in "Next steps" below.
+- Latency/size still need on-ARM-device confirmation regardless of which
+  variant ships, same caveat as everywhere else in this document.
 
 ### Reproduce
 
 ```
 H:\Programming\hayamimi\.venv\Scripts\python.exe scripts\quantize_punct.py
+H:\Programming\hayamimi\.venv\Scripts\python.exe scripts\quantize_punct.py --skip-quantize --source fleurs --n 250 --latency
 ```
 
-Writes the quantized model under
+The first command (re)quantizes and evaluates on the 15-clip `eval_real`
+sample (`--source eval_real`, the default). The second re-evaluates an
+already-produced int8 file against the larger 250-sentence FLEURS set used
+above (`--source fleurs`); pass `--seed` to resample differently. Writes
+the quantized model under
 `models/mojicast-punct-onnx/quantized_ort/punct_bert.int8.onnx` (not
-committed) and a `scratch_quantize_punct_results.json` summary at repo root
-(also not committed, scratch artifact). Pass `--skip-quantize` to re-run
-just the evaluation against an already-produced int8 file.
+committed) and a `scratch_quantize_punct_results_<source>.json` summary at
+repo root per source (also not committed, scratch artifacts).
 
 ## Multi-language routing on mobile
 
