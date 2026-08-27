@@ -1,4 +1,4 @@
-"""Japanese -> multilingual (zh / ko / en) subtitle translation module.
+"""Japanese -> multilingual (zh / ko / en / es) subtitle translation module.
 
 Uses M2M-100 418M (facebook/m2m100_418M), converted to CTranslate2 int8 by
 the Mojicast project (ishiki-emo/mojicast-m2m100-ct2, MIT license).
@@ -44,6 +44,7 @@ BEAM_SIZE_BY_TARGET = {
     "zh": 1,
     "ko": 4,
     "en": 1,
+    "es": 1,
 }
 # NOTE: Mojicast's report says no_repeat_ngram_size=3 "eliminated" repetition
 # loops for their conversion. Re-measured here on filler-heavy casual lines

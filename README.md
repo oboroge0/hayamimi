@@ -33,7 +33,7 @@ same clips, while running at 10-50x realtime on a 6-core desktop CPU.
 | Fast finals | a finalized line typically lands ~100ms after you stop talking (ja; see `docs/GOALS.md` for other languages) |
 | Two-pass refinement | after 2s of silence, recent utterances are batch re-decoded for a higher-accuracy "clean" transcript (ja real-broadcast CER 15.5% -> 12.0%) |
 | Speaker labels | `--speakers` tags each utterance S1/S2/... using CAM++ speaker embeddings (turn-taking, not full diarization) |
-| Translation | `--translate en,zh,ko` translates Japanese lines live (en via FuguMT, zh/ko via M2M-100) |
+| Translation | `--translate en,zh,ko,es` translates Japanese lines live (en via FuguMT, zh/ko/es via M2M-100) |
 | Hotwords / user dictionary | `--hotwords` biases decoding toward proper nouns (currently has no effect on the ja tier -- see Limitations); `--replace` does post-hoc find/replace and works everywhere |
 | OBS overlay + dashboard | `--serve` starts a local HTTP server with a browser-source overlay and a live dashboard |
 | Network audio input | `--input ws` accepts mic audio over a WebSocket (phone, ESP32/stackchan) and feeds it through the same pipeline, including `--serve`'s dashboard/overlay |
@@ -134,7 +134,7 @@ All flags are on `scripts/realtime_transcribe.py`:
 | `--lang-switch-guard SEC` | 2.0 | treat a new-language detection shorter than this as noise: it can never count toward confirming a switch (see `--lid-switch-confirm`) and it suppresses the omnilingual fallback on an empty decode (`0` disables) |
 | `--lid-switch-confirm N` | 2 | consecutive new-language detections (each >= `--lang-switch-guard` long) required before the session actually switches language; raise for stickier single-language sessions |
 | `--speakers` | off | label utterances with speaker ids (S1, S2, ...) |
-| `--translate [LANGS]` | off, `en` | translate Japanese lines to these comma-separated languages (`en`/`zh`/`ko`) |
+| `--translate [LANGS]` | off, `en` | translate Japanese lines to these comma-separated languages (`en`/`zh`/`ko`/`es`) |
 
 ## Architecture
 
@@ -256,7 +256,7 @@ license (`THIRD_PARTY_NOTICES.md` has the full table).
 **CC BY-SA 4.0 (share-alike)**. If you redistribute that model's weights,
 you must keep attribution and license any redistribution under CC BY-SA 4.0
 too. This does not affect hayamimi's own code license, and does not affect
-`--translate zh,ko` (M2M-100, MIT).
+`--translate zh,ko,es` (M2M-100, MIT).
 
 ## Credits
 
