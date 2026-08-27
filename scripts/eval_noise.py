@@ -37,7 +37,6 @@ Usage:
     python scripts/eval_noise.py --root H:\\Programming\\hayamimi --denoise --noise babble
 """
 import argparse
-import json
 import os
 import sys
 import time
@@ -49,6 +48,8 @@ import soundfile as sf
 
 from asr_engine import RoutedASR
 from eval_accuracy import cer_ja, wer_en
+from eval_common import load_manifest
+import eval_common
 
 WORKTREE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCS_PATH = os.path.join(WORKTREE_ROOT, "docs", "NOISE.md")
@@ -75,22 +76,15 @@ def score(lang: str, ref: str, hyp: str) -> float:
 
 
 def cache_path(root: str) -> str:
-    return os.path.join(root, "testdata", "_noise_eval_cache.json")
+    return eval_common.cache_path(root, "_noise_eval_cache.json")
 
 
 def load_cache(root: str) -> dict:
-    p = cache_path(root)
-    if os.path.exists(p):
-        with open(p, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    return eval_common.load_cache(cache_path(root))
 
 
 def save_cache(root: str, cache: dict):
-    p = cache_path(root)
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
+    eval_common.save_cache(cache_path(root), cache)
 
 
 def condition_dir(root: str, noise: str, snr) -> str:
@@ -128,8 +122,7 @@ def eval_manifest_dir(asr: RoutedASR, mdir: str, denoiser=None):
     return a list of per-clip result rows. If denoiser is given, each clip
     is denoised (GTCRN) first; the denoiser's own time is tracked separately
     as denoise_rtf, and rtf covers denoise+decode combined."""
-    with open(os.path.join(mdir, "manifest.json"), encoding="utf-8") as f:
-        entries = json.load(f)
+    entries = load_manifest(mdir)
     rows = []
     prev_lang = None
     for e in entries:

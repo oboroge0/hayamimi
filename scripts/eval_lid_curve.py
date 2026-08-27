@@ -26,7 +26,6 @@ Usage:
     python scripts/eval_lid_curve.py --root H:\\Programming\\hayamimi --report
 """
 import argparse
-import json
 import os
 import sys
 import time
@@ -37,6 +36,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import soundfile as sf
 
 from asr_engine import RoutedASR
+from eval_common import load_manifest
+import eval_common
 
 WORKTREE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCS_PATH = os.path.join(WORKTREE_ROOT, "docs", "LID.md")
@@ -54,22 +55,15 @@ BIN_SECONDS = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0]
 
 
 def cache_path(root: str) -> str:
-    return os.path.join(root, "testdata", "_lid_curve_cache.json")
+    return eval_common.cache_path(root, "_lid_curve_cache.json")
 
 
 def load_cache(root: str) -> dict:
-    p = cache_path(root)
-    if os.path.exists(p):
-        with open(p, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    return eval_common.load_cache(cache_path(root))
 
 
 def save_cache(root: str, cache: dict):
-    p = cache_path(root)
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
+    eval_common.save_cache(cache_path(root), cache)
 
 
 def load_clips(root: str, dirs: list) -> list:
@@ -77,8 +71,7 @@ def load_clips(root: str, dirs: list) -> list:
     clips = []
     for rel in dirs:
         mdir = os.path.join(root, rel)
-        with open(os.path.join(mdir, "manifest.json"), encoding="utf-8") as f:
-            entries = json.load(f)
+        entries = load_manifest(mdir)
         for e in entries:
             clips.append((rel, e["wav"], os.path.join(mdir, e["wav"]), e["lang"]))
     return clips

@@ -10,7 +10,6 @@ forced), this measures what the engine actually does, misroutes included.
 Usage:
     python scripts/eval_engine.py
 """
-import json
 import os
 import sys
 import time
@@ -22,6 +21,7 @@ import soundfile as sf
 
 from asr_engine import RoutedASR
 from eval_accuracy import cer_ja, wer_en
+from eval_common import load_manifest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCS_PATH = os.path.join(ROOT, "docs", "SCORECARD.md")
@@ -63,22 +63,21 @@ def main():
         # manifest's last clip happened to end on. Same convention as
         # eval_noise.py's per-language-block reset.
         asr.reset_session()
-        with open(os.path.join(mdir, "manifest.json"), encoding="utf-8") as f:
-            for e in json.load(f):
-                samples, sr = sf.read(os.path.join(mdir, e["wav"]), dtype="float32")
-                if samples.ndim > 1:
-                    samples = samples.mean(axis=1)
-                dur = len(samples) / sr
-                t0 = time.perf_counter()
-                r = asr.transcribe(samples, sr)  # LID included: the real path
-                wall = time.perf_counter() - t0
-                rows.append({
-                    "wav": e["wav"], "lang": e["lang"], "detected": r["lang"],
-                    "tier": r["tier"], "err": score(e["lang"], e["ref"], r["text"]),
-                    "rtf": wall / dur, "dur": dur,
-                })
-                print(f"{e['wav']:16} true={e['lang']:3} lid={r['lang']:3} tier={r['tier']:4} "
-                      f"err={rows[-1]['err']:.3f} rtf={rows[-1]['rtf']:.3f}")
+        for e in load_manifest(mdir):
+            samples, sr = sf.read(os.path.join(mdir, e["wav"]), dtype="float32")
+            if samples.ndim > 1:
+                samples = samples.mean(axis=1)
+            dur = len(samples) / sr
+            t0 = time.perf_counter()
+            r = asr.transcribe(samples, sr)  # LID included: the real path
+            wall = time.perf_counter() - t0
+            rows.append({
+                "wav": e["wav"], "lang": e["lang"], "detected": r["lang"],
+                "tier": r["tier"], "err": score(e["lang"], e["ref"], r["text"]),
+                "rtf": wall / dur, "dur": dur,
+            })
+            print(f"{e['wav']:16} true={e['lang']:3} lid={r['lang']:3} tier={r['tier']:4} "
+                  f"err={rows[-1]['err']:.3f} rtf={rows[-1]['rtf']:.3f}")
 
     lines = ["# Engine Scorecard (end-to-end, real speech)\n",
              "本番経路 (LID→ルーティング→デコード→ja句読点) のエンドツーエンド採点。",

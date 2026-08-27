@@ -15,7 +15,6 @@ Usage:
     python scripts/eval_singing.py [--root H:\\path\\to\\hayamimi]
 """
 import argparse
-import json
 import os
 import sys
 import time
@@ -27,6 +26,7 @@ import soundfile as sf
 
 from asr_engine import RoutedASR
 from eval_accuracy import cer_ja, wer_en, normalize_ja, levenshtein
+from eval_common import load_manifest
 
 DEFAULT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -60,27 +60,26 @@ def score(lang: str, ref: str, hyp: str) -> float:
 
 def run_manifest(asr, mdir):
     rows = []
-    with open(os.path.join(mdir, "manifest.json"), encoding="utf-8") as f:
-        for e in json.load(f):
-            # Each clip is an independent recording; don't let sticky-LID
-            # hysteresis carry language state across clips.
-            if hasattr(asr, "reset_session"):
-                asr.reset_session()
-            samples, sr = sf.read(os.path.join(mdir, e["wav"]), dtype="float32")
-            if samples.ndim > 1:
-                samples = samples.mean(axis=1)
-            dur = len(samples) / sr
-            t0 = time.perf_counter()
-            r = asr.transcribe(samples, sr)
-            wall = time.perf_counter() - t0
-            rows.append({
-                "wav": e["wav"], "lang": e["lang"], "detected": r["lang"],
-                "tier": r["tier"], "err": score(e["lang"], e["ref"], r["text"]),
-                "rtf": wall / dur, "dur": dur, "hyp": r["text"], "ref": e["ref"],
-            })
-            print(f"{os.path.basename(mdir):24} {e['wav']:12} true={e['lang']:3} "
-                  f"lid={r['lang']:3} tier={r['tier']:4} err={rows[-1]['err']:.3f} "
-                  f"rtf={rows[-1]['rtf']:.3f}")
+    for e in load_manifest(mdir):
+        # Each clip is an independent recording; don't let sticky-LID
+        # hysteresis carry language state across clips.
+        if hasattr(asr, "reset_session"):
+            asr.reset_session()
+        samples, sr = sf.read(os.path.join(mdir, e["wav"]), dtype="float32")
+        if samples.ndim > 1:
+            samples = samples.mean(axis=1)
+        dur = len(samples) / sr
+        t0 = time.perf_counter()
+        r = asr.transcribe(samples, sr)
+        wall = time.perf_counter() - t0
+        rows.append({
+            "wav": e["wav"], "lang": e["lang"], "detected": r["lang"],
+            "tier": r["tier"], "err": score(e["lang"], e["ref"], r["text"]),
+            "rtf": wall / dur, "dur": dur, "hyp": r["text"], "ref": e["ref"],
+        })
+        print(f"{os.path.basename(mdir):24} {e['wav']:12} true={e['lang']:3} "
+              f"lid={r['lang']:3} tier={r['tier']:4} err={rows[-1]['err']:.3f} "
+              f"rtf={rows[-1]['rtf']:.3f}")
     return rows
 
 
