@@ -84,6 +84,97 @@ void main() {
       expect(buffer.drainFrames(), isEmpty);
       expect(buffer.pendingSampleCount, 1);
     });
+
+    test(
+      'ring boundary: repeated small add/drain cycles past the initial '
+      'capacity keep frame contents and order correct',
+      () {
+        // frameSize 4 * initial capacity factor 8 = 32-sample backing
+        // array; looping well past that forces both the "compact toward
+        // offset 0" and "grow" paths of the ring buffer.
+        final buffer = PcmFrameBuffer(frameSize: 4);
+        var nextValue = 1.0;
+        final allFrames = <Float32List>[];
+
+        for (var cycle = 0; cycle < 20; cycle++) {
+          // Push 3 samples (not a full frame), then 1 more to complete it --
+          // exercises the carry-over-then-complete boundary every cycle.
+          final threeSamples = Float32List.fromList([
+            nextValue,
+            nextValue + 1,
+            nextValue + 2,
+          ]);
+          buffer.add(threeSamples);
+          expect(buffer.drainFrames(), isEmpty);
+          expect(buffer.pendingSampleCount, 3);
+
+          buffer.add(Float32List.fromList([nextValue + 3]));
+          final frames = buffer.drainFrames();
+          expect(frames, hasLength(1));
+          expect(buffer.pendingSampleCount, 0);
+          allFrames.add(frames.single);
+          nextValue += 4;
+        }
+
+        for (var i = 0; i < allFrames.length; i++) {
+          final base = 1.0 + i * 4;
+          expect(
+            allFrames[i],
+            Float32List.fromList([base, base + 1, base + 2, base + 3]),
+          );
+        }
+      },
+    );
+
+    test('a chunk far larger than the backing array grows it correctly', () {
+      final buffer = PcmFrameBuffer(frameSize: 4);
+      // Initial capacity is 4 * 8 = 32 samples; push well past that in one
+      // call to force the doubling-grow path (not just compaction).
+      final bigChunk = Float32List.fromList(
+        List.generate(100, (i) => i.toDouble()),
+      );
+      buffer.add(bigChunk);
+
+      final frames = buffer.drainFrames();
+      expect(frames, hasLength(25));
+      for (var i = 0; i < frames.length; i++) {
+        final base = (i * 4).toDouble();
+        expect(
+          frames[i],
+          Float32List.fromList([base, base + 1, base + 2, base + 3]),
+        );
+      }
+      expect(buffer.pendingSampleCount, 0);
+    });
+
+    test('interleaved adds and partial drains preserve order across growth', () {
+      final buffer = PcmFrameBuffer(frameSize: 5);
+      final produced = <double>[];
+      final consumed = <double>[];
+      var counter = 0.0;
+
+      for (var i = 0; i < 15; i++) {
+        // Alternate small and large chunks to hit both the compact and
+        // grow branches of _makeRoomFor across the run.
+        final chunkLen = i.isEven ? 2 : 13;
+        final chunk = Float32List.fromList(
+          List.generate(chunkLen, (j) => counter + j),
+        );
+        counter += chunkLen;
+        produced.addAll(chunk);
+        buffer.add(chunk);
+
+        for (final frame in buffer.drainFrames()) {
+          consumed.addAll(frame);
+        }
+      }
+
+      // Whatever's left in the buffer at the end should be exactly the
+      // tail of everything produced, since consumed + pending must equal
+      // produced in order.
+      expect(consumed.length + buffer.pendingSampleCount, produced.length);
+      expect(consumed, produced.sublist(0, consumed.length));
+    });
   });
 
   group('concatFloat32Lists', () {

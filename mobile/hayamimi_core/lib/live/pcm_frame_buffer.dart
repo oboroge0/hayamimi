@@ -23,16 +23,76 @@ Float32List pcm16BytesToFloat32(Uint8List bytes) {
 /// per `acceptWaveform` call (e.g. 512 samples at 16kHz). This buffer sits
 /// between the two: push whatever arrives, pull out only complete frames,
 /// and keep the remainder for next time.
+///
+/// Backed by a single growable [Float32List] used as a ring: unread samples
+/// live in `_buffer[_start, _start + _length)`, [add] appends after that
+/// range, and [drainFrames] just advances `_start`/`_length` -- no per-frame
+/// shifting of the whole backing array. This matters because [add] and
+/// [drainFrames] run on every mic callback (dozens of times a second for
+/// the life of a session): the previous `List<double>` + `removeRange(0,
+/// frameSize)` implementation shifted every remaining buffered sample down
+/// on every drained frame, an O(n) cost paid on the hot path for what's
+/// normally well under one frame's worth of carryover. The backing array
+/// only grows (doubling) or gets compacted back to offset 0 when there
+/// isn't room to append in place, which happens rarely relative to the
+/// steady stream of add/drain calls.
 class PcmFrameBuffer {
   PcmFrameBuffer({required this.frameSize})
-    : assert(frameSize > 0, 'frameSize must be positive');
+    : assert(frameSize > 0, 'frameSize must be positive'),
+      _buffer = Float32List(frameSize * _initialCapacityFrames);
+
+  static const int _initialCapacityFrames = 8;
 
   final int frameSize;
-  final List<double> _pending = <double>[];
+
+  Float32List _buffer;
+  int _start = 0; // index of the first unread sample in _buffer
+  int _length = 0; // count of unread samples starting at _start
 
   /// Appends new samples to the pending tail.
   void add(Float32List samples) {
-    _pending.addAll(samples);
+    if (samples.isEmpty) {
+      return;
+    }
+    _makeRoomFor(samples.length);
+    final writeStart = _start + _length;
+    _buffer.setRange(writeStart, writeStart + samples.length, samples);
+    _length += samples.length;
+  }
+
+  /// Ensures `_buffer` can hold `_length + additional` samples starting at
+  /// `_start`, compacting the unread region to offset 0 (if that alone
+  /// makes enough room) or growing the backing array (doubling capacity
+  /// until it fits) otherwise.
+  void _makeRoomFor(int additional) {
+    if (_start + _length + additional <= _buffer.length) {
+      return;
+    }
+    final needed = _length + additional;
+    if (needed <= _buffer.length) {
+      // The unread region fits at the front; just slide it there instead
+      // of growing.
+      final compacted = Float32List.sublistView(
+        _buffer,
+        _start,
+        _start + _length,
+      );
+      _buffer.setRange(0, _length, compacted);
+      _start = 0;
+      return;
+    }
+    var newCapacity = _buffer.isEmpty ? frameSize : _buffer.length;
+    while (newCapacity < needed) {
+      newCapacity *= 2;
+    }
+    final newBuffer = Float32List(newCapacity);
+    newBuffer.setRange(
+      0,
+      _length,
+      Float32List.sublistView(_buffer, _start, _start + _length),
+    );
+    _buffer = newBuffer;
+    _start = 0;
   }
 
   /// Removes and returns as many complete [frameSize]-length frames as are
@@ -40,18 +100,26 @@ class PcmFrameBuffer {
   /// next call. Returns an empty list when there isn't a full frame yet.
   List<Float32List> drainFrames() {
     final frames = <Float32List>[];
-    while (_pending.length >= frameSize) {
-      frames.add(Float32List.fromList(_pending.sublist(0, frameSize)));
-      _pending.removeRange(0, frameSize);
+    while (_length >= frameSize) {
+      frames.add(
+        Float32List.fromList(
+          _buffer.sublist(_start, _start + frameSize),
+        ),
+      );
+      _start += frameSize;
+      _length -= frameSize;
     }
     return frames;
   }
 
   /// Number of samples currently buffered but not yet enough for a frame.
-  int get pendingSampleCount => _pending.length;
+  int get pendingSampleCount => _length;
 
   /// Drops any buffered, not-yet-complete samples.
-  void reset() => _pending.clear();
+  void reset() {
+    _start = 0;
+    _length = 0;
+  }
 }
 
 /// Concatenates [chunks] into a single Float32List, in order. Used to turn
