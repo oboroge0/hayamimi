@@ -112,28 +112,6 @@ def download_and_extract_tarbz2(url: str, dest_dir: str, label: str) -> None:
     os.remove(tmp)
 
 
-def extract_members_only(url: str, dest_dir: str, wanted_basenames: set, label: str) -> None:
-    """Like download_and_extract_tarbz2, but keeps only specific files from
-    the tarball (used for omnilingual, where we only need the int8 weights
-    and tokens, not the README/test_wavs)."""
-    target = os.path.join(MODELS_DIR, dest_dir)
-    if os.path.isdir(target):
-        print(f"[skip] {label} (already present: {target})")
-        return
-    print(f"[get ] {label}")
-    tmp = os.path.join(MODELS_DIR, f".{dest_dir}.tar.bz2.part")
-    os.makedirs(target, exist_ok=True)
-    _download_to(url, tmp)
-    print(f"  extracting (selected files) -> {target}")
-    with tarfile.open(tmp, "r:bz2") as tf:
-        for member in tf.getmembers():
-            base = os.path.basename(member.name)
-            if base in wanted_basenames:
-                member.name = base
-                tf.extract(member, target)
-    os.remove(tmp)
-
-
 def download_hf_repo(repo: str, dest_dir: str, label: str, ignore_patterns=None) -> None:
     """Snapshot-download a full Hugging Face repo (used for the Mojicast
     translation/punctuation models, which are distributed as small repos)."""
@@ -220,11 +198,17 @@ def main():
         "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
         "Parakeet TDT 0.6B v3 (en + 24 EU languages)")
 
-    extract_members_only(
-        f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-2025-11-12.tar.bz2",
-        "omnilingual-300m-ctc-int8",
-        {"model.int8.onnx", "tokens.txt"},
-        "Meta Omnilingual ASR 300M CTC (~1600-language fallback)")
+    # Fetch the two runtime files directly. The GitHub release tarball is
+    # ~1GB and its packaging has changed over time; direct publisher-mirror
+    # files are both smaller and make interrupted/partial installs repairable.
+    omni_repo = "csukuangfj/sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-int8-2025-11-12"
+    omni_dir = os.path.join(MODELS_DIR, "omnilingual-300m-ctc-int8")
+    for filename in ("model.int8.onnx", "tokens.txt"):
+        download_file(
+            HF_RESOLVE.format(repo=omni_repo, path=filename),
+            os.path.join(omni_dir, filename),
+            f"Meta Omnilingual ASR 300M CTC {filename}",
+        )
 
     download_file(
         f"{GITHUB_RELEASES}/{SPEAKER_TAG}/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",

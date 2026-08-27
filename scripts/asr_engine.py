@@ -662,9 +662,16 @@ class RoutedASR:
             text = self._decode(rec, samples, sample_rate)
         if not text.strip() and tier != "omni" and not suppress_fallback:
             # safety net: the specialist came back empty (likely LID mistake);
-            # the 1600-language generalist gets the last word.
-            text = self._decode(self._get("omni"), samples, sample_rate)
-            tier = "omni"
+            # the 1600-language generalist gets the last word. A partial or
+            # --minimal model install must still be allowed to emit an empty
+            # segment instead of terminating a long-running meeting.
+            try:
+                omni = self._get("omni")
+            except ModelUnavailable:
+                omni = None
+            if omni is not None:
+                text = self._decode(omni, samples, sample_rate)
+                tier = "omni"
         corrected = script_corrected_lang(lang, text)
         if live and text.strip() and corrected != lang:
             # the decoded script contradicts the LID tag (romaji-mangled

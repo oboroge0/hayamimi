@@ -386,6 +386,28 @@ def test_sticky_confirmed_switch_after_two_consecutive_detections():
     assert (pend2, cnt2) == (None, 0)
 
 
+def test_missing_omni_fallback_does_not_terminate_session():
+    routed = asr_engine.RoutedASR.__new__(asr_engine.RoutedASR)
+    routed.last_lang = None
+    routed._pending_lang = None
+    routed._pending_count = 0
+    routed.min_switch_s = 2.0
+    routed.lid_switch_confirm = 2
+    routed._unavailable = {"omni"}
+    routed._route = lambda lang: (object(), "v3")
+    routed._decode = lambda rec, samples, sample_rate: ""
+    routed._get = lambda name: (_ for _ in ()).throw(asr_engine.ModelUnavailable(name))
+    routed._replace = lambda text: text
+
+    result = routed.transcribe(
+        np.zeros(16000, dtype=np.float32), 16000,
+        known_lang="en", speech_s=1.0,
+    )
+
+    assert result["text"] == ""
+    assert result["tier"] == "v3"
+
+
 def test_sticky_alternating_misfires_never_accumulate():
     # Two DIFFERENT wrong-language misfires in a row must not add up to a
     # switch -- each one resets the pending candidate.
