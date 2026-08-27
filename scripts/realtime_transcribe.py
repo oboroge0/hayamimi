@@ -355,13 +355,25 @@ class Refiner:
 
     def __init__(self, asr: RoutedASR, history: AudioHistory, sample_rate: int,
                  printer: PartialPrinter, transcript_path: str | None = None,
-                 translators: dict | None = None, stats: "SessionStats | None" = None):
+                 translators: dict | None = None, stats: "SessionStats | None" = None,
+                 speaker_labeler=None, diarizer=None):
         self.asr = asr
         self.history = history
         self.sr = sample_rate
         self.printer = printer
         self.translators = translators or {}  # ja->target, synchronous per refine
         self.stats = stats
+        # docs/DIARIZATION_PLAN.md iterations 3-4: when --speakers is on,
+        # re-diarize each group's audio (group-local speaker turns) and
+        # remap those local clusters onto speaker_labeler's session-global
+        # S{n} centroids, so a refine group with a mid-group speaker change
+        # prints one [refine/S{n}] line per turn instead of one majority-
+        # vote line for the whole group. speaker_labeler is the SAME
+        # instance the fast path uses (realtime_transcribe.py's --speakers
+        # wiring), so global labels stay consistent between the two passes
+        # and the fast path's centroids double as the diarizer's anchor set.
+        self.speaker_labeler = speaker_labeler
+        self.diarizer = diarizer
         self.spans: list[tuple[int, int, str, str, str]] = []
         self._transcript = open(transcript_path, "a", encoding="utf-8") if transcript_path else None
         # A single FIFO worker (not "spawn a thread per refine") is what makes
@@ -409,6 +421,89 @@ class Refiner:
                 # a different language and must not accumulate this span
                 self.maybe_refine(seg_start, force=True, force_sync=False)
         self.spans.append((seg_start, seg_end, lang, text, speaker))
+
+    MIN_TURN_S = 0.3  # shorter diarization turns aren't worth a separate ASR call
+
+    def _emit_turns(self, buf: np.ndarray, refine_lang: str, fast_joined: str) -> bool:
+        """Multi-speaker refine path (docs/DIARIZATION_PLAN.md iterations 3-4).
+
+        Re-diarizes this group's audio and, if it finds a genuine speaker
+        change, decodes and prints one [refine/S{n}] line per turn instead
+        of the single majority-vote line maybe_refine()'s caller falls back
+        to. Each local diarization cluster is remapped onto the SAME global
+        centroids self.speaker_labeler (the fast path) maintains, so S{n}
+        stays consistent between the fast and refine passes.
+
+        Returns True if it printed turn-level output (caller should stop
+        and skip the single-line fallback), False if it declined: no
+        diarizer/labeler configured, diarization found only one speaker
+        (the majority-vote line is just as good and cheaper), or the
+        turn-decoded text came back suspiciously short (same "never lose
+        content vs. the fast finals" guard maybe_refine() applies to the
+        single-line path).
+        """
+        if self.diarizer is None or self.speaker_labeler is None:
+            return False
+        try:
+            raw = self.diarizer.process(buf, self.sr)
+        except Exception as exc:
+            print(f"[refine] diarization failed, falling back to single-speaker line: {exc}",
+                  file=sys.stderr)
+            return False
+        if len({local for local, _, _ in raw}) < 2:
+            return False
+
+        turns = []  # (local_id, start_sample, end_sample) within buf
+        for local_id, start_s, end_s in raw:
+            start = max(0, int(round(start_s * self.sr)))
+            end = min(len(buf), int(round(end_s * self.sr)))
+            if end - start >= int(self.MIN_TURN_S * self.sr):
+                turns.append((local_id, start, end))
+        if len(turns) < 2:
+            return False
+
+        # one representative embedding per local cluster, matched onto the
+        # global centroid set -- this is the iteration-4 remap step.
+        local_ids = sorted({t[0] for t in turns})
+        global_label = {}
+        for local_id in local_ids:
+            cluster_audio = np.concatenate(
+                [buf[start:end] for lid, start, end in turns if lid == local_id]
+            )
+            emb = self.speaker_labeler.embed(cluster_audio, self.sr)
+            global_label[local_id] = self.speaker_labeler.match_embedding(emb, update=True)
+
+        outputs = []  # (global_label, turn_text), in chronological turn order
+        for local_id, start, end in turns:
+            turn_text = self.asr.transcribe(buf[start:end], self.sr, known_lang=refine_lang,
+                                            live=False)["text"]
+            if turn_text.strip():
+                outputs.append((global_label[local_id], turn_text))
+
+        total_text = " ".join(t for _, t in outputs)
+        if len(total_text.strip()) < 0.7 * len(fast_joined):
+            return False
+
+        for label, turn_text in outputs:
+            tag = f"{label}|{refine_lang}" if label else refine_lang
+            print(f"[refine/{tag}] {turn_text}", flush=True)
+            if self.printer.server is not None:
+                self.printer.server.publish({"type": "refine", "text": turn_text,
+                                             "lang": refine_lang, "speaker": label})
+            outs = []
+            if self.translators and refine_lang == "ja":
+                for tlang, tr in self.translators.items():
+                    out = translate_by_sentence(tr, turn_text)
+                    if out and out != turn_text:
+                        print(f"[refine→{tlang}] {out}", flush=True)
+                        outs.append((tlang, out))
+            if self._transcript is not None:
+                prefix = f"{label}: " if label else ""
+                self._transcript.write(prefix + turn_text + "\n")
+                for tlang, out in outs:
+                    self._transcript.write(f"  →{tlang} {out}\n")
+                self._transcript.flush()
+        return True
 
     def maybe_refine(self, now_sample: int, force: bool = False, force_sync: bool | None = None):
         if not self.spans:
@@ -524,6 +619,17 @@ class Refiner:
             if refine_lang != lang and self.stats is not None:
                 self.stats.refine_lang_corrections += 1
                 print(f"[refine] language corrected {lang}->{refine_lang}", flush=True)
+
+            # docs/DIARIZATION_PLAN.md iterations 3-4: if the group actually
+            # contains a speaker change, prefer per-turn output over the
+            # single majority-vote line below. mixed-language groups skip
+            # this (their "text" is already the joined fast finals, not a
+            # coherent re-decode a turn-level re-split would make sense
+            # against) and so does the fallback branch below when the
+            # diarizer isn't available or found only one speaker.
+            if not mixed and self._emit_turns(buf, refine_lang, fast_joined):
+                return
+
             tag = f"{speaker}|{refine_lang}" if speaker else refine_lang
             print(f"[refine/{tag}] {text}", flush=True)
             if self.printer.server is not None:
@@ -724,10 +830,20 @@ def main():
     printer = PartialPrinter(enabled=not args.no_partial, server=server)
 
     speaker_labeler = None
+    diarizer = None
     if args.speakers:
         from speaker_id import SpeakerLabeler
 
         speaker_labeler = SpeakerLabeler()
+        try:
+            from diarize import GroupDiarizer
+
+            diarizer = GroupDiarizer()
+        except FileNotFoundError as exc:
+            # missing pyannote segmentation model: --speakers still works
+            # with the fast-path-only labeling (majority-vote in refine),
+            # just without the per-turn refine split. Not fatal.
+            print(f"[refine] speaker diarization disabled: {exc}", file=sys.stderr)
 
     translators = {}
     translator_worker = None
@@ -740,7 +856,9 @@ def main():
     history = AudioHistory(SAMPLE_RATE)
     refiner = None if args.no_refine else Refiner(asr, history, SAMPLE_RATE, printer,
                                                   transcript_path=args.transcript,
-                                                  translators=translators, stats=stats)
+                                                  translators=translators, stats=stats,
+                                                  speaker_labeler=speaker_labeler,
+                                                  diarizer=diarizer)
 
     def finish(sr):
         vad.flush()
