@@ -61,7 +61,14 @@ class LiveTranscriber {
   // provisional partial -- see `draft_pass.dart` for the timing/skip logic
   // and why it's a coarser, cheaper pass than the fast-final/refine ones.
   bool _busy = false; // true while ANY decode (final/refine/draft) is running
-  final List<Float32List> _draftFrames = [];
+  // Kept trimmed to defaultDraftWindowSeconds as frames arrive (see
+  // slideDraftFrames in draft_pass.dart) -- without this, a long
+  // uninterrupted utterance would grow this list without bound and
+  // _runDraftDecode's concatFloat32Lists over the whole thing, once per
+  // draft tick, made the total work across the utterance O(n^2) in its
+  // length even though only the trailing defaultDraftWindowSeconds is ever
+  // actually decoded.
+  List<Float32List> _draftFrames = [];
   bool _draftSegmentActive = false;
   DateTime? _lastDraftAt;
   bool _debugStreaming = false;
@@ -280,7 +287,7 @@ class LiveTranscriber {
   void _resetSessionState() {
     _refineBuffer.clear();
     _lastSegmentAt = null;
-    _draftFrames.clear();
+    _clearDraftFrames();
     _draftSegmentActive = false;
     _lastDraftAt = null;
     if (_autoRefineEnabled) {
@@ -338,15 +345,20 @@ class LiveTranscriber {
       // Just started a new segment: drop anything left over from before
       // (shouldn't normally happen, since a finalized segment clears this
       // in _drainReadySegments, but guards against drift either way).
-      _draftFrames.clear();
+      _clearDraftFrames();
     }
     if (detected) {
       _draftFrames.add(frame);
+      _draftFrames = slideDraftFrames(_draftFrames, sampleRate: sampleRate);
     }
     _draftSegmentActive = detected;
 
     _drainReadySegments();
     _maybeEmitDraft();
+  }
+
+  void _clearDraftFrames() {
+    _draftFrames = [];
   }
 
   void _drainReadySegments() {
@@ -360,7 +372,7 @@ class LiveTranscriber {
       // The segment just popped supersedes whatever the draft pass had
       // accumulated for it -- the real (properly routed/decoded) final is
       // about to replace any draft the UI was showing.
-      _draftFrames.clear();
+      _clearDraftFrames();
       _draftSegmentActive = false;
       _decodeSegment(segment);
     }
@@ -622,7 +634,7 @@ class LiveTranscriber {
 
     _refineBuffer.clear();
     _lastSegmentAt = null;
-    _draftFrames.clear();
+    _clearDraftFrames();
     _draftSegmentActive = false;
     _lastDraftAt = null;
 
