@@ -90,7 +90,9 @@ def segments_to_der_tuples(segments: list[tuple[str, float, float]]
 # ---------------------------------------------------------------------------
 
 def generate_speaker_hypothesis(wav_path: str, min_silence: float = 0.35,
-                                max_speech: float = 12.0) -> list[tuple[str, float, float]]:
+                                max_speech: float = 12.0,
+                                hysteresis_enabled: bool | None = None,
+                                hysteresis_min_hits: int = None) -> list[tuple[str, float, float]]:
     """Run hayamimi's real --speakers pipeline pieces over a wav file and
     return (speaker, start_s, end_s) for each VAD-finalized segment.
 
@@ -116,7 +118,22 @@ def generate_speaker_hypothesis(wav_path: str, min_silence: float = 0.35,
     samples, sr = read_wave(wav_path, target_rate=SAMPLE_RATE)
     vad = build_vad(min_silence, max_speech)
     history = AudioHistory(sr)
-    labeler = SpeakerLabeler()
+    # merge_enabled is deliberately not threaded through here: the baseline
+    # method has no group/"clean copy" boundary to hang maybe_merge_centroids()
+    # off of (see generate_diarize_hypothesis's docstring) -- only
+    # hysteresis, which is purely a fast-path (label()) behavior, applies.
+    # hysteresis_enabled=None (the default, distinct from False) means "use
+    # speaker_id.SpeakerLabeler's own default" (False -- section 9 tried
+    # and rejected it as the module default, see speaker_id.py's
+    # HYSTERESIS_MIN_HITS comment), matching how remap_threshold=None
+    # already worked in this module. Pass --hysteresis-enabled explicitly
+    # to measure the opt-in mitigation anyway.
+    labeler_kwargs = {}
+    if hysteresis_enabled is not None:
+        labeler_kwargs["hysteresis_enabled"] = hysteresis_enabled
+    if hysteresis_min_hits is not None:
+        labeler_kwargs["hysteresis_min_hits"] = hysteresis_min_hits
+    labeler = SpeakerLabeler(**labeler_kwargs)
 
     hyp: list[tuple[str, float, float]] = []
 
@@ -174,7 +191,11 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
                                 max_speech: float = 12.0,
                                 diar_threshold: float = None,
                                 sim_threshold: float = None,
-                                remap_threshold: float = None
+                                remap_threshold: float = None,
+                                merge_enabled: bool | None = None,
+                                merge_threshold: float = None,
+                                hysteresis_enabled: bool | None = None,
+                                hysteresis_min_hits: int = None
                                 ) -> tuple[list[tuple[str, float, float]], dict]:
     """Score the new method: same VAD + fast SpeakerLabeler as the baseline,
     but grouped exactly the way production's Refiner groups utterances
@@ -208,6 +229,12 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     independently of diar_threshold (diarize.DEFAULT_THRESHOLD, which only
     affects the *local* clustering within one group) and landed on
     REMAP_THRESHOLD=0.35 with SIM_THRESHOLD left at 0.45.
+
+    merge_enabled/merge_threshold and hysteresis_enabled/hysteresis_min_hits
+    plumb through to speaker_id.SpeakerLabeler's iteration-6 (section 9)
+    speaker-count mitigations. merge_centroids() is called once per closed
+    group (this function's natural "clean copy" boundary), matching how
+    realtime_transcribe.Refiner._emit_turns() would call it.
     """
     import numpy as np
     from realtime_transcribe import GROUP_GAP_S, GROUP_MAX_S, SAMPLE_RATE, AudioHistory, build_vad, read_wave, wav_chunks
@@ -218,12 +245,25 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     vad = build_vad(min_silence, max_speech)
     history = AudioHistory(sr)
     # the single session-global centroid set, shared by fast path + remap.
-    # Only pass remap_threshold through when explicitly given -- passing
-    # None explicitly (vs. omitting the kwarg) makes SpeakerLabeler fall
-    # back to `threshold` instead of its own REMAP_THRESHOLD default.
+    # Only pass remap_threshold/merge_threshold/hysteresis_min_hits through
+    # when explicitly given -- passing None explicitly (vs. omitting the
+    # kwarg) makes SpeakerLabeler fall back to its own module-level default
+    # instead of whatever this function's caller left unspecified.
+    # merge_enabled/hysteresis_enabled=None means "use SpeakerLabeler's own
+    # default" -- both default False (section 9 tried and rejected both as
+    # the module default, see speaker_id.py's HYSTERESIS_MIN_HITS comment),
+    # same tri-state idiom as remap_threshold above.
     labeler_kwargs = {}
+    if merge_enabled is not None:
+        labeler_kwargs["merge_enabled"] = merge_enabled
+    if hysteresis_enabled is not None:
+        labeler_kwargs["hysteresis_enabled"] = hysteresis_enabled
     if remap_threshold is not None:
         labeler_kwargs["remap_threshold"] = remap_threshold
+    if merge_threshold is not None:
+        labeler_kwargs["merge_threshold"] = merge_threshold
+    if hysteresis_min_hits is not None:
+        labeler_kwargs["hysteresis_min_hits"] = hysteresis_min_hits
     labeler = SpeakerLabeler(
         threshold=SIM_THRESHOLD if sim_threshold is None else sim_threshold,
         **labeler_kwargs,
@@ -286,6 +326,12 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
             global_label[local_id] = labeler.match_embedding(
                 emb, update=True, threshold=labeler.remap_threshold)
 
+        # iteration 6 (section 9): this group's remap is exactly the "clean
+        # copy" boundary merge_centroids() is meant for -- give it a chance
+        # to fold any two global centroids that have drifted together
+        # before the next group opens new ones against them.
+        labeler.maybe_merge_centroids()
+
         for local_id, s, e in turns:
             hyp.append((global_label[local_id], (g_start + s * sr) / sr, (g_start + e * sr) / sr))
 
@@ -293,6 +339,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
         "diar_time_s": diar_time,
         "n_groups": len(groups),
         "audio_s": len(samples) / sr,
+        "merge_history": labeler.merge_history(),
     }
     return hyp, stats
 
@@ -339,6 +386,8 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
                   min_silence: float = 0.35, max_speech: float = 12.0,
                   method: str = "baseline", diar_threshold: float = None,
                   sim_threshold: float = None, remap_threshold: float = None,
+                  merge_enabled: bool | None = None, merge_threshold: float = None,
+                  hysteresis_enabled: bool | None = None, hysteresis_min_hits: int = None,
                   breakdown: bool = False) -> dict:
     import simpleder
 
@@ -347,9 +396,11 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
     extra = {}
     if method == "refine_diarize":
         hyp_raw, extra = generate_diarize_hypothesis(
-            wav_path, min_silence, max_speech, diar_threshold, sim_threshold, remap_threshold)
+            wav_path, min_silence, max_speech, diar_threshold, sim_threshold, remap_threshold,
+            merge_enabled, merge_threshold, hysteresis_enabled, hysteresis_min_hits)
     else:
-        hyp_raw = generate_speaker_hypothesis(wav_path, min_silence, max_speech)
+        hyp_raw = generate_speaker_hypothesis(
+            wav_path, min_silence, max_speech, hysteresis_enabled, hysteresis_min_hits)
     decode_s = time.time() - t0
     hyp = segments_to_der_tuples(hyp_raw)
 
@@ -405,6 +456,29 @@ def main():
                     help="also report Miss/False-Alarm/Confusion via pyannote.metrics "
                          "(requirements-dev.txt). Slower and heavier than the default "
                          "simpleder-only scoring -- see docs/DIARIZATION_PLAN.md section 4.")
+    ap.add_argument("--merge-enabled", action=argparse.BooleanOptionalAction, default=None,
+                    help="iteration 6 (docs/DIARIZATION_PLAN.md section 9) mitigation A: "
+                         "periodically fold global centroids that have drifted together back "
+                         "into one speaker. Only meaningful with --method refine_diarize (the "
+                         "merge point is once per closed group). Default: speaker_id."
+                         "SpeakerLabeler's own default (False -- section 9 found this mitigation "
+                         "fragile, not adopted). Pass --no-merge-enabled to force off "
+                         "explicitly even if the class default ever changes.")
+    ap.add_argument("--merge-threshold", type=float, default=None, metavar="T",
+                    help="cosine similarity above which two global centroids merge, when "
+                         "--merge-enabled. Default: speaker_id.MERGE_THRESHOLD.")
+    ap.add_argument("--hysteresis-enabled", action=argparse.BooleanOptionalAction, default=None,
+                    help="iteration 6 (docs/DIARIZATION_PLAN.md section 9) mitigation B: a "
+                         "newly opened global centroid displays under its nearest confirmed "
+                         "speaker until it has matched --hysteresis-min-hits times. Applies to "
+                         "both --method values. Default: speaker_id.SpeakerLabeler's own default "
+                         "(False -- clean on the AMI sweep but rejected after "
+                         "testdata/two_speakers.wav showed it can permanently swallow a real "
+                         "speaker who only speaks once, see speaker_id.py). Pass "
+                         "--hysteresis-enabled to measure the opt-in mitigation anyway.")
+    ap.add_argument("--hysteresis-min-hits", type=int, default=None, metavar="N",
+                    help="hits required to confirm a provisional speaker, when "
+                         "hysteresis is enabled. Default: speaker_id.HYSTERESIS_MIN_HITS.")
     args = ap.parse_args()
 
     if not os.path.exists(args.manifest):
@@ -428,6 +502,9 @@ def main():
         result = score_meeting(wav_path, rttm_path, args.collar, args.min_silence, args.max_speech,
                                method=args.method, diar_threshold=args.diar_threshold,
                                sim_threshold=args.sim_threshold, remap_threshold=args.remap_threshold,
+                               merge_enabled=args.merge_enabled, merge_threshold=args.merge_threshold,
+                               hysteresis_enabled=args.hysteresis_enabled,
+                               hysteresis_min_hits=args.hysteresis_min_hits,
                                breakdown=args.breakdown)
         extra = ""
         if "diar_time_s" in result and result.get("audio_s"):
@@ -437,6 +514,8 @@ def main():
         if args.breakdown:
             extra += (f"  [miss={result['miss'] * 100:.1f}% fa={result['false_alarm'] * 100:.1f}% "
                       f"confusion={result['confusion'] * 100:.1f}%]")
+        if result.get("merge_history"):
+            extra += f"  merged={result['merge_history']}"
         print(f"[{entry['meeting']}] DER={result['der'] * 100:.1f}%  "
               f"ref_speakers={result['n_ref_speakers']} hyp_speakers={result['n_hyp_speakers']}  "
               f"ref_turns={result['n_ref_turns']} hyp_segments={result['n_hyp_segments']}  "
