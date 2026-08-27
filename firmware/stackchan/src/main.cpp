@@ -87,7 +87,23 @@ void setStatus(const String &s) {
 }
 
 void handleEventJson(const uint8_t *payload, size_t len) {
-  JsonDocument doc;
+  // Reused across calls instead of a fresh JsonDocument per event: this
+  // fires once per server text frame (partial/final/refine/... -- i.e.
+  // continuously for the life of a session), and ArduinoJson v7's
+  // JsonDocument owns a heap-backed memory pool that grows on demand but
+  // is only released when the document is destroyed. A local (stack)
+  // JsonDocument would therefore malloc/free that pool on every single
+  // event, which is exactly the allocate/free churn that fragments the
+  // ESP32's heap over a long-running session. `static` keeps one instance
+  // (and its already-grown pool) alive for the process's lifetime, and
+  // clear() below empties its contents without releasing the pool, so
+  // steady-state parsing does no allocation at all. Safe as a function-
+  // static here because handleEventJson only ever runs on the main loop()
+  // task (via webSocketEvent() <- webSocket.loop(), see loop()) -- never
+  // from micTask on the other core -- so there's no concurrent access to
+  // guard against.
+  static JsonDocument doc;
+  doc.clear();
   if (deserializeJson(doc, payload, len)) return; // malformed frame: drop silently
 
   const char *type = doc["type"] | "";
