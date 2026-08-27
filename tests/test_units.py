@@ -525,6 +525,8 @@ def test_transcribe_bootstrap_too_short_decodes_but_does_not_seed_last_lang():
         def _get(self, name):
             return "sv-recognizer"
 
+        _sv_probe = asr_engine.RoutedASR._sv_probe
+
         def _route(self, lang):
             assert lang == "en"
             return ("en-recognizer", "v3")
@@ -544,6 +546,47 @@ def test_transcribe_bootstrap_too_short_decodes_but_does_not_seed_last_lang():
     # the decode succeeded, but the bootstrap candidate was too short to
     # confirm -- the session must remain "no language established yet"
     assert stub.last_lang is None
+
+
+def test_transcribe_bootstrap_zh_yue_reuses_single_sv_probe_decode():
+    # A brand-new session (last_lang=None) where whisper-tiny says "zh" but
+    # SenseVoice's own probe says "yue" touches THREE potential SenseVoice
+    # probe call sites in one transcribe() call: the bootstrap confirmation,
+    # the dual-LID switch-confirmation check, and the ko/yue reuse check in
+    # the decode section. RoutedASR._sv_probe must memoize across all three
+    # so the actual SenseVoice decode only runs once per segment.
+    call_count = 0
+
+    class _Stub:
+        forced_lang = None
+        dual_confirm = True
+        last_lang = None
+        _pending_lang = None
+        _pending_count = 0
+        _unavailable = set()
+
+        def _decode_full(self, rec, samples, sample_rate):
+            nonlocal call_count
+            call_count += 1
+            return ("some text", "<|yue|>0.9")
+
+        def _get(self, name):
+            assert name == "sv"
+            return "sv-recognizer"
+
+        _sv_probe = asr_engine.RoutedASR._sv_probe
+
+        def _replace(self, text):
+            return text
+
+    stub = _Stub()
+    result = asr_engine.RoutedASR.transcribe(
+        stub, np.zeros(4800, dtype=np.float32), 16000,
+        known_lang="zh", speech_s=2.0, live=True)
+    assert result["text"] == "some text"
+    assert result["lang"] == "yue"
+    assert result["tier"] == "sv"
+    assert call_count == 1, f"expected exactly one SenseVoice probe decode, got {call_count}"
 
 
 def test_dual_confirm_session_switches_from_each_stuck_lang_to_yue():

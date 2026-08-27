@@ -689,6 +689,35 @@ class RoutedASR:
     def _decode(cls, rec, samples: np.ndarray, sample_rate: int) -> str:
         return cls._decode_full(rec, samples, sample_rate)[0]
 
+    def _sv_probe(self, cached, samples: np.ndarray, sample_rate: int):
+        """Run SenseVoice's confirmation-probe decode on `samples`, memoized
+        across the (up to three) call sites in transcribe() that may need it
+        for the same segment: session bootstrap, dual-LID switch
+        confirmation, and zh/yue arbitration.
+
+        `cached` is whatever a previous call for this exact segment already
+        returned (or None if none has run yet / the previous attempt failed).
+        A non-None `cached` is reused as-is with zero elapsed time -- this is
+        the memoization. A None `cached` always triggers a fresh decode
+        attempt, so a failed probe (ModelUnavailable) is retried on every
+        call site rather than being cached as a permanent failure, matching
+        the pre-refactor behavior.
+
+        Returns (probe_result, elapsed_ms) where probe_result is the
+        (text, tag) pair from _decode_full, or None if the probe hasn't run
+        (cached was None and unavailable) or ran but the sv model is
+        unavailable (minimal install).
+        """
+        if cached is not None:
+            return cached, 0.0
+        t0 = time.perf_counter()
+        result = None
+        try:
+            result = self._decode_full(self._get("sv"), samples, sample_rate)
+        except ModelUnavailable:
+            pass  # minimal install: no probe possible
+        return result, (time.perf_counter() - t0) * 1000
+
     def _route(self, lang: str) -> tuple[object, str]:
         if lang in RZ_LANGS:
             return self._get_with_fallback("rz")
@@ -823,14 +852,10 @@ class RoutedASR:
                 # "ru" on segment 1 of a Japanese session and it collapsed
                 # from there). Always confirm the very first segment against
                 # SenseVoice's own LID, whatever whisper-tiny said.
-                t0 = time.perf_counter()
-                try:
-                    probe_text, probe_tag = self._decode_full(self._get("sv"), samples, sample_rate)
-                    sv_probe = (probe_text, probe_tag)
-                    bootstrap_probe_lang = sv_lid_tag(probe_tag)
-                except ModelUnavailable:
-                    pass  # minimal install: no probe possible
-                probe_ms = (time.perf_counter() - t0) * 1000
+                sv_probe, elapsed_ms = self._sv_probe(sv_probe, samples, sample_rate)
+                if sv_probe is not None:
+                    bootstrap_probe_lang = sv_lid_tag(sv_probe[1])
+                probe_ms = elapsed_ms
 
             if self.dual_confirm and lang in DUAL_CONFIRM_LANGS:
                 if lang != self.last_lang:
@@ -841,15 +866,11 @@ class RoutedASR:
                     # if it already decoded this exact audio.
                     sv_lang = bootstrap_probe_lang
                     if sv_probe is None:
-                        t0 = time.perf_counter()
                         sv_lang = ""
-                        try:
-                            probe_text, probe_tag = self._decode_full(self._get("sv"), samples, sample_rate)
-                            sv_probe = (probe_text, probe_tag)
-                            sv_lang = sv_lid_tag(probe_tag)
-                        except ModelUnavailable:
-                            pass  # minimal install: no probe possible, mismatch by default
-                        probe_ms += (time.perf_counter() - t0) * 1000
+                        sv_probe, elapsed_ms = self._sv_probe(sv_probe, samples, sample_rate)
+                        if sv_probe is not None:
+                            sv_lang = sv_lid_tag(sv_probe[1])
+                        probe_ms += elapsed_ms
                     lang, switched = resolve_dual_confirm(lang, self.last_lang, speech_s, sv_lang)
                     suppress_fallback = speech_s is not None and speech_s < MIN_PROBE_S
                     if was_bootstrap and suppress_fallback:
@@ -885,11 +906,8 @@ class RoutedASR:
             # Reuse the switch-confirmation probe above if it already decoded
             # this exact audio through SenseVoice instead of a second pass.
             if sv_text is None:
-                try:
-                    sv = self._get("sv")
-                    sv_text, sv_lang2 = self._decode_full(sv, samples, sample_rate)
-                except ModelUnavailable:
-                    sv_text = None  # minimal install: plain routing below
+                sv_probe, _elapsed_ms = self._sv_probe(sv_probe, samples, sample_rate)
+                sv_text, sv_lang2 = sv_probe if sv_probe is not None else (None, None)
             if sv_text is not None:
                 text = sv_text
                 if "yue" in sv_lang2:
