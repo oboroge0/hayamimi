@@ -1,4 +1,5 @@
 .venv/
+.venv-llm/
 models/
 testdata/
 __pycache__/
