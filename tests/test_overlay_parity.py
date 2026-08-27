@@ -14,9 +14,19 @@ import difflib
 import os
 import re
 
+import pytest
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY_PATH = os.path.join(ROOT, "scripts", "subtitle_server.py")
 DART_PATH = os.path.join(ROOT, "mobile", "hayamimi_core", "lib", "server", "overlay_html.dart")
+
+# On branches that carry only the engine side (no mobile/ tree), there is
+# nothing to compare against -- the parity check is only meaningful where
+# both halves exist (the full worktree / merged main).
+pytestmark = pytest.mark.skipif(
+    not os.path.exists(DART_PATH),
+    reason="mobile overlay_html.dart not present on this branch",
+)
 
 
 def _extract_py_overlay_html() -> str:
