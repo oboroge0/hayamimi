@@ -364,7 +364,28 @@ class Refiner:
         self.stats = stats
         self.spans: list[tuple[int, int, str, str, str]] = []
         self._transcript = open(transcript_path, "a", encoding="utf-8") if transcript_path else None
-        self._worker_lock = threading.Lock()  # serialize refine decodes off the hot path
+        # A single FIFO worker (not "spawn a thread per refine") is what makes
+        # output order safe: maybe_refine() is only ever called from the
+        # single-threaded ingestion path (run_stream / add_span's language-
+        # boundary flush), so the order tasks are *queued* in is always the
+        # chronological order of the audio groups. Threading.Thread-per-call
+        # loses that guarantee -- start() order is not lock-acquisition
+        # order, so two nearly-simultaneous refines (a language-boundary
+        # flush racing the next group's silence-triggered flush) could grab
+        # the old _worker_lock in either order and print [refine/...] lines
+        # out of chronological sequence. A single consumer thread draining a
+        # Queue processes strictly in enqueue order, so this can't happen.
+        self._task_queue: "queue.Queue" = queue.Queue()
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker_thread.start()
+
+    def _worker_loop(self):
+        while True:
+            task = self._task_queue.get()
+            try:
+                task()
+            finally:
+                self._task_queue.task_done()
 
     def add_span(self, seg_start: int, seg_end: int, lang: str, text: str, speaker: str):
         """Append one finalized segment to the pending refine group.
@@ -428,106 +449,126 @@ class Refiner:
         def work():
             # off the hot path: a refine of a 25s group takes ~0.5-1s and must
             # not delay the next utterance's instant final (soak test showed
-            # 2.6s latency spikes when run inline)
-            with self._worker_lock:
-                refine_lang = lang
-                if mixed:
-                    text = fast_joined
-                else:
-                    # re-run LID on the merged (longer, higher-confidence)
-                    # audio: the fast path's per-segment majority vote used
-                    # only 2-4s clips, which docs/LID.md measured well below
-                    # whisper-tiny's high-confidence length for several
-                    # languages. But "longer" only holds when the group
-                    # really is a multi-segment utterance -- a group can be
-                    # a single short segment sitting alone between silence
-                    # gaps, and a lone whisper-tiny re-judgment on that is
-                    # no more reliable than the live path's single LID call
-                    # (real-mic incident: this flipped a correctly
-                    # dual-confirmed live "ko" back to a collapsed "ru").
-                    # So the re-judgment goes through the SAME dual-LID
-                    # confirmation as the live path: SenseVoice must agree,
-                    # and resolve_refine_lang additionally gates on the
-                    # group's total duration (see REFINE_MIN_REGROUP_S).
-                    group_duration_s = len(buf) / self.sr
-                    detected = self.asr._identify_lang(buf, self.sr)
-                    sv_lang = ""
-                    probe_text = None
-                    if detected != lang and group_duration_s >= REFINE_MIN_REGROUP_S:
-                        try:
-                            sv_rec = self.asr._get("sv")
-                            probe_text, sv_tag = self.asr._decode_full(sv_rec, buf, self.sr)
-                            sv_lang = sv_lid_tag(sv_tag)
-                        except ModelUnavailable:
-                            sv_lang = ""  # minimal install: no probe possible, no override
-                    resolved, changed = resolve_refine_lang(lang, detected, sv_lang, group_duration_s)
-                    if changed:
-                        if resolved in SV_LANGS and probe_text is not None:
-                            # resolve_refine_lang only sets changed=True when
-                            # sv_lang == whisper_lang == resolved, so the SenseVoice
-                            # probe above already decoded this exact buffer through
-                            # the same route transcribe() would take for `resolved`
-                            # (ko/yue both route to SenseVoice) -- reuse its text
-                            # instead of a second SV pass, same reuse pattern as
-                            # the live path's dual-LID confirmation probe. Apply
-                            # the same post-processing transcribe() would (text
-                            # replacements, and Kiwi ko word-spacing) so the
-                            # result matches what a fresh transcribe() call would
-                            # have produced.
-                            text = self.asr._replace(probe_text)
-                            if resolved == "ko" and text.strip() and self.asr.ko_spacer is not None:
-                                try:
-                                    text = self.asr.ko_spacer.space(text, reset_whitespace=True)
-                                except Exception:
-                                    pass
-                        else:
-                            text = self.asr.transcribe(buf, self.sr, known_lang=resolved,
-                                                        live=False)["text"]
-                        if text.strip():
-                            refine_lang = resolved
-                        else:
-                            text = self.asr.transcribe(buf, self.sr, known_lang=lang,
-                                                        live=False)["text"]
+            # 2.6s latency spikes when run inline). Runs on the single
+            # _worker_thread, which serializes it against every other queued
+            # refine in enqueue (== chronological) order -- see the comment
+            # on _task_queue in __init__.
+            refine_lang = lang
+            if mixed:
+                text = fast_joined
+            else:
+                # re-run LID on the merged (longer, higher-confidence)
+                # audio: the fast path's per-segment majority vote used
+                # only 2-4s clips, which docs/LID.md measured well below
+                # whisper-tiny's high-confidence length for several
+                # languages. But "longer" only holds when the group
+                # really is a multi-segment utterance -- a group can be
+                # a single short segment sitting alone between silence
+                # gaps, and a lone whisper-tiny re-judgment on that is
+                # no more reliable than the live path's single LID call
+                # (real-mic incident: this flipped a correctly
+                # dual-confirmed live "ko" back to a collapsed "ru").
+                # So the re-judgment goes through the SAME dual-LID
+                # confirmation as the live path: SenseVoice must agree,
+                # and resolve_refine_lang additionally gates on the
+                # group's total duration (see REFINE_MIN_REGROUP_S).
+                group_duration_s = len(buf) / self.sr
+                detected = self.asr._identify_lang(buf, self.sr)
+                sv_lang = ""
+                probe_text = None
+                if detected != lang and group_duration_s >= REFINE_MIN_REGROUP_S:
+                    try:
+                        sv_rec = self.asr._get("sv")
+                        probe_text, sv_tag = self.asr._decode_full(sv_rec, buf, self.sr)
+                        sv_lang = sv_lid_tag(sv_tag)
+                    except ModelUnavailable:
+                        sv_lang = ""  # minimal install: no probe possible, no override
+                resolved, changed = resolve_refine_lang(lang, detected, sv_lang, group_duration_s)
+                if changed:
+                    if resolved in SV_LANGS and probe_text is not None:
+                        # resolve_refine_lang only sets changed=True when
+                        # sv_lang == whisper_lang == resolved, so the SenseVoice
+                        # probe above already decoded this exact buffer through
+                        # the same route transcribe() would take for `resolved`
+                        # (ko/yue both route to SenseVoice) -- reuse its text
+                        # instead of a second SV pass, same reuse pattern as
+                        # the live path's dual-LID confirmation probe. Apply
+                        # the same post-processing transcribe() would (text
+                        # replacements, and Kiwi ko word-spacing) so the
+                        # result matches what a fresh transcribe() call would
+                        # have produced.
+                        text = self.asr._replace(probe_text)
+                        if resolved == "ko" and text.strip() and self.asr.ko_spacer is not None:
+                            try:
+                                text = self.asr.ko_spacer.space(text, reset_whitespace=True)
+                            except Exception:
+                                pass
+                    else:
+                        text = self.asr.transcribe(buf, self.sr, known_lang=resolved,
+                                                    live=False)["text"]
+                    if text.strip():
+                        refine_lang = resolved
                     else:
                         text = self.asr.transcribe(buf, self.sr, known_lang=lang,
                                                     live=False)["text"]
-                # a merged re-decode must never LOSE content; if it comes back
-                # much shorter than the fast finals combined, trust those
-                if len(text.strip()) < 0.7 * len(fast_joined):
-                    text = fast_joined
-                    refine_lang = lang
-                if not text.strip():
-                    return
-                if refine_lang != lang and self.stats is not None:
-                    self.stats.refine_lang_corrections += 1
-                    print(f"[refine] language corrected {lang}->{refine_lang}", flush=True)
-                tag = f"{speaker}|{refine_lang}" if speaker else refine_lang
-                print(f"[refine/{tag}] {text}", flush=True)
-                if self.printer.server is not None:
-                    self.printer.server.publish({"type": "refine", "text": text, "lang": refine_lang,
-                                                 "speaker": speaker})
-                outs = []
-                if self.translators and refine_lang == "ja":
-                    # synchronous here (we're already off the hot path) so the
-                    # transcript keeps source and translations adjacent, in
-                    # order. The MT models degrade on multi-sentence input,
-                    # so translate sentence by sentence.
-                    for tlang, tr in self.translators.items():
-                        out = translate_by_sentence(tr, text)
-                        if out and out != text:
-                            print(f"[refine→{tlang}] {out}", flush=True)
-                            outs.append((tlang, out))
-                if self._transcript is not None:
-                    prefix = f"{speaker}: " if speaker else ""
-                    self._transcript.write(prefix + text + "\n")
-                    for tlang, out in outs:
-                        self._transcript.write(f"  →{tlang} {out}\n")
-                    self._transcript.flush()
+                else:
+                    text = self.asr.transcribe(buf, self.sr, known_lang=lang,
+                                                live=False)["text"]
+            # a merged re-decode must never LOSE content; if it comes back
+            # much shorter than the fast finals combined, trust those
+            if len(text.strip()) < 0.7 * len(fast_joined):
+                text = fast_joined
+                refine_lang = lang
+            if not text.strip():
+                return
+            if refine_lang != lang and self.stats is not None:
+                self.stats.refine_lang_corrections += 1
+                print(f"[refine] language corrected {lang}->{refine_lang}", flush=True)
+            tag = f"{speaker}|{refine_lang}" if speaker else refine_lang
+            print(f"[refine/{tag}] {text}", flush=True)
+            if self.printer.server is not None:
+                self.printer.server.publish({"type": "refine", "text": text, "lang": refine_lang,
+                                             "speaker": speaker})
+            outs = []
+            if self.translators and refine_lang == "ja":
+                # synchronous here (we're already off the hot path) so the
+                # transcript keeps source and translations adjacent, in
+                # order. The MT models degrade on multi-sentence input,
+                # so translate sentence by sentence.
+                for tlang, tr in self.translators.items():
+                    out = translate_by_sentence(tr, text)
+                    if out and out != text:
+                        print(f"[refine→{tlang}] {out}", flush=True)
+                        outs.append((tlang, out))
+            if self._transcript is not None:
+                prefix = f"{speaker}: " if speaker else ""
+                self._transcript.write(prefix + text + "\n")
+                for tlang, out in outs:
+                    self._transcript.write(f"  →{tlang} {out}\n")
+                self._transcript.flush()
 
+        # Both branches enqueue onto the same FIFO worker so cross-call
+        # ordering is preserved even when a sync flush (shutdown, or a
+        # language-boundary split queued via maybe_refine(..., force_sync=False)
+        # just above it) lands close to an async one. force_sync=True still
+        # blocks the caller until this task has actually run (the shutdown
+        # path needs the transcript finished before the process exits) --
+        # it just does so by waiting on the task rather than by running the
+        # work inline, so it can't jump the queue ahead of an
+        # already-queued-but-not-yet-run older group.
         if run_sync:
-            work()  # shutdown path: finish the transcript before exiting
+            done = threading.Event()
+
+            def sync_work(work=work, done=done):
+                try:
+                    work()
+                finally:
+                    done.set()
+
+            self._task_queue.put(sync_work)
+            done.wait()
         else:
-            threading.Thread(target=work, daemon=True).start()
+            self._task_queue.put(work)
 
 
 def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStats,

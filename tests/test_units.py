@@ -779,3 +779,75 @@ def test_refiner_add_span_splits_again_on_return_to_original_language():
     assert r.calls == [(48000, True, False), (96000, True, False)]
     assert len(r.spans) == 1
     assert r.spans[0][2] == "ja"
+
+
+# ---- Refiner worker: output order must track enqueue order, not decode time --
+
+def test_refiner_worker_prints_groups_in_enqueue_order_despite_slower_first_decode():
+    # Regression for a reviewed-as-plausible ordering bug: the refine worker
+    # used to be "spawn a fresh thread per group, serialize the critical
+    # section with a Lock". Thread.start() order is not lock-acquisition
+    # order, so a language-boundary flush (add_span calling
+    # maybe_refine(force=True, force_sync=False)) racing the next group's
+    # own flush could let the *second* group's thread win the lock and print
+    # first, reversing [refine/...] output relative to real time. The fix
+    # replaces per-call threads with a single FIFO worker fed by a
+    # queue.Queue, so enqueue order (== call order == audio chronology)
+    # deterministically equals decode/print order regardless of how long
+    # any individual group's mock decode takes. This test enqueues a
+    # deliberately SLOW first group and a fast second group and asserts the
+    # slow one still finishes and prints first.
+    import threading
+    import time
+
+    printed_order = []
+
+    class _FakeAsr:
+        forced_lang = None
+
+        def _identify_lang(self, buf, sr):
+            # report agreement with the caller's own language so
+            # resolve_refine_lang short-circuits to "no change" and the
+            # refine path falls straight through to transcribe(). Decided
+            # from the buffer's length (16000 samples for group 1, 32000
+            # for group 2, since PREROLL_S pulls each group's buffer back
+            # to sample 0) rather than a mutable attribute set by the main
+            # thread -- that attribute would race with the worker thread
+            # reading it once both groups are queued, which is exactly the
+            # kind of nondeterminism this test must not itself depend on.
+            return "ja" if len(buf) == 16000 else "en"
+
+        def transcribe(self, buf, sr, known_lang=None, live=False):
+            if known_lang == "ja":
+                time.sleep(0.2)  # much slower than the second group
+            printed_order.append(known_lang)
+            return {"text": f"text-{known_lang}"}
+
+    sr = 16000
+    history = AudioHistory(sr, keep_s=30.0)
+    history.push(np.zeros(sr * 3, dtype=np.float32))
+    printer = PartialPrinter(enabled=False)
+    asr = _FakeAsr()
+    refiner = Refiner(asr, history, sr, printer)
+
+    # group 1: ja, slow decode, spans [0, 16000). Text must actually look
+    # Japanese -- script_corrected_lang() would otherwise reclassify an
+    # ASCII string tagged "ja" as "en" and defeat the buffer-length check
+    # _identify_lang relies on below.
+    refiner.spans = [(0, 16000, "ja", "テスト文章です", "")]
+    refiner.maybe_refine(16000, force=True, force_sync=False)
+
+    # group 2: en, fast decode, spans [16000, 32000) -- enqueued right after
+    # group 1, mirroring a language-boundary flush closely followed by the
+    # next group's own flush.
+    refiner.spans = [(16000, 32000, "en", "group two text", "")]
+    refiner.maybe_refine(32000, force=True, force_sync=False)
+
+    refiner._task_queue.join()  # wait for both queued tasks to finish
+
+    assert printed_order == ["ja", "en"], (
+        f"expected FIFO (enqueue) order despite the slower first decode, got {printed_order}")
+
+    # and there is exactly one persistent worker thread, not one per call
+    worker_threads = [t for t in threading.enumerate() if t is refiner._worker_thread]
+    assert len(worker_threads) == 1
