@@ -11,5 +11,6 @@ pytest==9.1.1
 OpenCC==1.4.2
 pykakasi==2.3.0   # kana-space scoring for the singing eval (eval_singing.py)
 gdown==6.1.0      # PJS corpus download in make_singset.py
-pyarrow==25.0.1   # column-projected remote parquet reads (eval_translate.py, FLEURS)
+pyarrow==25.0.1   # column-projected remote parquet reads (eval_translate.py, quantize_punct.py)
 sacrebleu==2.6.0  # chrF scoring (eval_translate.py)
+onnxconverter-common==1.16.0  # fp16 conversion (quantize_punct.py --variant fp16)
