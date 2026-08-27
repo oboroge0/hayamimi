@@ -66,4 +66,79 @@ void main() {
       expect(resolved.tokens, 'TOKENS.TXT');
     });
   });
+
+  group('resolveOnnxFile', () {
+    test('matches any .onnx file when role is left blank', () {
+      final resolved = resolveOnnxFile(['model.onnx', 'tokens.txt']);
+      expect(resolved, 'model.onnx');
+    });
+
+    test('matches by role substring, case-insensitively', () {
+      final resolved = resolveOnnxFile([
+        'MODEL-Encoder.ONNX',
+        'model-decoder.onnx',
+      ], role: 'encoder');
+      expect(resolved, 'MODEL-Encoder.ONNX');
+    });
+
+    test('prefers the int8 variant when both are present', () {
+      final resolved = resolveOnnxFile([
+        'model.onnx',
+        'model.int8.onnx',
+      ]);
+      expect(resolved, 'model.int8.onnx');
+    });
+
+    test('throws when no .onnx file matches the role', () {
+      expect(
+        () => resolveOnnxFile(['model.onnx'], role: 'decoder'),
+        throwsA(isA<ModelFileResolutionException>()),
+      );
+    });
+
+    test('requireInt8 rejects a match with no int8 variant', () {
+      expect(
+        () => resolveOnnxFile(['model.onnx'], requireInt8: true),
+        throwsA(isA<ModelFileResolutionException>()),
+      );
+    });
+
+    test('requireInt8 returns the int8 variant when present', () {
+      final resolved = resolveOnnxFile([
+        'model.onnx',
+        'model.int8.onnx',
+      ], requireInt8: true);
+      expect(resolved, 'model.int8.onnx');
+    });
+  });
+
+  group('resolveOnnxFilePair', () {
+    test('resolves both roles independently', () {
+      final resolved = resolveOnnxFilePair(
+        [
+          'whisper-encoder.int8.onnx',
+          'whisper-decoder.int8.onnx',
+          'README.md',
+        ],
+        role1: 'encoder',
+        role2: 'decoder',
+        requireInt8: true,
+      );
+
+      expect(resolved.first, 'whisper-encoder.int8.onnx');
+      expect(resolved.second, 'whisper-decoder.int8.onnx');
+    });
+
+    test('throws when one side has no int8 match and requireInt8 is set', () {
+      expect(
+        () => resolveOnnxFilePair(
+          ['whisper-encoder.int8.onnx', 'whisper-decoder.onnx'],
+          role1: 'encoder',
+          role2: 'decoder',
+          requireInt8: true,
+        ),
+        throwsA(isA<ModelFileResolutionException>()),
+      );
+    });
+  });
 }
