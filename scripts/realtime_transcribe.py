@@ -471,7 +471,8 @@ class Refiner:
                 [buf[start:end] for lid, start, end in turns if lid == local_id]
             )
             emb = self.speaker_labeler.embed(cluster_audio, self.sr)
-            global_label[local_id] = self.speaker_labeler.match_embedding(emb, update=True)
+            global_label[local_id] = self.speaker_labeler.match_embedding(
+                emb, update=True, threshold=self.speaker_labeler.remap_threshold)
 
         outputs = []  # (global_label, turn_text), in chronological turn order
         for local_id, start, end in turns:
@@ -779,6 +780,11 @@ def main():
                          "Default depends on --mode (2 for balanced, 1 for fast).")
     ap.add_argument("--speakers", action="store_true",
                     help="label utterances with speaker ids (S1, S2, ...)")
+    ap.add_argument("--speaker-remap-threshold", type=float, default=None, metavar="T",
+                    help="cosine similarity threshold for the refine-path local-cluster-to-"
+                         "global remap (speaker_id.SpeakerLabeler.remap_threshold), independent "
+                         "of the fast-path SIM_THRESHOLD. Default: same as the fast path "
+                         "(speaker_id.SIM_THRESHOLD). See docs/DIARIZATION_PLAN.md section 8.")
     ap.add_argument("--translate", nargs="?", const="en", default=None, metavar="LANGS",
                     help="translate Japanese lines to these languages, comma-separated "
                          "(default en). en=FuguMT; any other M2M-100 target code "
@@ -834,7 +840,14 @@ def main():
     if args.speakers:
         from speaker_id import SpeakerLabeler
 
-        speaker_labeler = SpeakerLabeler()
+        # None here means "use speaker_id.py's own default (REMAP_THRESHOLD)",
+        # not "same as the fast-path threshold" -- only pass remap_threshold
+        # through when --speaker-remap-threshold was actually given, so the
+        # SpeakerLabeler constructor's own default applies otherwise.
+        speaker_kwargs = {}
+        if args.speaker_remap_threshold is not None:
+            speaker_kwargs["remap_threshold"] = args.speaker_remap_threshold
+        speaker_labeler = SpeakerLabeler(**speaker_kwargs)
         try:
             from diarize import GroupDiarizer
 

@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
 
-from eval_diar import group_segments, parse_rttm, segments_to_der_tuples
+from eval_diar import der_breakdown, group_segments, parse_rttm, segments_to_der_tuples
 
 
 # ---- parse_rttm -------------------------------------------------------------
@@ -132,6 +132,35 @@ def test_der_end_to_end_from_parsed_rttm(tmp_path):
     )
     ref = segments_to_der_tuples(parse_rttm(str(rttm)))
     assert simpleder.DER(ref, ref, collar=0.25) == pytest.approx(0.0)
+
+
+# ---- der_breakdown (iteration 5: Miss/FA/Confusion via pyannote.metrics) ----
+
+def test_der_breakdown_zero_for_identical_ref_and_hyp():
+    pytest.importorskip("pyannote.metrics")
+    ref = [("A", 0.0, 5.0), ("B", 5.0, 10.0)]
+    result = der_breakdown(ref, ref, collar=0.0)
+    assert result["miss"] == pytest.approx(0.0)
+    assert result["false_alarm"] == pytest.approx(0.0)
+    assert result["confusion"] == pytest.approx(0.0)
+    assert result["der_breakdown"] == pytest.approx(0.0)
+
+
+def test_der_breakdown_isolates_confusion_from_miss():
+    pytest.importorskip("pyannote.metrics")
+    # Pure confusion: same coverage, wrong speaker for the second half.
+    ref = [("A", 0.0, 10.0)]
+    hyp_confused = [("A", 0.0, 5.0), ("B", 5.0, 10.0)]
+    confused = der_breakdown(ref, hyp_confused, collar=0.0)
+    assert confused["confusion"] > 0.0
+    assert confused["miss"] == pytest.approx(0.0)
+    assert confused["false_alarm"] == pytest.approx(0.0)
+
+    # Pure miss: hypothesis simply doesn't cover the second half at all.
+    hyp_missed = [("A", 0.0, 5.0)]
+    missed = der_breakdown(ref, hyp_missed, collar=0.0)
+    assert missed["miss"] > 0.0
+    assert missed["confusion"] == pytest.approx(0.0)
 
 
 # ---- group_segments (iteration 3-4 Refiner-style grouping) ------------------
