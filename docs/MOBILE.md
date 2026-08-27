@@ -383,21 +383,124 @@ is not a drop-in accuracy-neutral replacement. If this is revisited later:
 - Latency/size still need on-ARM-device confirmation regardless of which
   variant ships, same caveat as everywhere else in this document.
 
+### Follow-up: fp16 and static INT8 (QDQ) candidates — fp16 PASSES, static INT8 fails too
+
+Dynamic INT8 above failed the pre-declared −0.02 F1 threshold by a wide
+margin (−0.0812). Two follow-up candidates from `scripts/quantize_punct.py`'s
+"Next steps" list were tried next, same harness (FLEURS ja, n=250, seed=0,
+`--source fleurs`), same pre-declared pass criterion (variant F1 within
+−0.02 of fp32 F1):
+
+- **fp16**: whole-graph float16 conversion via `onnxconverter-common`
+  (`onnxconverter_common.float16.convert_float_to_float16(model,
+  keep_io_types=True)` — keeps `input_ids`/`attention_mask`/`logits` at
+  their original int64/float32 dtypes so `punct_ja.py` needs no changes;
+  only internal weights/activations run in fp16). New CLI: `--variant fp16`.
+- **int8-static (QDQ, calibrated)**: `onnxruntime.quantization.quantize_static`
+  with `QuantFormat.QDQ`, `weight_type=QInt8`, `activation_type=QUInt8`,
+  calibrated on **100 FLEURS ja sentences disjoint from the 250-sentence
+  eval set** (`--calib-n 100 --calib-seed 777`, excluded by exact string
+  match against the eval sentences — no calibration-on-eval leakage). The
+  preprocessing step (`quant_pre_process`) needed `sympy` (added to the
+  venv, not yet added to `requirements.txt` — out of this task's scope)
+  and its symbolic-shape-inference pass fails on this graph's
+  position-embedding `Min(512, seq_len)` broadcast pattern ("Incomplete
+  symbolic shape inference"); the script falls back to
+  `quant_pre_process(..., skip_symbolic_shape=True)` automatically when
+  that happens. New CLI: `--variant int8-static`.
+
+#### Results (FLEURS ja, n=250, seed=0 — same set as the dynamic-INT8 run above)
+
+| variant | size | reduction | P | R | F1 | punct-inclusive CER | mean latency (this PC) |
+|---|---|---|---|---|---|---|---|
+| fp32 | 363.5 MB | — | 0.8724 | 0.4831 | 0.6218 | 2.81% | 51.5–77.6 ms* |
+| int8 dynamic | 91.4 MB | 74.9% | 0.9638 | 0.3757 | 0.5407 | 3.25% | 22.94 ms |
+| **fp16** | **181.8 MB** | **50.0%** | 0.8724 | 0.4831 | **0.6218** | 2.81% | 532.3 ms |
+| int8-static (QDQ) | 91.3 MB | 74.9% | 0.9275 | 0.3432 | 0.5010 | 3.48% | 35.0 ms |
+
+\* fp32 is re-run as the baseline in both variant runs; 51.5ms alongside
+fp16, 77.6ms alongside int8-static — within this PC's run-to-run noise,
+not a real difference. int8 dynamic's 22.94ms figure is from the earlier
+run above (same harness).
+
+**fp16 PASSES** (F1 delta = **+0.0000** — bit-for-bit identical P/R/F1/CER
+to fp32 on this 250-sentence set; the punctuation predictions did not
+change at all going to half precision). **int8-static FAILS**, and fails
+*worse* than dynamic INT8 (F1 delta = **−0.1208** vs dynamic's −0.0812):
+same failure mode as dynamic — precision goes up (0.928 vs 0.872) but
+recall collapses further (0.343 vs 0.483, dynamic's own already-collapsed
+0.376). Calibration didn't fix the recall problem; QDQ activation
+quantization made it worse. Combined with the dynamic-INT8 result, this
+now rules out *both* INT8 quantization approaches tried for this model —
+the recall collapse looks like a property of quantizing this BERT-char
+head's decision boundary near the comma/period threshold, not a specific
+recipe's fault.
+
+fp16's latency on this PC is the catch: **532ms mean `restore()` call,
+~10x slower than fp32's ~52-78ms and ~23x slower than int8 dynamic**. This
+x86/Windows CPU (via onnxruntime's CPU EP) has no native fp16 compute path
+for this op mix, so fp16 tensors are cast to fp32, computed, and cast back
+at essentially every op — pure overhead with no matching throughput gain,
+unlike a GPU or an ARM chip with a NEON fp16 vector unit. This is the same
+PC-vs-ARM caveat flagged everywhere else in this document: fp16's *size*
+win (50%, real and platform-independent) is what would carry over to a
+phone; its *latency* number here says nothing about ARM/NEON-fp16 or
+Apple/Qualcomm NPU behavior and must be re-measured on-device before
+relying on it.
+
+#### Mobile-sizing verdict: fp16 is the sole surviving candidate
+
+Of the three quantization variants tried for this model (dynamic INT8,
+int8-static/QDQ, fp16), **fp16 is the only one that clears the accuracy
+bar** — it is the recommended candidate *if* this model needs a
+smaller-than-fp32 footprint on a phone-deployable profile:
+`models/mojicast-punct-onnx/quantized_ort/punct_bert.fp16.onnx` (not
+committed; regenerate via `--variant fp16`), 181.8 MB vs fp32's 363.5 MB.
+Both INT8 approaches (dynamic and static/QDQ) are now considered
+exhausted for this model at default settings — see "if revisited" below.
+
+As with the ASR-side fp16/int8 findings elsewhere in this document, **this
+does not change the PC default**: `scripts/punct_ja.py`'s `PunctuatorJa`
+keeps loading fp32 (`punct_bert.onnx`) by default, since the PC build has
+no size constraint. fp16 is recorded here purely as the phone-deployable
+candidate; wiring it into the actual mobile profile (and re-measuring
+latency on real ARM hardware, per the caveat above) is a separate mobile-
+integration task, out of scope here.
+
+If INT8 is revisited again later for this model specifically (beyond
+fp16), the two off-the-shelf recipes here are now both empirically ruled
+out; next steps would need to get more invasive: per-mark-type threshold
+tuning specifically for a quantized checkpoint (lower comma/period
+decision thresholds to compensate for the recall shift), quantization-
+aware training/fine-tuning rather than post-training quantization, or
+accepting a mixed strategy (e.g. keep the attention/matmul-heavy layers
+in fp16 and leave embeddings in fp32) rather than a single blanket
+conversion.
+
 ### Reproduce
 
 ```
 H:\Programming\hayamimi\.venv\Scripts\python.exe scripts\quantize_punct.py
 H:\Programming\hayamimi\.venv\Scripts\python.exe scripts\quantize_punct.py --skip-quantize --source fleurs --n 250 --latency
+H:\Programming\hayamimi\.venv\Scripts\python.exe scripts\quantize_punct.py --variant fp16 --source fleurs --n 250 --seed 0 --latency
+H:\Programming\hayamimi\.venv\Scripts\python.exe scripts\quantize_punct.py --variant int8-static --source fleurs --n 250 --seed 0 --calib-n 100 --calib-seed 777 --latency
 ```
 
-The first command (re)quantizes and evaluates on the 15-clip `eval_real`
-sample (`--source eval_real`, the default). The second re-evaluates an
-already-produced int8 file against the larger 250-sentence FLEURS set used
-above (`--source fleurs`); pass `--seed` to resample differently. Writes
+The first command (re)quantizes and evaluates dynamic INT8 on the 15-clip
+`eval_real` sample (`--source eval_real`, the default, `--variant int8` by
+default). The second re-evaluates an already-produced int8 file against
+the larger 250-sentence FLEURS set used above (`--source fleurs`); pass
+`--seed` to resample differently. The third and fourth (re)quantize and
+evaluate the fp16 and int8-static follow-up candidates on the same
+250-sentence FLEURS set; int8-static additionally calibrates on a
+disjoint 100-sentence FLEURS sample (`--calib-n`/`--calib-seed`). Writes
 the quantized model under
-`models/mojicast-punct-onnx/quantized_ort/punct_bert.int8.onnx` (not
-committed) and a `scratch_quantize_punct_results_<source>.json` summary at
-repo root per source (also not committed, scratch artifacts).
+`models/mojicast-punct-onnx/quantized_ort/punct_bert.<variant>.onnx` (not
+committed, `models/` is untracked) and a
+`scratch_quantize_punct_results_<source>_<variant>.json` summary at repo
+root per run (also not committed, scratch artifacts). fp16 needs the
+`onnxconverter-common` pip package; int8-static needs `sympy` for its
+preprocessing step — neither is yet pinned in `requirements.txt`.
 
 ## Multi-language routing on mobile
 
