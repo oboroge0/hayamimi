@@ -848,6 +848,82 @@ def test_refiner_worker_prints_groups_in_enqueue_order_despite_slower_first_deco
     assert printed_order == ["ja", "en"], (
         f"expected FIFO (enqueue) order despite the slower first decode, got {printed_order}")
 
+
+# ---- Refiner worker: shutdown must drain the whole backlog, not just the ---
+# ---- one task it explicitly enqueues -----------------------------------
+
+def test_refiner_shutdown_must_drain_full_backlog_not_just_last_task():
+    # Full-pipeline QA (docs/DIARIZATION_PLAN.md section 10) found that a
+    # 10-minute --speakers run silently dropped the meeting's final ~1
+    # minute of refine output with no exception and exit code 0. Root
+    # cause: realtime_transcribe.py's finish() called
+    # `refiner.maybe_refine(0, force=True)` and exited. That call only
+    # blocks on the ONE task it enqueues -- and it enqueues nothing at all
+    # if self.spans is already empty, which happens whenever the very last
+    # group closed asynchronously (force_sync=False) slightly earlier
+    # during run_stream. On long --speakers audio the single FIFO worker
+    # thread routinely lags behind the fast path (per-group diarization +
+    # per-turn re-decode costs far more than a plain refine), so a backlog
+    # of already-queued groups can still be sitting in _task_queue,
+    # unprocessed, when the main thread reaches shutdown. Since the worker
+    # is a daemon thread, exiting there kills it mid-backlog. The fix is
+    # for shutdown to additionally call `refiner._task_queue.join()`. This
+    # test reproduces the race directly: it enqueues a slow group
+    # asynchronously (spans end up empty afterward, exactly like the real
+    # add_span/maybe_refine call during run_stream), then simulates the
+    # shutdown-time forced flush finding nothing new to flush. Without the
+    # join(), the slow group's output would not be observed by this point.
+    import threading
+    import time
+
+    printed = []
+    decode_started = threading.Event()
+
+    class _FakeAsr:
+        forced_lang = None
+
+        def _identify_lang(self, buf, sr):
+            return "en"
+
+        def transcribe(self, buf, sr, known_lang=None, live=False):
+            decode_started.set()
+            time.sleep(0.3)  # stands in for a slow --speakers group refine
+            printed.append("late-group")
+            return {"text": "late-group text"}
+
+    sr = 16000
+    history = AudioHistory(sr, keep_s=30.0)
+    history.push(np.zeros(sr * 3, dtype=np.float32))
+    printer = PartialPrinter(enabled=False)
+    refiner = Refiner(_FakeAsr(), history, sr, printer)
+
+    # A group closes asynchronously mid-stream, exactly like add_span's
+    # language-boundary flush or a natural GROUP_GAP/GROUP_MAX close during
+    # run_stream: force=True, force_sync=False. self.spans is emptied
+    # immediately (maybe_refine clears it before returning), well before
+    # the slow fake decode above even starts.
+    refiner.spans = [(0, 16000, "en", "some slow group's fast-path text", "")]
+    refiner.maybe_refine(16000, force=True, force_sync=False)
+    assert refiner.spans == []
+
+    decode_started.wait(timeout=2.0)  # the worker has picked the task up
+
+    # Shutdown's forced flush: self.spans is empty (nothing new happened),
+    # so this is a no-op that returns instantly and does NOT wait for the
+    # backlog -- reproducing the bug's finish() call exactly.
+    refiner.maybe_refine(0, force=True)
+    assert printed == [], (
+        "maybe_refine(force=True) with empty spans must return instantly "
+        "without waiting for the queued backlog (this is the buggy "
+        "behavior being characterized, not the fix)")
+
+    # The fix: shutdown must additionally drain the queue before exiting.
+    refiner._task_queue.join()
+    assert printed == ["late-group"], (
+        "the backlogged group's refine output was lost -- _task_queue.join() "
+        "at shutdown must wait for every already-queued task, not just the "
+        "last one maybe_refine(force=True) happens to enqueue")
+
     # and there is exactly one persistent worker thread, not one per call
     worker_threads = [t for t in threading.enumerate() if t is refiner._worker_thread]
     assert len(worker_threads) == 1

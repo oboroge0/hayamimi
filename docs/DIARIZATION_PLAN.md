@@ -887,6 +887,209 @@ hysteresis(min_hits=2):  ['S1', 'S1', 'S1', 'S1']  -- 話者0が永久にS1へ�
     でも未着手のまま。
 - オーバーラップ区間の扱い（先着優先）は引き続き未着手。
 
+## 10. フルパイプライン検証（本番経路: VAD→ASR→清書→グループ再分離→ターン分割出力）
+
+### 背景と目的
+
+§6〜§9のDER測定は`scripts/eval_diar.py`のASR抜きの軽量経路（VADで切った
+セグメントに直接埋め込み・クラスタリングをかけるだけ）で行っており、
+実際にユーザーが使う`scripts/realtime_transcribe.py`の本番経路
+（VAD確定セグメント→ASR速報→`Refiner`の清書グループ化→
+`GroupDiarizer`によるグループ内再分離→ターン単位の再デコード→
+`[refine/S{n}]`出力）は通していなかった。朝のPR提案前の最終QAとして、
+`--speakers`ありでAMI会議2本（各10分、4話者）を実際に完走させ、
+ターン分割・レイテンシ・キュー挙動・メモリを確認した。
+
+### 実行環境
+
+- コマンド: `python scripts/realtime_transcribe.py --wav <file> --no-realtime
+  [--speakers] --mode balanced`
+- 対象: `testdata/eval_diar/IS1008a.wav`, `testdata/eval_diar/ES2011a.wav`
+  （各600秒・16kHz mono、リファレンス話者数4）
+- 計測: 子プロセスの壁時計時間、`psutil`によるプロセスツリー合計RSSの
+  ピーク、`stdout`から`session summary`行の`mean_latency`/`max_latency`
+  （速報パスのASRレイテンシ）
+
+### 10.1 通し実行結果
+
+| ファイル | `--speakers` | 完走 | wall time | peak RSS | segments (速報) | refineライン数 |
+|---|---|---|---|---|---|---|
+| IS1008a | なし | ✅ | 430.6s | 3749MB | 54 | 22 |
+| IS1008a | あり | ✅（後述バグ発見・修正後は完全） | 474.8s | 3752MB | 54 | 70→71(修正後) |
+| ES2011a | なし | ✅ | 218.3s | 3287MB | 75 | 36 |
+| ES2011a | あり | ✅ | 247.3s | 3503MB | 75 | 66 |
+
+2本ともクラッシュ・ハング・未捕捉例外なし（`returncode=0`）。ただし
+IS1008aの`--speakers`実行で、完走はするが**会議終盤の内容が清書出力
+から消える**という実害のあるバグを発見した（10.2）。
+
+### 10.2 発見したバグ: シャットダウン時に清書ワーカーのバックログが
+   ドレインされず終盤の内容が無音のまま消える（修正済み）
+
+**症状**: IS1008a に `--speakers` を付けて通しで実行すると、`returncode=0`・
+例外一切なしで完走するにもかかわらず、会議終盤（「finance/marketing/
+Christineとのやり取り」に相当する約30秒分、速報パスには
+`[S1|en/v3] Because uh she is doing the design ... Do we already have a cast`
+として正しく出ている区間）の清書 `[refine/...]` 行が**一切出力されない**。
+`--speakers`なしの同一ファイル・同一区間では、`[refine/en] ...`として
+一字一句一致する内容が正しく出力される。
+
+**再現条件**: 90秒に切り出した末尾クリップ単体では再現せず、10分フル尺
+でのみ再現した。`Refiner._worker_loop`に`try/except`+`traceback.print_exc()`
+を仕込んでフル尺を再実行しても例外は一切出力されなかった
+（`scripts/realtime_transcribe.py`のこの診断ハンドラは調査用に追加し、
+そのまま防御的措置として残した）。
+
+**根本原因**（`scripts/realtime_transcribe.py`）: `Refiner`は単一の
+FIFOワーカースレッド（daemon）で`_task_queue`を処理する。シャットダウン
+処理の`finish()`は
+
+```python
+if refiner is not None:
+    refiner.maybe_refine(0, force=True)
+```
+
+だけを呼んでいた。`maybe_refine(force=True)`は「今エンキューする**その
+1タスクだけ**」を`threading.Event`で待つ（`done.wait()`）。しかも
+`self.spans`が既に空なら**何もエンキューせず即return**する
+（`if not self.spans: return`）。`--speakers`は話者ごとの再分離＋
+ターンごとの再デコードが発生するぶん通常の清書より大幅に重く
+（1グループあたり0.5〜1s程度で済む通常清書に対し、ダイアライゼーション＋
+複数ターンの個別ASR再デコードが乗る）、10分尺では速報パス（メイン
+スレッド）がワーカースレッドの処理速度を上回って先に進み、
+`run_stream`終了時点で**すでに非同期（`force_sync=False`）でキューに
+積まれたまま未処理のグループがバックログとして残っている**ケースが
+生じる。この状態で最後のグループがちょうど`run_stream`中に非同期フラッシュ
+済み（＝`self.spans`が空）だと、`finish()`の`maybe_refine(force=True)`は
+何もせず即座に戻り、`done.wait()`による待機も発生しない。その直後に
+メインスレッドは`session summary`を出力してプロセスを終了し、daemon
+ワーカースレッドはバックログを処理しきる前に強制終了される――
+これが例外なし・`returncode=0`・内容だけ消える、という観測と完全に一致する。
+
+**修正**（`scripts/realtime_transcribe.py`の`finish()`）: `maybe_refine`の
+直後に`refiner._task_queue.join()`を追加し、既にキューに積まれている
+全タスク（同期・非同期問わず）の完了を待ってから終了するようにした。
+
+```python
+if refiner is not None:
+    refiner.maybe_refine(0, force=True)
+    refiner._task_queue.join()
+```
+
+**検証**: 修正後にIS1008a・ES2011aを`--speakers`ありで再実行し、両方とも
+最終グループの内容が欠落なく`[refine/...]`に出力されることを確認した
+（IS1008aは71行、末尾が`[refine/S1|en] ... Do we already have a cast`で
+速報パスの最終行と一致）。回帰テストとして
+`tests/test_units.py::test_refiner_shutdown_must_drain_full_backlog_not_just_last_task`
+を追加し、モデルなしで「非同期フラッシュ直後は`self.spans`が空になる →
+`maybe_refine(force=True)`は待たずに戻る → `_task_queue.join()`を呼んで
+初めてバックログの出力が観測される」という再発防止のガード条件を固定した。
+`pytest tests -q`は127件全通過（既存126件＋新規1件）。
+
+### 10.3 ターン分割出力の実例
+
+修正後のIS1008a（`--speakers`）から、1つの清書グループ内で複数話者に
+正しく分割された実例:
+
+```
+[refine/S1|en] new project which we are going to discuss now so I want to
+  introduce first of all the names and the colleagues here
+[refine/S1|en] And what you're uh doing?
+[refine/S2|en] Uh sure. My name is Agnes and I'm an user usability user
+  interface designer.
+[refine/S3|en] My name is Ed and I do accounting.
+[refine/S1|en] Uh how do you spell your name uh E D. E. D, okay.
+[refine/S3|en] E D.
+[refine/S4|en] Do you also do marketing?
+```
+
+`--speakers`なしでは同じ区間が単一の多数決ラベル1行に潰れる
+（§1で記載した既知の限界）のに対し、`--speakers`ありでは相槌の応酬
+（"E D." のような1〜2語の短いターン）まで含めて話者ごとに分離できている。
+清書テキスト自体の崩壊（単語の欠落・文字化け）は目視で確認した範囲では
+見られなかった。ただし後述10.6の通り話者数の過大推定（S1〜S7、
+ES2011aはS1〜S13相当）は残っている。
+
+### 10.4 清書レイテンシへの影響
+
+`session summary`の`mean_latency`/`max_latency`は速報パス（VAD確定
+セグメント単位のASR）のレイテンシで、`--speakers`は速報パスに
+埋め込み計算1回を追加するのみなので影響は小さいと予想した通りだった:
+
+| ファイル | 指標 | `--speakers`なし | `--speakers`あり | 差分 |
+|---|---|---|---|---|
+| IS1008a | mean_latency | 783ms | 838ms | +55ms |
+| IS1008a | max_latency | 4318ms | 4353ms | +35ms |
+| ES2011a | mean_latency | 456ms | 479ms | +23ms |
+| ES2011a | max_latency | 2256ms | 2206ms | -50ms |
+
+速報パスのレイテンシはほぼ変わらない。コストが乗るのは清書パス側で、
+壁時計全体の増分（IS1008a: 430.6s→474.8s、+44.2s / ES2011a:
+218.3s→247.3s、+29.0s、いずれも`--no-realtime`での処理時間差）が
+それに相当する。清書ワーカーは速報パスと並行して裏で走る設計なので
+体感の速報表示には影響しないが、10.2のバグが示す通り**清書が速報パスに
+追いつききれないバックログが実際に発生する**ため、清書の「最終的な
+到着」は録音直後ではなく、10〜30秒以上遅れて（場合によっては音声終了後
+まで）続くことがある。
+
+### 10.5 FIFOワーカーとの相互作用（キュー詰まり）
+
+10.2の通り、キューが「詰まる」こと自体は実際に起きていた
+（バックログが未処理のまま残る）。ただし本番のFIFO設計自体は健全で、
+シャットダウン時に`_task_queue.join()`で待てば必ず全件処理される
+（デッドロックやスタベーションは観測されず、単に「終了処理が
+バックログを待たずに先に終わっていた」というシャットダウン手順の
+バグだった）。稼働中（ストリーミング中）の詰まりについては、キューの
+深さを直接ログするインストルメンテーションはコードベースに無く、
+今回は間接的に（清書行の出力タイミングの空白区間・壁時計の増分から）
+確認した。次回の作業では`_task_queue.qsize()`をサマリーに含める
+などバックログの深さを直接観測できるようにしておくと、今回のような
+バグの切り分けが速くなる。
+
+### 10.6 RSS/安定性
+
+| ファイル | `--speakers`なし peak RSS | `--speakers`あり peak RSS | 差分 |
+|---|---|---|---|
+| IS1008a | 3749MB | 3752MB | +3MB |
+| ES2011a | 3287MB | 3503MB | +216MB |
+
+差分はモデル込みプロセスツリー全体（ASR・LID・翻訳ワーカー等含む）の
+ピークで、CAM++埋め込みモデル自体は28MBと小さいため、話者追加に伴う
+メモリ増分は誤差〜数百MB程度に収まっている。10分尺2本を通しても
+メモリリークを疑う継続的な増加傾向は見られなかった（本測定はプロセス
+単位のピークのみで、時系列のRSS推移は取っていない）。
+
+過大推定の副作用として、ES2011aの`--speakers`実行ではセントロイドが
+S1〜S13相当まで開いた（リファレンス4話者）。これは§9で記録した
+軽量DER測定（`eval_diar.py`、ref4に対し4〜5）よりも明確に悪い数字で、
+本番の清書パスが`_emit_turns()`経由で`speaker_labeler.embed()`/
+`match_embedding()`を清書グループごと・ターンごとに追加で呼ぶため、
+軽量経路の測定より頻繁にセントロイドマッチングが走り、閾値を跨ぐ
+機会そのものが増えているのが一因とみられる（未検証の推測。§9の
+残課題「話者数過大推定」がフルパイプラインではむしろ悪化しうる、
+という新しい懸念として申し送る）。
+
+### 10.7 実用判断・申し送り
+
+- **10.2のバグは修正済み・回帰テスト追加済みで、PRに含めてよい状態**。
+  修正前の状態でPRを出していた場合、長尺会議の`--speakers`利用で
+  終盤の清書が無言で消えるという、ユーザーから見て気づきにくい
+  重大な体験劣化を埋め込むところだった。
+- ターン分割の質そのもの（10.3）は実用的で、テキストの崩壊も
+  見られない。相槌レベルの短いターンまで拾えている。
+- 話者数の過大推定（10.6）は§8/§9で既知の課題だが、フルパイプラインで
+  測ると軽量DER評価より悪化して見える会議があった。DERへの実害は
+  §8で小さいと確認済みだが、**表示される話者ラベルの数がユーザー体験に
+  直結する**ことを踏まえると、次イテレーションの優先課題として
+  引き続き重い。
+- レイテンシ・メモリの両面で、`--speakers`を本番投入すること自体への
+  障害は見当たらなかった（速報パスの体感速度は変わらず、清書の遅延も
+  実用範囲内、メモリ増分も小さい）。
+- 申し送り: キューの深さを可観測にする計装がないため、同種の
+  バックログ関連の不具合は次回も気づきにくい。`_task_queue.qsize()`や
+  最終グループのタイムスタンプをサマリーに出す等の軽量な計装を
+  今後のイテレーションで検討する価値がある。
+
 ## 出典
 
 - [Speaker Diarization — sherpa-onnx docs](https://k2-fsa.github.io/sherpa/onnx/speaker-diarization/index.html)
