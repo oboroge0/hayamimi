@@ -396,7 +396,7 @@ class Refiner:
     def __init__(self, asr: RoutedASR, history: AudioHistory, sample_rate: int,
                  printer: PartialPrinter, transcript_path: str | None = None,
                  translators: dict | None = None, stats: "SessionStats | None" = None,
-                 speaker_labeler=None, diarizer=None):
+                 speaker_labeler=None, diarizer=None, min_remap_update_s: float = 0.0):
         self.asr = asr
         self.history = history
         self.sr = sample_rate
@@ -414,6 +414,10 @@ class Refiner:
         # and the fast path's centroids double as the diarizer's anchor set.
         self.speaker_labeler = speaker_labeler
         self.diarizer = diarizer
+        # Round 4 (docs/DIARIZATION_PLAN.md section 14) T2 experiment: see
+        # eval_diar.generate_diarize_hypothesis()'s min_remap_update_s
+        # docstring. 0.0 (default) is a no-op.
+        self.min_remap_update_s = min_remap_update_s
         self.spans: list[tuple[int, int, str, str, str]] = []
         self._transcript = open(transcript_path, "a", encoding="utf-8") if transcript_path else None
         # A single FIFO worker (not "spawn a thread per refine") is what makes
@@ -470,7 +474,8 @@ class Refiner:
 
     MIN_TURN_S = 0.3  # shorter diarization turns aren't worth a separate ASR call
 
-    def _emit_turns(self, buf: np.ndarray, refine_lang: str, fast_joined: str) -> bool:
+    def _emit_turns(self, buf: np.ndarray, refine_lang: str, fast_joined: str,
+                    majority_speaker: str = "") -> bool:
         """Multi-speaker refine path (docs/DIARIZATION_PLAN.md iterations 3-4).
 
         Re-diarizes this group's audio and, if it finds a genuine speaker
@@ -479,6 +484,12 @@ class Refiner:
         to. Each local diarization cluster is remapped onto the SAME global
         centroids self.speaker_labeler (the fast path) maintains, so S{n}
         stays consistent between the fast and refine passes.
+
+        majority_speaker is maybe_refine()'s own majority-vote label over
+        the group's fast-path per-segment labels -- the same fallback the
+        caller would print on a decline. Only used as the read-only-remap
+        fallback for a too-short local cluster when self.min_remap_update_s
+        gates it (see that attribute's comment); ignored otherwise.
 
         Returns True if it printed turn-level output (caller should stop
         and skip the single-line fallback), False if it declined: no
@@ -517,9 +528,16 @@ class Refiner:
                 [buf[start:end] for lid, start, end in turns if lid == local_id]
             )
             emb = self.speaker_labeler.embed(cluster_audio, self.sr)
-            global_label[local_id] = self.speaker_labeler.match_embedding(
-                emb, update=True, threshold=self.speaker_labeler.remap_threshold,
-                source="remap")
+            cluster_dur_s = sum((end - start) / self.sr for lid, start, end in turns if lid == local_id)
+            if self.min_remap_update_s > 0 and cluster_dur_s < self.min_remap_update_s:
+                probe = self.speaker_labeler.match_embedding(
+                    emb, update=False, threshold=self.speaker_labeler.remap_threshold,
+                    source="remap")
+                global_label[local_id] = probe if probe else majority_speaker
+            else:
+                global_label[local_id] = self.speaker_labeler.match_embedding(
+                    emb, update=True, threshold=self.speaker_labeler.remap_threshold,
+                    source="remap")
 
         # iteration 6 (docs/DIARIZATION_PLAN.md section 9): this refine
         # group's remap is the natural "clean copy" boundary -- give
@@ -688,7 +706,7 @@ class Refiner:
             # coherent re-decode a turn-level re-split would make sense
             # against) and so does the fallback branch below when the
             # diarizer isn't available or found only one speaker.
-            if not mixed and self._emit_turns(buf, refine_lang, fast_joined):
+            if not mixed and self._emit_turns(buf, refine_lang, fast_joined, speaker):
                 return
 
             # speaker is the majority vote over the group's canonical
@@ -871,6 +889,14 @@ def main():
     ap.add_argument("--speaker-hysteresis-min-hits", type=int, default=None, metavar="N",
                     help="hits required to confirm a provisional speaker, when "
                          "--speaker-hysteresis. Default: speaker_id.HYSTERESIS_MIN_HITS.")
+    ap.add_argument("--speaker-min-remap-update-s", type=float, default=0.0, metavar="S",
+                    help="Round 4 (docs/DIARIZATION_PLAN.md section 14) T2 experiment: a "
+                         "refine-group local diarization cluster shorter than this many "
+                         "seconds remaps READ-ONLY -- it can still match an existing global "
+                         "speaker, but never folds its (likely noisier, since it's short) "
+                         "embedding into that speaker's centroid and never opens a brand-new "
+                         "S{n} on a miss, falling back to the group's majority fast-path label "
+                         "instead. 0.0 (default) is a no-op.")
     ap.add_argument("--translate", nargs="?", const="en", default=None, metavar="LANGS",
                     help="translate Japanese lines to these languages, comma-separated "
                          "(default en). en=FuguMT; any other M2M-100 target code "
@@ -971,7 +997,8 @@ def main():
                                                   transcript_path=args.transcript,
                                                   translators=translators, stats=stats,
                                                   speaker_labeler=speaker_labeler,
-                                                  diarizer=diarizer)
+                                                  diarizer=diarizer,
+                                                  min_remap_update_s=args.speaker_min_remap_update_s)
 
     def finish(sr):
         vad.flush()
