@@ -1927,6 +1927,195 @@ this frame is excluded.」— **overlapフレームは話者セグメント抽�
   要望）は着手していない。構造的floor（~3.1pt）を動かす唯一の既知
   経路だが、スコープの大きい別イテレーションが必要。
 
+## 15. Round 5: REMAP誤りへの2つの対策実験（joint remap／provisional centroid除外）— いずれも不採用
+
+### 背景
+
+§14（Round 4）でconfusionの内訳診断を行い、両meetingともREMAP誤り
+（`SpeakerLabeler.match_embedding()`がグループ内のローカル話者クラスタを
+セッション全体のグローバルS{n}へ誤って割り当てるケース）が支配的
+（ES2011a 49%、IS1009a 61%）と確認済み。§14 T2の`min_remap_update_s`
+（centroid更新をクラスタ長でゲート）は「短いクラスタのノイズがcentroidを
+汚す」という仮説を検証したが、REMAP誤りの絶対秒数は全く動かず反証された
+（§14 T2の結論）。本ラウンドはコード自体を読み直して見つけた別の仮説を
+2本試す。
+
+**メカニズム（コードで確認済み）**: `realtime_transcribe.Refiner._emit_turns()`
+は清書グループ内の各ローカルクラスタを`SpeakerLabeler.match_embedding()`
+経由で**独立に**（貪欲最近傍、閾値0.35）グローバルS{n}へマッチさせる。
+同じグループ内の2つの異なるローカルクラスタが同じグローバル話者へ
+マッチするのを妨げる仕組みが何もない — 実在する2人の話者が1人に
+潰れれば、それはDER上のconfusionとして現れる。
+
+### T1: 制約付き同時remap（Hungarian割当）
+
+**仮説**: 上記の「2つのローカルクラスタが同じグローバル話者に潰れる」
+ケースをそもそも起こさせなければ、その分のREMAP誤りが減るはず。
+
+**実装**（`scripts/speaker_id.py`に`SpeakerLabeler.match_embeddings_joint()`
+を追加。デフォルトoffのフラグ経由でのみ呼ばれる —
+`scripts/realtime_transcribe.py`の`Refiner`に`joint_remap`コンストラクタ
+引数／`--speaker-joint-remap`CLIフラグ、`scripts/eval_diar.py`の
+`generate_diarize_hypothesis()`に同名引数／`--joint-remap`CLIフラグ）:
+グループ内の全ローカルクラスタ×生存中の全グローバルcentroidの
+コサイン類似度行列を一度に作り、`scipy.optimize.linear_sum_assignment`
+（Hungarian法）で**合計類似度を最大化する1対1割当**を解く。既存の
+remap_threshold（0.35）は割当後の適格性フィルタとしてそのまま残す —
+最適割当の類似度がそれでも閾値未満のクラスタは「適格な候補なし」として
+従来の独立`match_embedding()`呼び出しにフォールバック（新規speakerを開く、
+または非制約の単独最近傍にマッチ）。単一ローカルクラスタのグループは
+Hungarianを経由せず従来パスと完全に同一（制約すべき相手がいないため）。
+`min_remap_update_s`（§14 T2）がゲートする短いクラスタは、そちらの
+read-onlyプローブが先に処理し、Hungarian対象からは除外する。
+
+**測定**（AMI 5会議、collar=0.25s、`--method refine_diarize --breakdown`）:
+
+| meeting | baseline DER | joint-remap DER | Δ | baseline confusion | joint-remap confusion |
+|---|---|---|---|---|---|
+| ES2011a | 17.0% | 20.3% | **+3.3pt** | 6.1% | 8.2% |
+| IS1008a | 4.0% | 5.2% | **+1.2pt** | 0.7% | 2.0% |
+| ES2004a | 17.8% | 20.0% | **+2.2pt** | 5.0% | 6.7% |
+| IS1009a | 16.9% | 26.6% | **+9.7pt** | 12.4% | 19.4% |
+| TS3003a | 14.1% | 15.8% | **+1.7pt** | 0.7% | 2.2% |
+| **平均** | **13.9%** | **17.6%** | **+3.7pt** | — | — |
+
+**5会議全てで悪化**、しかも§13で確認済みの run-to-run ノイズ床
+（±0.2pt級）を遥かに超える規模。採用基準（0.3pt以上の改善、悪化
+0.5pt以内）どころか、逆方向に大きく外れているため即座に不採用と判断、
+T2の全体sanity（pytest等）は実施しなかった（採用基準未達の時点で
+スコープ外 — タスク定義通り）。
+
+**なぜ悪化したか（§14と同じ手法の内部診断インストルメントで検証、
+ES2011a・IS1009a）**:
+
+| meeting | 施策 | confusion合計 | LOCAL | REMAP | FAST-PATH残差 |
+|---|---|---|---|---|---|
+| ES2011a | baseline | 23.5s | 8.6s（36.6%） | 11.0s（47.0%） | 3.8s（16.4%） |
+| ES2011a | joint-remap | 36.3s | 21.6s（**59.6%**） | 7.3s（20.1%） | 7.4s（20.3%） |
+| IS1009a | baseline | 57.3s | 22.1s（38.5%） | 35.2s（61.4%） | 0.0s |
+| IS1009a | joint-remap | 89.8s | 38.0s（42.3%） | 51.7s（57.6%） | 0.0s |
+
+ES2011aではREMAP誤りの絶対秒数自体は確かに減った（11.0s→7.3s、狙い通り）
+が、LOCAL誤りがそれ以上に増えた（8.6s→21.6s）。IS1009aに至っては
+REMAP・LOCAL両方が悪化した（REMAP 35.2s→51.7s、LOCAL 22.1s→38.0s）。
+
+原因の仮説（コード上の性質から）: LOCAL誤りの定義は「グループの時間
+範囲内でローカルクラスタ→参照話者の最適割当（Hungarian、重複時間
+最大化）を計算しても、なお参照と食い違う」ケース — つまり**ローカル
+diarizerの局所クラスタリング自体が実話者数より過分割している**場合、
+本来は同一話者である2つのローカルクラスタを、joint remapは制約により
+**強制的に別々のグローバル話者へ割り当てる**。これは「2つの異なる
+ローカルクラスタは異なる実話者である」という前提（T1のタスク設計の
+根拠）が、ローカルクラスタリングが完璧ではない現実の下では成り立たない
+ことを意味する。§0以来「LOCAL誤りは局所クラスタリングそのものの限界」
+と位置付けてきたが、本実験はその限界が単独では良性でも、joint制約と
+組み合わさると新たな誤りを能動的に生み出す（過分割された同一話者の
+片方を無理やり別人にする）ことを示した。
+
+（run間ノイズについての注記: `GroupDiarizer`のローカルクラスタリングは
+§14で述べた通り完全に決定論的ではないため、上表の内部診断（1回実行）
+はLOCAL/REMAPの厳密な内訳にノイズを含む。ただしフルスイープのDER自体
+（5会議全て、平均+3.7pt悪化）はそのノイズ床を遥かに超える規模なので、
+「T1は悪化する」という結論自体はノイズに左右されない。）
+
+**判定: 不採用**。`--joint-remap`/`--speaker-joint-remap`フラグは
+コードとしては残す（デフォルトoff、機能追加のみで本番非影響）が、
+有効化は推奨しない。
+
+### T3: provisional centroidをremap候補から除外
+
+T1が失敗し、かつIS1009aのconfusionが基準の8%を大きく超えたまま
+（12.4%）だったため、タスク定義どおりT3に進んだ。
+
+**仮説**: `speaker_id.PROVISIONAL_CONFIRM_HITS`未満（＝一度もマッチされて
+いない、開いたばかりの一発centroid）がremapの最近傍探索に混ざっている
+ことで、本来別の（既に確定した）話者にマッチすべきクラスタの類似度を
+「奪って」誤ったマッチを起こしているのではないか。
+
+**実装**（`scripts/speaker_id.py`の`SpeakerLabeler.match_embedding()`に
+`exclude_provisional`引数を追加。Trueの場合、`self._counts[i] <
+PROVISIONAL_CONFIRM_HITS`のcentroidを最近傍探索から完全に除外する
+——マッチしても新規オープンしてもよいが、それ以外のcentroidの
+邪魔をさせない。remap呼び出し（`Refiner._emit_turns()`の独立/short-id
+両方、`eval_diar.py`の同等ループ）にのみ`exclude_provisional_remap`
+という新規フラグ経由で渡す — fast path（`label()`）には決して渡さない
+＝centroidが最初の確認ヒットを得る経路そのものを塞がないようにした。
+`--exclude-provisional-remap`/`--speaker-exclude-provisional-remap`
+CLIフラグ、デフォルトoff）。
+
+**測定**（同条件）:
+
+| meeting | baseline DER | exclude-provisional DER | Δ | baseline confusion | exclude-provisional confusion |
+|---|---|---|---|---|---|
+| ES2011a | 17.0% | 17.7% | +0.7pt | 6.1% | 6.8% |
+| IS1008a | 4.0% | 4.0% | ±0 | 0.7% | 0.7% |
+| ES2004a | 17.8% | 17.6% | -0.2pt | 5.0% | 5.0% |
+| IS1009a | 16.9% | 20.5% | **+3.6pt** | 12.4% | 15.4% |
+| TS3003a | 14.1% | 14.2% | +0.1pt | 0.7% | 0.9% |
+| **平均** | **13.9%** | **14.8%** | **+0.9pt** | — | — |
+
+T1ほど壊滅的ではないが、平均DERは改善どころか悪化（+0.9pt）、
+IS1009aは単独で+3.6ptの明確な回帰。採用基準（0.3pt以上の改善）を
+満たさないため不採用。
+
+**内部診断**（同手法）:
+
+| meeting | 施策 | confusion合計 | LOCAL | REMAP | FAST-PATH残差 |
+|---|---|---|---|---|---|
+| ES2011a | baseline | 23.5s | 8.6s | 11.0s | 3.8s |
+| ES2011a | exclude-provisional | 27.0s | 8.6s（±0） | 11.0s（**±0**） | 7.4s（+3.6s） |
+| IS1009a | baseline | 57.3s | 22.1s | 35.2s | 0.0s |
+| IS1009a | exclude-provisional | 71.5s | 21.4s（-0.7s） | 50.1s（**+14.9s、悪化**） | 0.0s |
+
+ES2011aはREMAP・LOCALとも全く変化がなく（remapのやり直しが発生する
+ような一発centroidがこのmeetingでは元々remap候補としてほぼ選ばれて
+いなかったと見られる）、増分は全てFAST-PATH残差（clustering非決定性の
+ノイズと見られる、fallbackグループはそもそもremapを経由しない）。
+IS1009aはREMAP誤りが**明確に悪化**（35.2s→50.1s）— 「一発centroidを
+除外すれば正しい確定済み話者にマッチするはず」という仮説とは逆に、
+除外によって**本来は正しいはずの一発centroid自身へのマッチ**（今
+出現した話者が、たまたま直前に一度だけ登場した本人と同一で、
+まだ2回目のヒットに至っていないだけのケース）が塞がれ、代わりに
+別の（誤った）確定済みcentroidへ吸着されたか、無用に新規centroidを
+開いたと考えられる。「provisional＝ノイズが多い一発の誤りやすい
+centroid」という前提が、IS1009aでは「provisional＝正しいが、
+たまたまだ1回しか出現していないだけの新規話者」というケースを
+無視できないほど含んでいたということ。
+
+**判定: 不採用**。`--exclude-provisional-remap`/
+`--speaker-exclude-provisional-remap`フラグはコードとしては残す
+（デフォルトoff、機能追加のみで本番非影響）が、有効化は推奨しない。
+
+### 採用/不採用まとめ
+
+| 施策 | 変更内容 | 平均DERへの効果 | 判定 |
+|---|---|---|---|
+| `match_embeddings_joint()`の追加、`--joint-remap`等 | 機能追加のみ、デフォルトoffで本番非影響 | — | **採用**（評価・本番双方の機能として） |
+| `--joint-remap`を有効化 | グループ内remapを制約付きHungarian割当に | +3.7pt悪化、5会議全て悪化 | **不採用** |
+| `match_embedding()`の`exclude_provisional`引数、`--exclude-provisional-remap`等 | 機能追加のみ、デフォルトoffで本番非影響 | — | **採用**（評価・本番双方の機能として） |
+| `--exclude-provisional-remap`を有効化 | 未確認centroidをremap候補から除外 | +0.9pt悪化（IS1009a+3.6pt） | **不採用** |
+
+ライブレイテンシへの影響: 両施策ともremap呼び出しの回数・タイミングは
+変えない（`match_embeddings_joint()`は同じグループ内の呼び出しを1回に
+まとめる分、むしろ呼び出し回数はわずかに減る）ので、デフォルトoffの
+現状はもちろん、仮に有効化してもレイテンシへの影響はない。今回不採用
+になった理由はいずれもDER側の効果不足（というより悪化）のみ。
+
+### 残課題
+
+- REMAP誤りの真因は§14に続き依然未確定。本ラウンドで判明したのは
+  「REMAP誤りとLOCAL誤りは独立ではなく、remap側の制約を強めると
+  LOCAL側に誤りが押し出される（少なくともES2011aでは）」という
+  トレードオフの存在。今後この方向を攻めるなら、remap側だけでなく
+  ローカルクラスタリングの過分割自体（§14残課題に記載済みの
+  `num_clusters`ヒントなど）に踏み込む必要がありそうだが、未着手。
+- provisional centroidの「ノイズが多い一発」と「正しいが未確認の
+  新規話者」を区別する情報は現状`_counts`（ヒット回数）しかない。
+  T3の反例（IS1009a）は、ヒット回数だけでは両者を判別できないことを
+  示唆しており、次の一手があるとすれば埋め込み自体の質（分散・
+  信頼度スコアなど、sherpa-onnxの埋め込み抽出器からは現状取得
+  できない）のような別シグナルが必要になりそうだが、今回のスコープ外。
+
 ## 出典
 
 - [Speaker Diarization — sherpa-onnx docs](https://k2-fsa.github.io/sherpa/onnx/speaker-diarization/index.html)
