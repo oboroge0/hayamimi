@@ -92,7 +92,8 @@ def segments_to_der_tuples(segments: list[tuple[str, float, float]]
 def generate_speaker_hypothesis(wav_path: str, min_silence: float = 0.35,
                                 max_speech: float = 12.0,
                                 hysteresis_enabled: bool | None = None,
-                                hysteresis_min_hits: int = None) -> list[tuple[str, float, float]]:
+                                hysteresis_min_hits: int = None,
+                                vad_threshold: float = 0.5) -> list[tuple[str, float, float]]:
     """Run hayamimi's real --speakers pipeline pieces over a wav file and
     return (speaker, start_s, end_s) for each VAD-finalized segment.
 
@@ -116,7 +117,7 @@ def generate_speaker_hypothesis(wav_path: str, min_silence: float = 0.35,
     from speaker_id import SpeakerLabeler
 
     samples, sr = read_wave(wav_path, target_rate=SAMPLE_RATE)
-    vad = build_vad(min_silence, max_speech)
+    vad = build_vad(min_silence, max_speech, vad_threshold)
     history = AudioHistory(sr)
     # merge_enabled is deliberately not threaded through here: the baseline
     # method has no group/"clean copy" boundary to hang maybe_merge_centroids()
@@ -197,7 +198,8 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
                                 hysteresis_enabled: bool | None = None,
                                 hysteresis_min_hits: int = None,
                                 min_duration_on: float = None,
-                                min_duration_off: float = None
+                                min_duration_off: float = None,
+                                vad_threshold: float = 0.5
                                 ) -> tuple[list[tuple[str, float, float]], dict]:
     """Score the new method: same VAD + fast SpeakerLabeler as the baseline,
     but grouped exactly the way production's Refiner groups utterances
@@ -249,7 +251,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     from diarize import DEFAULT_MIN_DURATION_OFF, DEFAULT_MIN_DURATION_ON, DEFAULT_THRESHOLD, GroupDiarizer
 
     samples, sr = read_wave(wav_path, target_rate=SAMPLE_RATE)
-    vad = build_vad(min_silence, max_speech)
+    vad = build_vad(min_silence, max_speech, vad_threshold)
     history = AudioHistory(sr)
     # the single session-global centroid set, shared by fast path + remap.
     # Only pass remap_threshold/merge_threshold/hysteresis_min_hits through
@@ -418,7 +420,8 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
                   merge_enabled: bool | None = None, merge_threshold: float = None,
                   hysteresis_enabled: bool | None = None, hysteresis_min_hits: int = None,
                   min_duration_on: float = None, min_duration_off: float = None,
-                  breakdown: bool = False, skip_overlap: bool = False) -> dict:
+                  breakdown: bool = False, skip_overlap: bool = False,
+                  vad_threshold: float = 0.5) -> dict:
     import simpleder
 
     ref = segments_to_der_tuples(parse_rttm(rttm_path))
@@ -428,10 +431,11 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
         hyp_raw, extra = generate_diarize_hypothesis(
             wav_path, min_silence, max_speech, diar_threshold, sim_threshold, remap_threshold,
             merge_enabled, merge_threshold, hysteresis_enabled, hysteresis_min_hits,
-            min_duration_on, min_duration_off)
+            min_duration_on, min_duration_off, vad_threshold)
     else:
         hyp_raw = generate_speaker_hypothesis(
-            wav_path, min_silence, max_speech, hysteresis_enabled, hysteresis_min_hits)
+            wav_path, min_silence, max_speech, hysteresis_enabled, hysteresis_min_hits,
+            vad_threshold)
     decode_s = time.time() - t0
     hyp = segments_to_der_tuples(hyp_raw)
 
@@ -464,6 +468,17 @@ def main():
                     help="VAD min_silence_duration, same knob as realtime_transcribe.py")
     ap.add_argument("--max-speech", type=float, default=12.0,
                     help="VAD max_speech_duration, same knob as realtime_transcribe.py")
+    ap.add_argument("--vad-threshold", type=float, default=0.5, metavar="T",
+                    help="Silero VAD speech-probability threshold (sherpa_onnx "
+                         "SileroVadModelConfig.threshold), same knob as realtime_transcribe.py's "
+                         "build_vad(). Default 0.5 matches current production/sherpa_onnx "
+                         "default. Lower values flag more low-energy speech as speech at the "
+                         "cost of more false alarms. docs/DIARIZATION_PLAN.md section 13 "
+                         "(Round 3). The installed sherpa_onnx has no speech-padding knob to "
+                         "pair with this (checked: SileroVadModelConfig fields are threshold, "
+                         "min_silence_duration, min_speech_duration, max_speech_duration, "
+                         "window_size, neg_threshold -- no speech_pad_ms), so there is no "
+                         "--vad-pad flag.")
     ap.add_argument("--method", choices=["baseline", "refine_diarize"], default="baseline",
                     help="baseline: current --speakers (SpeakerLabeler only, docs/"
                          "DIARIZATION_PLAN.md section 6). refine_diarize: iteration "
@@ -555,7 +570,8 @@ def main():
                                hysteresis_min_hits=args.hysteresis_min_hits,
                                min_duration_on=args.min_duration_on,
                                min_duration_off=args.min_duration_off,
-                               breakdown=args.breakdown, skip_overlap=args.skip_overlap)
+                               breakdown=args.breakdown, skip_overlap=args.skip_overlap,
+                               vad_threshold=args.vad_threshold)
         extra = ""
         if "diar_time_s" in result and result.get("audio_s"):
             rtf = result["diar_time_s"] / result["audio_s"]

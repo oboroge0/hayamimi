@@ -45,14 +45,24 @@ def read_wave(path: str, target_rate: int = SAMPLE_RATE):
 
 
 def build_vad(min_silence: float = 0.35,
-              max_speech: float = 12.0) -> sherpa_onnx.VoiceActivityDetector:
+              max_speech: float = 12.0,
+              vad_threshold: float = 0.5) -> sherpa_onnx.VoiceActivityDetector:
     # 0.35s endpointing measured CER-neutral vs 0.5s on real broadcast ja
     # (docs/BENCHMARKS.md iteration 9) and finalizes 150ms sooner. max_speech
     # force-splits breathless monologues (radio/game commentary hit 21s
     # segments) so finals stay timely; the refine pass re-merges the group.
+    # vad_threshold is Silero's own speech-probability cutoff (sherpa_onnx's
+    # SileroVadModelConfig default is 0.5); lowering it makes the VAD flag
+    # more low-energy/quiet speech as speech at the cost of more false
+    # alarms. docs/DIARIZATION_PLAN.md section 13 (Round 3) sweeps this --
+    # this default (0.5) keeps current production behavior unchanged.
+    # The installed sherpa_onnx (1.12.15) SileroVadModelConfig exposes no
+    # speech-padding knob (no speech_pad_ms field) alongside threshold, so
+    # there is nothing to plumb through for that half of T1.
     cfg = sherpa_onnx.VadModelConfig(
         silero_vad=sherpa_onnx.SileroVadModelConfig(
             model=VAD_MODEL,
+            threshold=vad_threshold,
             min_silence_duration=min_silence,
             min_speech_duration=0.25,
             window_size=WINDOW_SIZE,
