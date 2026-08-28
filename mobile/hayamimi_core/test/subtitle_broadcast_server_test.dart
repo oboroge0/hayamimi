@@ -102,6 +102,31 @@ void main() {
       }
     });
 
+    test('a second start() while running keeps the same bound port', () async {
+      await server.start();
+      final port = server.boundPort;
+
+      await server.start();
+
+      expect(server.boundPort, port);
+    });
+
+    test('concurrent start() calls bind exactly one server', () async {
+      // The isRunning guard alone doesn't cover this: it only flips once
+      // the bind completes, so two overlapping starts both used to bind,
+      // and the first server was dropped on the floor still listening.
+      await Future.wait([server.start(), server.start(), server.start()]);
+      final port = server.boundPort;
+      expect(port, isNotNull);
+
+      await server.stop();
+
+      // If a second, unreferenced server had also bound, it would still be
+      // holding the port here.
+      final rebound = await ServerSocket.bind(InternetAddress.anyIPv4, port!);
+      await rebound.close();
+    });
+
     test('stop() closes the port so a new server can bind a fresh one', () async {
       await server.start();
       expect(server.isRunning, isTrue);

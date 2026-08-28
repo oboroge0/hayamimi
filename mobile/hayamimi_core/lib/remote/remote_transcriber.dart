@@ -71,7 +71,18 @@ class RemoteTranscriber {
   /// ingest handshake, and starts streaming mic audio. Reconnects
   /// automatically with a fixed backoff if the connection drops, until
   /// [disconnect] is called.
+  ///
+  /// Throws [StateError] if this client is already connected, connecting,
+  /// or waiting to reconnect — connecting twice would orphan the first
+  /// socket and stream the mic into both. Call [disconnect] first to move
+  /// to a different server.
   Future<void> connect(String url) async {
+    if (_desiredConnected) {
+      throw StateError(
+        'RemoteTranscriber is already connected or connecting to $_url; '
+        'call disconnect() before connecting again.',
+      );
+    }
     _url = url;
     _desiredConnected = true;
     await _connectOnce();
@@ -328,8 +339,13 @@ class RemoteTranscriber {
   }
 
   /// Releases everything, including the mic recorder itself. Call once
-  /// when the owning widget is disposed.
+  /// when the owning widget is disposed. Idempotent: a second call is a
+  /// no-op rather than a "Bad state: Stream has already been closed".
   Future<void> dispose() async {
+    if (_disposed) {
+      return;
+    }
+    _disposed = true;
     await disconnect();
     await _eventsController.close();
     await _stateController.close();

@@ -23,6 +23,11 @@ class SubtitleBroadcastServer {
   final int port;
 
   HttpServer? _httpServer;
+  // [isRunning] only flips once the bind completes, so without this a
+  // second concurrent start() would sail past it and bind a second server
+  // (or, on a fixed port, fail with an address-in-use the caller didn't
+  // ask for) while the first one's HttpServer is dropped on the floor.
+  bool _starting = false;
   final List<HttpResponse> _clients = [];
 
   bool get isRunning => _httpServer != null;
@@ -31,13 +36,20 @@ class SubtitleBroadcastServer {
   /// running. Differs from [port] only when [port] was `0`.
   int? get boundPort => _httpServer?.port;
 
+  /// Binds the LAN listener. A call made while the server is already
+  /// running — or while an earlier [start] is still binding — is a no-op.
   Future<void> start() async {
-    if (isRunning) {
+    if (isRunning || _starting) {
       return;
     }
-    final server = await HttpServer.bind(InternetAddress.anyIPv4, port);
-    _httpServer = server;
-    server.listen(_handleRequest, onError: (_) {});
+    _starting = true;
+    try {
+      final server = await HttpServer.bind(InternetAddress.anyIPv4, port);
+      _httpServer = server;
+      server.listen(_handleRequest, onError: (_) {});
+    } finally {
+      _starting = false;
+    }
   }
 
   Future<void> stop() async {
