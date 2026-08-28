@@ -202,6 +202,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
                                 vad_threshold: float = 0.5,
                                 min_remap_update_s: float = 0.0,
                                 joint_remap: bool = False,
+                                exclude_provisional_remap: bool = False,
                                 ) -> tuple[list[tuple[str, float, float]], dict]:
     """Score the new method: same VAD + fast SpeakerLabeler as the baseline,
     but grouped exactly the way production's Refiner groups utterances
@@ -274,6 +275,15 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     clusters can't land on the same global speaker) -- see that method's
     docstring. Mirrors realtime_transcribe.Refiner._emit_turns() exactly,
     same as every other flag here.
+
+    exclude_provisional_remap (Round 5, docs/DIARIZATION_PLAN.md section 15
+    T3, only run if T1 fails or leaves IS1009a confusion >8%): False
+    (default) is a no-op. When True, every remap match_embedding() call
+    below (both the min_remap_update_s read-only probe and the
+    joint/independent long-cluster path) passes exclude_provisional=True,
+    so a global centroid that hasn't yet been matched a second time can
+    never be chosen as a remap target -- see match_embedding()'s
+    exclude_provisional docstring.
     """
     import numpy as np
     from realtime_transcribe import GROUP_GAP_S, GROUP_MAX_S, SAMPLE_RATE, AudioHistory, build_vad, read_wave, wav_chunks
@@ -381,7 +391,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
                 short_ids.append(local_id)
                 probe = labeler.match_embedding(
                     cluster_embs[local_id], update=False, threshold=labeler.remap_threshold,
-                    source="remap")
+                    source="remap", exclude_provisional=exclude_provisional_remap)
                 global_label[local_id] = probe if probe else majority
 
         joint_ids = [lid for lid in local_ids if lid not in short_ids and lid not in empty_ids]
@@ -396,7 +406,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
                 for local_id in joint_ids:
                     global_label[local_id] = labeler.match_embedding(
                         cluster_embs[local_id], update=True, threshold=labeler.remap_threshold,
-                        source="remap")
+                        source="remap", exclude_provisional=exclude_provisional_remap)
 
         # iteration 6 (section 9): this group's remap is exactly the "clean
         # copy" boundary merge_centroids() is meant for -- give it a chance
@@ -481,7 +491,7 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
                   min_duration_on: float = None, min_duration_off: float = None,
                   breakdown: bool = False, skip_overlap: bool = False,
                   vad_threshold: float = 0.5, min_remap_update_s: float = 0.0,
-                  joint_remap: bool = False) -> dict:
+                  joint_remap: bool = False, exclude_provisional_remap: bool = False) -> dict:
     import simpleder
 
     ref = segments_to_der_tuples(parse_rttm(rttm_path))
@@ -491,7 +501,8 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
         hyp_raw, extra = generate_diarize_hypothesis(
             wav_path, min_silence, max_speech, diar_threshold, sim_threshold, remap_threshold,
             merge_enabled, merge_threshold, hysteresis_enabled, hysteresis_min_hits,
-            min_duration_on, min_duration_off, vad_threshold, min_remap_update_s, joint_remap)
+            min_duration_on, min_duration_off, vad_threshold, min_remap_update_s, joint_remap,
+            exclude_provisional_remap)
     else:
         hyp_raw = generate_speaker_hypothesis(
             wav_path, min_silence, max_speech, hysteresis_enabled, hysteresis_min_hits,
@@ -614,6 +625,14 @@ def main():
                          "independently, so two distinct local clusters can't both land on the "
                          "same global speaker. Only meaningful with --method refine_diarize. Off "
                          "by default. See speaker_id.SpeakerLabeler.match_embeddings_joint().")
+    ap.add_argument("--exclude-provisional-remap", action="store_true",
+                    help="Round 5 (docs/DIARIZATION_PLAN.md section 15) T3 experiment: a global "
+                         "centroid that hasn't yet been matched a second time (still provisional, "
+                         "see speaker_id.PROVISIONAL_CONFIRM_HITS) is never chosen as a remap "
+                         "target -- it may be 'stealing' a match that should have gone to a real, "
+                         "already-recurring speaker. Only meaningful with --method refine_diarize. "
+                         "Off by default. See speaker_id.SpeakerLabeler.match_embedding()'s "
+                         "exclude_provisional docstring.")
     ap.add_argument("--skip-overlap", action="store_true",
                     help="T2 (docs/DIARIZATION_PLAN.md section 12): exclude reference regions "
                          "with >=2 concurrent speakers from DER scoring (pyannote.metrics "
@@ -650,7 +669,8 @@ def main():
                                breakdown=args.breakdown, skip_overlap=args.skip_overlap,
                                vad_threshold=args.vad_threshold,
                                min_remap_update_s=args.min_remap_update_s,
-                               joint_remap=args.joint_remap)
+                               joint_remap=args.joint_remap,
+                               exclude_provisional_remap=args.exclude_provisional_remap)
         extra = ""
         if "diar_time_s" in result and result.get("audio_s"):
             rtf = result["diar_time_s"] / result["audio_s"]

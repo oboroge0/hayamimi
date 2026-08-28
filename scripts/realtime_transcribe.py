@@ -397,7 +397,7 @@ class Refiner:
                  printer: PartialPrinter, transcript_path: str | None = None,
                  translators: dict | None = None, stats: "SessionStats | None" = None,
                  speaker_labeler=None, diarizer=None, min_remap_update_s: float = 0.0,
-                 joint_remap: bool = False):
+                 joint_remap: bool = False, exclude_provisional_remap: bool = False):
         self.asr = asr
         self.history = history
         self.sr = sample_rate
@@ -424,6 +424,10 @@ class Refiner:
         # False (default) is a no-op -- every local cluster still remaps
         # independently via match_embedding(), same as before.
         self.joint_remap = joint_remap
+        # Round 5 (docs/DIARIZATION_PLAN.md section 15) T3 experiment: see
+        # speaker_id.SpeakerLabeler.match_embedding()'s exclude_provisional
+        # docstring. False (default) is a no-op.
+        self.exclude_provisional_remap = exclude_provisional_remap
         self.spans: list[tuple[int, int, str, str, str]] = []
         self._transcript = open(transcript_path, "a", encoding="utf-8") if transcript_path else None
         # A single FIFO worker (not "spawn a thread per refine") is what makes
@@ -550,7 +554,7 @@ class Refiner:
         for local_id in short_ids:
             probe = self.speaker_labeler.match_embedding(
                 cluster_embs[local_id], update=False, threshold=self.speaker_labeler.remap_threshold,
-                source="remap")
+                source="remap", exclude_provisional=self.exclude_provisional_remap)
             global_label[local_id] = probe if probe else majority_speaker
 
         joint_ids = [lid for lid in local_ids if lid not in short_ids]
@@ -571,7 +575,7 @@ class Refiner:
                 for local_id in joint_ids:
                     global_label[local_id] = self.speaker_labeler.match_embedding(
                         cluster_embs[local_id], update=True, threshold=self.speaker_labeler.remap_threshold,
-                        source="remap")
+                        source="remap", exclude_provisional=self.exclude_provisional_remap)
 
         # iteration 6 (docs/DIARIZATION_PLAN.md section 9): this refine
         # group's remap is the natural "clean copy" boundary -- give
@@ -938,6 +942,14 @@ def main():
                          "each local cluster independently, so two distinct local clusters "
                          "can't both land on the same global speaker. Off by default pending "
                          "measurement; see speaker_id.SpeakerLabeler.match_embeddings_joint().")
+    ap.add_argument("--speaker-exclude-provisional-remap", action="store_true",
+                    help="Round 5 (docs/DIARIZATION_PLAN.md section 15) T3 experiment: a global "
+                         "speaker centroid that hasn't yet been matched a second time (still "
+                         "provisional, see speaker_id.PROVISIONAL_CONFIRM_HITS) is never chosen "
+                         "as a remap target -- it may be 'stealing' a match that should have gone "
+                         "to a real, already-recurring speaker. Off by default. See "
+                         "speaker_id.SpeakerLabeler.match_embedding()'s exclude_provisional "
+                         "docstring.")
     ap.add_argument("--translate", nargs="?", const="en", default=None, metavar="LANGS",
                     help="translate Japanese lines to these languages, comma-separated "
                          "(default en). en=FuguMT; any other M2M-100 target code "
@@ -1040,7 +1052,8 @@ def main():
                                                   speaker_labeler=speaker_labeler,
                                                   diarizer=diarizer,
                                                   min_remap_update_s=args.speaker_min_remap_update_s,
-                                                  joint_remap=args.speaker_joint_remap)
+                                                  joint_remap=args.speaker_joint_remap,
+                                                  exclude_provisional_remap=args.speaker_exclude_provisional_remap)
 
     def finish(sr):
         vad.flush()

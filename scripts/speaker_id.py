@@ -218,7 +218,8 @@ class SpeakerLabeler:
         return self._remap_threshold
 
     def match_embedding(self, emb: np.ndarray, update: bool = True,
-                         threshold: float | None = None, source: str = "") -> str:
+                         threshold: float | None = None, source: str = "",
+                         exclude_provisional: bool = False) -> str:
         """Assign a precomputed embedding to the nearest global centroid
         (or open a new speaker), same policy as label() but for a caller
         that already has an embedding (see embed()).
@@ -241,11 +242,25 @@ class SpeakerLabeler:
         source is a free-form diagnostic tag ("fast"/"remap") recorded in
         centroid_open_counts() whenever this call opens a brand-new
         centroid -- see __init__'s _open_log comment. Purely observational.
+
+        exclude_provisional (Round 5, docs/DIARIZATION_PLAN.md section 15
+        T3): when True, a centroid that hasn't yet been matched a second
+        time (self._counts[i] < PROVISIONAL_CONFIRM_HITS -- is_provisional()'s
+        own definition, section 10.8's "one-off outlier" case) is skipped
+        entirely as a match candidate here, as if it didn't exist. T1's
+        hypothesis (never confirmed measured) was that such a fresh,
+        still-noisy one-off centroid can "steal" a remap match that should
+        have gone to a real, already-recurring speaker. Only meant for the
+        remap call sites -- never pass True for the fast path, which is
+        exactly how a centroid earns its first confirming second hit in
+        the first place.
         """
         thr = self._threshold if threshold is None else threshold
         best, best_sim = -1, -1.0
         for i, c in enumerate(self._centroids):
             if i in self._alias:  # merged away (iteration 6); dead slot
+                continue
+            if exclude_provisional and self._counts[i] < PROVISIONAL_CONFIRM_HITS:
                 continue
             sim = float(np.dot(emb, c) / (np.linalg.norm(c) + 1e-9))
             if sim > best_sim:
