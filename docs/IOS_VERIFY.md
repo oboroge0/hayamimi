@@ -14,6 +14,76 @@ Windows 側では Xcode の操作そのものを検証できないため、本�
 「Mac 未検証」と明記した箇所は、実際に Mac 上で一度通してみるまで手順の正確性
 を保証しない。
 
+## 検証ステータス: (a)〜(d) 完了、(e) 未検証 (2026-08-27)
+
+この Mac 上の Claude Code セッションで、本ドキュメントの手順を実際に一度通した。
+実機は iPhone 15 (おぼろげiPhone, iOS 27.0 beta)、Xcode 26.3、Flutter 3.47.1
+(3.41.6 からアップグレード済み)。次にこの続きをやるセッション向けの引き継ぎ:
+
+- **(a) Bench RTF**: 完了。ja int8, RTF **0.013**(PC int8 の 0.062 より
+  約4.8倍速い — 想定通り ARM の int8 カーネルが効いた)。詳細・比較表は
+  `docs/MOBILE.md` の「On-device (iPhone 15) verification」節。
+- **(b) マニフェスト一括評価**: 完了。`testdata/eval_real/`(15 ja + 15 en、
+  `scripts/make_realset.py --skip-eval` で Mac 上で再生成可能、公開HF
+  データセット経由なので Windows 側の元データ不要)を実機に push して完走。
+- **(c) Live 実マイク**: 完了。文字起こし成功、発熱なし、UI もたつきなし。
+- **(d) 多言語ルーティング Live**: 完了(動作はした)。SenseVoice +
+  whisper-tiny(LID)を実機に push、ja⇔en の言語バッジ切り替えを確認。
+  ただし複数人が話している部屋での実施だったため、精度自体は参考値どまり
+  — 静かな環境での単独話者での再検証が望ましい。`testdata/eval_real_zhko/`
+  (zh/ko 用、`scripts/make_realset_zhko.py --skip-eval` で同様に再生成可能)
+  も生成・push 済み。
+- **(e) Remote**: **オーナー判断で対象外**(このセッションではやらない)。
+  Mac 上で `python scripts/realtime_transcribe.py --input ws --serve
+  --lang ja` は起動できた(`ws://<Mac IP>:8766/ingest`)が、この Mac の
+  Wi-Fi (en0) の IP が通常のプライベート LAN 範囲外(`104.194.96.0/20`)で、
+  iPhone から実際に届くか確認する前にオーナーが「Remote はやらなくていい」
+  と判断し、検証対象から外れた。再開する場合はまず iPhone 側の Wi-Fi 設定
+  (設定 > Wi-Fi > 接続中のネットワークの (i) > IP アドレス) を見て、Mac 側
+  と同じセグメントかどうか確認するところから。
+
+### このセッションで踏んだ落とし穴 (次回のために)
+
+- **debug ビルドは `flutter run` / `flutter attach` 経由でしか起動できない**
+  — `flutter install` で入れてから `xcrun devicectl device process launch`
+  で単独起動しようとすると "Debug mode Flutter apps can only be launched
+  from Flutter tooling" で弾かれる。
+- **iOS 27 beta では LLDB のアタッチが遅い/不安定**(1〜3分、時にはそれ以上)。
+  `flutter config --no-enable-lldb-debugging` は逆に Xcode 経由の起動に
+  フォールバックしてさらに悪化した(Automation 権限待ちでハング)ので、
+  デフォルト設定のまま気長に待つのが結局一番安定した。
+- **devicectl のトンネル接続がしばしば invalidate される**
+  ("CoreDeviceError", "Lost connection to device")。詰まったら
+  **USB ケーブルを一度抜き差しする**とトンネルが張り直されて解消することが
+  多かった。
+- **`flutter run`/`flutter install` を繰り返すと、アプリの Documents
+  コンテナ (push したモデルファイル一式) がリセットされることがある** —
+  毎回起動後は `xcrun devicectl device info files --domain-type
+  appDataContainer --domain-identifier dev.oboroge.hayamimiMobile
+  --subdirectory Documents` で中身が残っているか確認し、消えていたら
+  `xcrun devicectl device copy to` で再 push する。
+- **ローカルネットワーク権限**(システム設定 > プライバシーとセキュリティ >
+  ローカルネットワーク)をターミナルアプリに許可しないと、Dart VM Service
+  の探索が `SocketException ... port 5353` で失敗し、アプリが起動時の
+  一時停止状態のまま白画面になる。
+- **モデルファイル配置は Finder より `xcrun devicectl device copy to
+  --domain-type appDataContainer --domain-identifier
+  dev.oboroge.hayamimiMobile` の方が速くて確実**(3節の Finder/Xcode
+  Devices ウィンドウ手順は Mac 未検証のままだが、コマンド版で代替できる
+  ことが分かった)。
+- `mobile/ios/Runner/Info.plist` の `UIFileSharingEnabled` /
+  `LSSupportsOpeningDocumentsInPlace` は既に設定済みだった(3.2節の
+  「Mac 未検証」は解消 — 追加作業不要)。
+
+### 未コミットの差分について
+
+`mobile/ios/Runner.xcodeproj/project.pbxproj` に、Xcode で選択した個人の
+Apple Developer Team ID (`DEVELOPMENT_TEAM = 9M9U5TB32V`) と
+`objectVersion` の自動更新 (54→60) がローカルに残っている。他の開発者の
+ビルドに影響しうる個人設定なので**意図的にコミットしていない**。このまま
+残すか `git checkout -- mobile/ios/Runner.xcodeproj/project.pbxproj` で
+戻すかは要判断。
+
 ## 0. 全体の流れ
 
 1. Mac の前提環境を整える
