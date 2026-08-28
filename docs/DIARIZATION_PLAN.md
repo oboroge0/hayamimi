@@ -1578,6 +1578,137 @@ Round 3では清書側のオフラインパラメータではなく、ライブV
   の差分3.1ptを縮めるには、overlap detection自体の実装が必要になり、
   スコープが大きい（Round 3以降の検討事項）。
 
+## 13. Round 3: ライブSilero VAD検出しきい値のスイープ（issue #11続き、§12 T3の申し送り）
+
+### 背景
+
+Round 2（§12）のT3診断で、TS3003a・ES2011aの実際のmissの70〜78%は
+**ライブSilero VADが一度も音声として検出せず、清書グループにすら
+入らなかった区間**（TS3003a 27.8s/490.6s、ES2011a 30.2s/394.9s）に
+起因することが分かった。境界ズレ／清書内部その他は2〜2.5%程度、
+`min_duration_on`起因は実質ゼロ。§12はこの結果から「Round 3では
+清書側のオフラインパラメータではなく、ライブVADの感度チューニングを
+検討対象にすべき」と申し送っていた。IS1009aの confusion 12.4%（5会議中
+最大）は本ラウンドの対象外（VAD側のmiss改善に絞る）。
+
+タスクは4つ: (T1) `scripts/realtime_transcribe.py`の`build_vad()`が
+持つSilero VADの感度ノブの露出、(T2) スイープ、(T3) 採用候補が出た
+場合のみのfaサニティゲート、(T4) 本セクションでのまとめ。
+
+### T1: ライブVAD感度ノブの露出
+
+`build_vad()`に`vad_threshold`引数（デフォルト0.5 = 現行本番動作と同じ）
+を追加し、`sherpa_onnx.SileroVadModelConfig.threshold`にそのまま渡すよう
+にした。`eval_diar.py`に`--vad-threshold`を、既存の`--min-silence`/
+`--max-speech`と同じ配線パターンで追加した
+(`scripts/realtime_transcribe.py`, `scripts/eval_diar.py`)。
+
+もう一つ探すはずだった「speech-padding（onset/offset側の余白）ノブ」は、
+インストール済み`sherpa_onnx`（1.13.6）の`SileroVadModelConfig`を実際に
+`dir()`で確認したところ**存在しなかった**: 持っているフィールドは
+`threshold`, `min_silence_duration`, `min_speech_duration`,
+`max_speech_duration`, `window_size`, `neg_threshold`の6つのみで、
+`speech_pad_ms`に相当するものはない。従って`--vad-pad`フラグは追加せず、
+このバージョンでは`threshold`単独が唯一の実効ノブとなる。
+
+### T2: スイープ
+
+AMI 5会議、collar=0.25s、`--method refine_diarize --breakdown`、他は
+デフォルト（`remap_threshold=0.35`, `sim_threshold=0.45`,
+`diar_threshold=0.5`, `min_silence=0.35`）での実測。baseline行は
+本ラウンドで再実測した`--vad-threshold 0.5`（Round 1到達点14.1%との
+差は実行間ノイズ、後述）。
+
+| vad-threshold | 平均DER | ES2011a | IS1008a | ES2004a | IS1009a | TS3003a |
+|---|---|---|---|---|---|---|
+| 0.50（baseline再実測） | 13.9% | 17.0% | 4.0% | 17.8% | 16.9% | 14.1% |
+| 0.40 | 16.5% | 33.7%（**+16.7pt**） | 4.7%（+0.7pt） | 17.2%（-0.6pt） | 14.9%（-2.0pt） | 11.9%（-2.2pt） |
+| 0.30 | 15.8% | 32.0%（**+15.0pt**） | 4.0%（±0.0pt） | 16.2%（-1.6pt） | 14.1%（-2.8pt） | 12.8%（-1.3pt） |
+| 0.20 | 15.6% | 20.8%（+3.8pt） | 4.0%（±0.0pt） | 18.2%（+0.4pt） | 19.7%（+2.8pt） | 15.3%（+1.2pt） |
+
+内訳（Miss/FalseAlarm/Confusion、参照総発話時間比、`--breakdown`実測）:
+
+| vad-threshold | ES2011a | IS1008a | ES2004a | IS1009a | TS3003a | 平均miss / 平均fa / 平均confusion |
+|---|---|---|---|---|---|---|
+| 0.50 | miss11.3/fa3.5/conf6.1 | miss2.6/fa3.5/conf0.7 | miss14.5/fa3.7/conf5.0 | miss6.8/fa4.5/conf12.4 | miss8.7/fa6.5/conf0.7 | 8.8 / 4.3 / 5.0 |
+| 0.40 | miss9.0/fa4.4/**conf25.2** | miss2.7/fa3.8/conf1.2 | miss12.2/fa6.0/conf5.5 | miss6.9/fa4.6/conf10.1 | miss6.2/fa6.5/conf0.9 | 7.4 / 5.1 / **8.6** |
+| 0.30 | miss7.6/fa4.8/**conf24.2** | miss2.0/fa3.2/conf1.1 | miss10.6/fa6.2/conf5.3 | miss6.5/fa5.1/conf8.7 | miss4.3/fa8.0/conf2.1 | 6.2 / 5.5 / **8.3** |
+| 0.20 | miss7.3/fa7.2/conf9.7 | miss2.0/fa3.2/conf1.1 | miss10.9/fa8.0/conf5.2 | miss6.4/fa8.1/conf10.5 | miss6.2/fa9.9/conf1.1 | 6.6 / **7.3** / 5.5 |
+
+**miss自体はT3診断どおり下がる**（平均8.8%→7.4%→6.2%→6.6%、
+`vad_threshold`を下げるほどライブVADが拾う音声が増えるという狙い通りの
+挙動）。一方で**faも単調に増える**（平均4.3%→5.1%→5.5%→7.3%、想定の
+トレードオフ）。ここまでは狙い通りだが、**想定していなかったのが
+confusionの急増**: ES2011aのconfusionが0.40/0.30で6.1%→25.2%/24.2%と
+4倍化し、平均DERを押し上げる主因になっている。0.20ではconfusionは
+9.7%まで戻るが、代わりにfaが7.2%まで増える（ES2004a・IS1009a・
+TS3003aのfaも軒並み8〜10%台に悪化）。
+
+原因の見立て: しきい値を下げると清書グループの境界に短く低エネルギーな
+音声区間が新たに混入し、`GroupDiarizer`（pyannote segmentation +
+CAM++ + FastClustering）のクラスタリングに揺れが生じて、話者ラベルの
+入れ替わり（confusion）が増える。miss改善分をconfusion／faの悪化が
+上回り、**3つの`vad-threshold`値すべてで平均DERが悪化した**
+（+1.7pt〜+2.6pt、採用基準の「0.3pt以上の改善」の逆方向）。特にES2011aは
+0.40/0.30で+15〜17pt級の大幅悪化で、「どの会議も0.5pt超の悪化なし」
+基準にも大きく抵触する。
+
+**コンボ実行は行わなかった**: T2の設計は「個別で0.3pt以上の改善が
+出た値があればコンボを回す」だったが、0.40/0.30/0.20のいずれも改善
+どころか悪化したため、組み合わせる意味のある候補が無かった。padding
+ノブ自体もT1の通り今回のsherpa_onnxには存在しないため、そもそも
+組み合わせる相手がない。
+
+baseline再実測の13.9%とRound 1到達点の14.1%の差（0.2pt）について:
+`GroupDiarizer`のFastClustering・`SpeakerLabeler`のマッチングは実行間で
+決定論的でない要素を含む（§8以降の既知の実行間ノイズと同水準）ため、
+この程度の差は測定誤差として扱う。0.2pt程度のノイズに対して、
+0.40/0.30/0.20の悪化幅（+1.7〜+2.6pt）は十分大きく、ノイズでは
+説明できない。
+
+### T3: faサニティゲート
+
+**実施しなかった**: タスク設計上、T3は「採用基準（平均0.3pt以上改善）を
+クリアした設定が出た場合のみ」実施する条件付きタスクだった。T2の結果、
+`vad-threshold`0.40/0.30/0.20のいずれも平均DERを悪化させており、
+クリアした設定が一つも無かったため、T3のfa詳細検証・本番デフォルト化の
+検討自体が対象外になった。
+
+### 採用/不採用まとめ
+
+| 施策 | 変更内容 | 平均DERへの効果 | 判定 |
+|---|---|---|---|
+| `vad_threshold`の露出（T1） | `build_vad()`/`--vad-threshold`追加 | 機能追加のみ、デフォルト0.5で本番非影響 | **採用**（評価スクリプト機能として） |
+| `vad_threshold=0.40` | 0.5→0.40 | +2.6pt悪化、ES2011a +16.7pt | **不採用**（悪化基準に大きく抵触） |
+| `vad_threshold=0.30` | 0.5→0.30 | +1.9pt悪化、ES2011a +15.0pt | **不採用**（悪化基準に大きく抵触） |
+| `vad_threshold=0.20` | 0.5→0.20 | +1.7pt悪化、fa平均7.3%まで増加 | **不採用**（改善なし、fa/confusion双方悪化） |
+| padding（speech_pad_ms相当）ノブ | 該当なし | 測定不可 | **対象外**（sherpa_onnx 1.13.6に存在しない） |
+
+本番の`build_vad()`呼び出しはデフォルト値（`vad_threshold=0.5`）のまま
+据え置く。ライブレイテンシへの影響について: `vad_threshold`自体は
+Silero推論1回あたりの確率カットオフであり、`min_silence_duration`の
+ような終端待ち時間には効かないため**しきい値を変えること自体は
+latency-neutral**（このスイープに関する限りレイテンシ論点は無い —
+今回不採用になったのはDER側の悪化のみが理由）。ただしpaddingノブは
+今回のsherpa_onnxに存在しないため、「paddingがtail latencyを増やすか」
+の議論自体が本ラウンドでは発生しなかった。
+
+### 残課題
+
+- **T3診断（§12）の「ライブVAD検出漏れ」問題自体は未解決のまま**。
+  `threshold`単純な引き下げは今回confusion急増という副作用で頭打ちに
+  なった。次に検討する余地があるとすれば`min_speech_duration`
+  （現在0.25s固定）や、Silero単体ではなく2段VAD構成（低しきい値VADで
+  候補区間を広く取り、別の軽量分類器でfaを間引く）だが、いずれも
+  スコープが今回のT1〜T4より大きい。
+- confusion急増のメカニズム（境界に混入した短い低エネルギー区間が
+  `GroupDiarizer`のクラスタリングをどう揺らすか）は仮説止まりで、
+  実際にどのセグメントがconfusionの原因になっているかの秒単位の
+  切り分けは行っていない。`vad_threshold=0.40`のES2011aを対象にした
+  詳細診断は次ラウンド以降の候補。
+- IS1009aのconfusion 12.4%（§0の既知の最大要因）は今回のスコープ外の
+  まま未着手。
+
 ## 出典
 
 - [Speaker Diarization — sherpa-onnx docs](https://k2-fsa.github.io/sherpa/onnx/speaker-diarization/index.html)
