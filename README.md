@@ -129,6 +129,41 @@ brew install git python@3.11 ffmpeg
 python3.11 -m venv .venv
 ```
 
+### Optional local meeting minutes on Apple Silicon
+
+The real-time pipeline stays CPU-only. As a separate post-processing step,
+Apple Silicon Macs with enough unified memory can turn a saved transcript into
+evidence-grounded Japanese minutes with a local MLX model. The script first
+extracts meeting facts with source-line ids, then writes minutes using an
+optional user-supplied evaluation focus. Neither pass calls a cloud API.
+
+```bash
+python3.11 -m venv .venv-llm
+.venv-llm/bin/pip install mlx-lm==0.31.3
+.venv-llm/bin/hf download mlx-community/Qwen3.8-27B-4bit \
+  --local-dir models/qwen3.8-27b-4bit
+
+.venv-llm/bin/python scripts/local_minutes.py meeting.txt \
+  --date "2026-08-27" \
+  --focus "探索型食品発酵、AI・SDL、デジタルツイン、自律的な次条件選定を重視する" \
+  --glossary confirmed-terms.txt \
+  --output meeting-minutes.md
+```
+
+The output path and its adjacent `.evidence.json` file are never overwritten
+unless `--force` is given. `--focus` changes what the evaluation emphasizes;
+it is not treated as evidence and cannot add meeting facts. `--glossary`
+corrects known names without adding claims. To change the focus or format
+without repeating the first inference pass, pass a prior `.evidence.json` to
+`--evidence`. The tested
+Qwen3.8-27B 4-bit model occupies about 15GB on disk and peaked around 16GB of
+resident memory for a one-pass summary, or about 20GB for the longer two-pass
+workflow, on an M2 Max with 64GB unified memory.
+
+Glossary files may also contain deterministic cleanup rules. Use
+`置換: old => new` for a confirmed correction and `削除行: fragment` to remove
+an entire generated line that repeats an unsafe or unverified transcription.
+
 `scripts/download_models.py` pulls ~3.1GB of pretrained models into
 `models/` (git-ignored). Pass `--minimal` for a ~1.1GB ja/en-only install
 (ReazonSpeech, whisper-tiny, Silero VAD, Japanese punctuation). See
