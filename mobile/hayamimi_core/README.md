@@ -67,6 +67,22 @@ usual platform setup — `RECORD_AUDIO` permission on Android
 on iOS (`ios/Runner/Info.plist`) — see the `mobile/` app in this repo for a
 working example of both.
 
+### App lifecycle
+
+This package does not observe the app lifecycle: the host app owns that
+policy, because only it knows whether a background session is wanted (and
+whether it has arranged the background-audio entitlements to keep one
+alive). The recommended default is to `stop()` on background and `start()`
+again on resume, from your own `WidgetsBindingObserver`.
+
+If you don't, the OS may take the microphone away mid-session — on
+backgrounding, or when another app grabs it. When that happens the library
+now emits an error event (`ErrorSubtitleEvent` on `HayamimiLive.events`, a
+`LiveTranscriberException` on `LiveTranscriber.errors`, `RemoteErrorEvent`
+on `HayamimiRemote.events`) and stops the session, so `isRunning` /
+`isConnected` tell the truth instead of reporting a live session that is
+silently receiving nothing.
+
 ### Recommended configurations (measured)
 
 Two supported profiles, both using **int8** model variants. On a real
