@@ -195,7 +195,9 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
                                 merge_enabled: bool | None = None,
                                 merge_threshold: float = None,
                                 hysteresis_enabled: bool | None = None,
-                                hysteresis_min_hits: int = None
+                                hysteresis_min_hits: int = None,
+                                min_duration_on: float = None,
+                                min_duration_off: float = None
                                 ) -> tuple[list[tuple[str, float, float]], dict]:
     """Score the new method: same VAD + fast SpeakerLabeler as the baseline,
     but grouped exactly the way production's Refiner groups utterances
@@ -235,11 +237,16 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     speaker-count mitigations. merge_centroids() is called once per closed
     group (this function's natural "clean copy" boundary), matching how
     realtime_transcribe.Refiner._emit_turns() would call it.
+
+    min_duration_on/min_duration_off plumb straight through to
+    diarize.GroupDiarizer's sherpa-onnx OfflineSpeakerDiarizationConfig
+    (default None -- falls back to diarize.DEFAULT_MIN_DURATION_ON/OFF).
+    Round 2 (docs/DIARIZATION_PLAN.md section 12) sweeps these.
     """
     import numpy as np
     from realtime_transcribe import GROUP_GAP_S, GROUP_MAX_S, SAMPLE_RATE, AudioHistory, build_vad, read_wave, wav_chunks
     from speaker_id import SIM_THRESHOLD, SpeakerLabeler
-    from diarize import DEFAULT_THRESHOLD, GroupDiarizer
+    from diarize import DEFAULT_MIN_DURATION_OFF, DEFAULT_MIN_DURATION_ON, DEFAULT_THRESHOLD, GroupDiarizer
 
     samples, sr = read_wave(wav_path, target_rate=SAMPLE_RATE)
     vad = build_vad(min_silence, max_speech)
@@ -268,7 +275,11 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
         threshold=SIM_THRESHOLD if sim_threshold is None else sim_threshold,
         **labeler_kwargs,
     )
-    diarizer = GroupDiarizer(threshold=DEFAULT_THRESHOLD if diar_threshold is None else diar_threshold)
+    diarizer = GroupDiarizer(
+        threshold=DEFAULT_THRESHOLD if diar_threshold is None else diar_threshold,
+        min_duration_on=DEFAULT_MIN_DURATION_ON if min_duration_on is None else min_duration_on,
+        min_duration_off=DEFAULT_MIN_DURATION_OFF if min_duration_off is None else min_duration_off,
+    )
 
     fast_segments: list[tuple[int, int, str]] = []  # (start_sample, end_sample, fast S{n})
 
@@ -360,7 +371,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
 # ---------------------------------------------------------------------------
 
 def der_breakdown(ref: list[tuple[str, float, float]], hyp: list[tuple[str, float, float]],
-                  collar: float) -> dict:
+                  collar: float, skip_overlap: bool = False) -> dict:
     """Miss/False-Alarm/Confusion breakdown via pyannote.metrics, as a
     fraction of total reference speech time (same units simpleder.DER's
     return value is in). Kept separate from score_meeting()'s simpleder
@@ -369,6 +380,13 @@ def der_breakdown(ref: list[tuple[str, float, float]], hyp: list[tuple[str, floa
     breakdown itself is needed -- iteration 5, to tell whether the
     remaining over-splitting after the section-8 threshold tuning is
     boundary noise (Miss/FA) or genuine speaker confusion).
+
+    skip_overlap (T2, docs/DIARIZATION_PLAN.md section 12): pass
+    skip_overlap=True to pyannote.metrics.DiarizationErrorRate, which
+    excludes reference regions with >=2 concurrent speakers from scoring
+    entirely. This is pyannote's own published-comparison convention and
+    the "what we can actually get" number given hayamimi emits one speaker
+    per time span (see the Round 1 overlap-floor analysis).
 
     Requires pyannote.metrics (requirements-dev.txt); imported lazily so
     scoring/sweeping without it stays working.
@@ -382,7 +400,7 @@ def der_breakdown(ref: list[tuple[str, float, float]], hyp: list[tuple[str, floa
             ann[Segment(start, end)] = speaker
         return ann
 
-    metric = DiarizationErrorRate(collar=collar)
+    metric = DiarizationErrorRate(collar=collar, skip_overlap=skip_overlap)
     detail = metric(to_annotation(ref), to_annotation(hyp), detailed=True)
     total = detail["total"] or 1e-9  # guard empty reference (shouldn't happen on real data)
     return {
@@ -399,7 +417,8 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
                   sim_threshold: float = None, remap_threshold: float = None,
                   merge_enabled: bool | None = None, merge_threshold: float = None,
                   hysteresis_enabled: bool | None = None, hysteresis_min_hits: int = None,
-                  breakdown: bool = False) -> dict:
+                  min_duration_on: float = None, min_duration_off: float = None,
+                  breakdown: bool = False, skip_overlap: bool = False) -> dict:
     import simpleder
 
     ref = segments_to_der_tuples(parse_rttm(rttm_path))
@@ -408,7 +427,8 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
     if method == "refine_diarize":
         hyp_raw, extra = generate_diarize_hypothesis(
             wav_path, min_silence, max_speech, diar_threshold, sim_threshold, remap_threshold,
-            merge_enabled, merge_threshold, hysteresis_enabled, hysteresis_min_hits)
+            merge_enabled, merge_threshold, hysteresis_enabled, hysteresis_min_hits,
+            min_duration_on, min_duration_off)
     else:
         hyp_raw = generate_speaker_hypothesis(
             wav_path, min_silence, max_speech, hysteresis_enabled, hysteresis_min_hits)
@@ -428,7 +448,7 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
     }
     result.update(extra)
     if breakdown:
-        result.update(der_breakdown(ref, hyp, collar))
+        result.update(der_breakdown(ref, hyp, collar, skip_overlap))
     return result
 
 
@@ -490,6 +510,23 @@ def main():
     ap.add_argument("--hysteresis-min-hits", type=int, default=None, metavar="N",
                     help="hits required to confirm a provisional speaker, when "
                          "hysteresis is enabled. Default: speaker_id.HYSTERESIS_MIN_HITS.")
+    ap.add_argument("--min-duration-on", type=float, default=None, metavar="S",
+                    help="diarize.GroupDiarizer's OfflineSpeakerDiarizationConfig."
+                         "min_duration_on: drop speech turns shorter than this (seconds) "
+                         "after segmentation. Only meaningful with --method refine_diarize. "
+                         "Default: diarize.DEFAULT_MIN_DURATION_ON (0.3). See docs/"
+                         "DIARIZATION_PLAN.md section 12 (Round 2).")
+    ap.add_argument("--min-duration-off", type=float, default=None, metavar="S",
+                    help="diarize.GroupDiarizer's OfflineSpeakerDiarizationConfig."
+                         "min_duration_off: bridge silence gaps shorter than this (seconds) "
+                         "within one local speaker turn. Only meaningful with --method "
+                         "refine_diarize. Default: diarize.DEFAULT_MIN_DURATION_OFF (0.5). "
+                         "See docs/DIARIZATION_PLAN.md section 12 (Round 2).")
+    ap.add_argument("--skip-overlap", action="store_true",
+                    help="T2 (docs/DIARIZATION_PLAN.md section 12): exclude reference regions "
+                         "with >=2 concurrent speakers from DER scoring (pyannote.metrics "
+                         "skip_overlap=True). Only affects --breakdown's der_breakdown; "
+                         "the primary simpleder DER is unaffected.")
     args = ap.parse_args()
 
     if not os.path.exists(args.manifest):
@@ -516,7 +553,9 @@ def main():
                                merge_enabled=args.merge_enabled, merge_threshold=args.merge_threshold,
                                hysteresis_enabled=args.hysteresis_enabled,
                                hysteresis_min_hits=args.hysteresis_min_hits,
-                               breakdown=args.breakdown)
+                               min_duration_on=args.min_duration_on,
+                               min_duration_off=args.min_duration_off,
+                               breakdown=args.breakdown, skip_overlap=args.skip_overlap)
         extra = ""
         if "diar_time_s" in result and result.get("audio_s"):
             rtf = result["diar_time_s"] / result["audio_s"]

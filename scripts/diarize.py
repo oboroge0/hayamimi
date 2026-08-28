@@ -32,6 +32,17 @@ SEGMENTATION_MODEL = os.path.join(
 # section 6 (iteration 3 sweep) for the values tried.
 DEFAULT_THRESHOLD = 0.5
 
+# OfflineSpeakerDiarizationConfig's VAD-adjacent knobs (same sherpa-onnx
+# semantics as the segmentation model's underlying VAD post-processing):
+# min_duration_on drops speech turns shorter than this after segmentation,
+# min_duration_off bridges (merges across) silence gaps shorter than this.
+# docs/DIARIZATION_PLAN.md Round 2 (section 12) sweeps these -- see that
+# section for the min-silence-0.5-equivalent confusion-vs-latency tradeoff
+# that motivated exposing them instead of only tuning production's
+# min_silence_duration.
+DEFAULT_MIN_DURATION_ON = 0.3
+DEFAULT_MIN_DURATION_OFF = 0.5
+
 
 class GroupDiarizer:
     """Offline diarizer for a single bounded audio buffer.
@@ -45,7 +56,9 @@ class GroupDiarizer:
     """
 
     def __init__(self, threads: int = 2, threshold: float = DEFAULT_THRESHOLD,
-                 num_clusters: int = -1):
+                 num_clusters: int = -1,
+                 min_duration_on: float = DEFAULT_MIN_DURATION_ON,
+                 min_duration_off: float = DEFAULT_MIN_DURATION_OFF):
         if not os.path.exists(SEGMENTATION_MODEL):
             raise FileNotFoundError(
                 f"pyannote segmentation model missing: {SEGMENTATION_MODEL}\n"
@@ -68,8 +81,8 @@ class GroupDiarizer:
             clustering=sherpa_onnx.FastClusteringConfig(
                 num_clusters=num_clusters, threshold=threshold,
             ),
-            min_duration_on=0.3,
-            min_duration_off=0.5,
+            min_duration_on=min_duration_on,
+            min_duration_off=min_duration_off,
         )
         self._sd = sherpa_onnx.OfflineSpeakerDiarization(cfg)
         self.sample_rate = self._sd.sample_rate
