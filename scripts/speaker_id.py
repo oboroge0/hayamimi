@@ -9,6 +9,7 @@ import os
 
 import numpy as np
 import sherpa_onnx
+from scipy.optimize import linear_sum_assignment
 
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
 EMBED_MODEL = os.path.join(MODELS_DIR, "campplus_sv.onnx")
@@ -277,6 +278,92 @@ class SpeakerLabeler:
         else:
             self._confirmed.append(True)
         return self._label_for(new_idx)
+
+    def match_embeddings_joint(self, embs: list[np.ndarray], update: bool = True,
+                                threshold: float | None = None, source: str = "") -> list[str]:
+        """Constrained joint remap for a whole refine group's local clusters
+        at once (Round 5, docs/DIARIZATION_PLAN.md section 15 T1).
+
+        match_embedding() called independently per local cluster (the
+        pre-existing remap path) greedily nearest-matches each cluster on
+        its own -- nothing stops two distinct local clusters in the same
+        refine group from both landing on the same global centroid, which
+        collapses two real speakers into one and lands in DER as
+        confusion (Round 4's attribution, section 14, found this REMAP
+        bucket dominates confusion on ES2011a/IS1009a). This solves the
+        whole group's assignment jointly instead: build a
+        [local x live-global-centroid] cosine-similarity matrix and run
+        the Hungarian algorithm (scipy.optimize.linear_sum_assignment) to
+        find the assignment that maximizes TOTAL similarity subject to
+        each local cluster getting a DISTINCT global centroid (Hungarian's
+        one-to-one matching guarantees that by construction).
+
+        threshold (default self._threshold, matching match_embedding()'s
+        own default -- callers pass self.remap_threshold explicitly, same
+        as they do for match_embedding()) is still the eligibility floor:
+        Hungarian always assigns every row a column when there are enough
+        live centroids, even a bad one, so each row's assigned similarity
+        is checked against threshold afterward. A local cluster whose
+        jointly-optimal assignment falls below threshold (or that has no
+        live centroid at all to pair with, e.g. the very first group of a
+        session) has no eligible candidate and falls back to an
+        independent match_embedding() call -- the pre-existing behavior:
+        open a new speaker via the normal path (or, rarely, match
+        whatever centroid its own solo nearest-neighbor search finds,
+        which is not constrained against the other clusters in this
+        fallback case).
+
+        A single-cluster group takes the same fallback path unconditionally
+        (skips the whole joint machinery) -- there is nothing to jointly
+        constrain against, so behavior there is byte-for-byte identical to
+        calling match_embedding() directly, matching this flag's "single-
+        local-cluster groups stay on the old path" requirement.
+
+        update follows match_embedding()'s semantics per assigned cluster:
+        True folds the embedding into the winning centroid's running mean
+        (and advances hysteresis bookkeeping the same way match_embedding()
+        does); False is a read-only probe and never mutates state.
+
+        source is passed through to the independent match_embedding()
+        fallback calls only (an embedding assigned via the joint path
+        matches an EXISTING centroid, so there's no "newly opened by
+        source X" event to log for it -- see centroid_open_counts()).
+        """
+        if not embs:
+            return []
+        thr = self._threshold if threshold is None else threshold
+        live = [i for i in range(len(self._centroids)) if i not in self._alias]
+        if len(embs) == 1 or not live:
+            return [self.match_embedding(e, update=update, threshold=thr, source=source)
+                    for e in embs]
+
+        sim = np.empty((len(embs), len(live)), dtype=np.float64)
+        for i, emb in enumerate(embs):
+            for j, ci in enumerate(live):
+                c = self._centroids[ci]
+                sim[i, j] = float(np.dot(emb, c) / (np.linalg.norm(c) + 1e-9))
+
+        row_ind, col_ind = linear_sum_assignment(-sim)
+        winners: dict[int, int] = {}  # local row -> centroid index, only if >= thr
+        for r, c in zip(row_ind, col_ind):
+            if sim[r, c] >= thr:
+                winners[r] = live[c]
+
+        labels: list[str] = [""] * len(embs)
+        for i, emb in enumerate(embs):
+            if i not in winners:
+                labels[i] = self.match_embedding(emb, update=update, threshold=thr, source=source)
+                continue
+            best = winners[i]
+            if update:
+                n = self._counts[best]
+                self._centroids[best] = (self._centroids[best] * n + emb) / (n + 1)
+                self._counts[best] = n + 1
+                if self._hysteresis_enabled and not self._confirmed[best]:
+                    if self._counts[best] >= self._hysteresis_min_hits:
+                        self._confirmed[best] = True
+            labels[i] = self._label_for(best)
+        return labels
 
     def label(self, samples: np.ndarray, sample_rate: int, source: str = "fast") -> str:
         emb = self.embed(samples, sample_rate)
