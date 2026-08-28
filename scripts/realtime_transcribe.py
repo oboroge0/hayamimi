@@ -52,11 +52,13 @@ def build_vad(min_silence: float = 0.35,
     # force-splits breathless monologues (radio/game commentary hit 21s
     # segments) so finals stay timely; the refine pass re-merges the group.
     # vad_threshold is Silero's own speech-probability cutoff (sherpa_onnx's
-    # SileroVadModelConfig default is 0.5); lowering it makes the VAD flag
-    # more low-energy/quiet speech as speech at the cost of more false
-    # alarms. docs/DIARIZATION_PLAN.md section 13 (Round 3) sweeps this --
+    # SileroVadModelConfig default is 0.5). docs/DIARIZATION_PLAN.md section
+    # 13 (Round 3) swept 0.40/0.30/0.20 on the AMI eval set: miss did drop
+    # as expected, but confusion grew far more (offline diarization gets
+    # more/noisier low-energy segments to cluster), so mean DER got *worse*
+    # at every value tried (14.1% baseline -> 15.6-16.5%). Rejected --
     # this default (0.5) keeps current production behavior unchanged.
-    # The installed sherpa_onnx (1.12.15) SileroVadModelConfig exposes no
+    # The installed sherpa_onnx (1.13.6) SileroVadModelConfig exposes no
     # speech-padding knob (no speech_pad_ms field) alongside threshold, so
     # there is nothing to plumb through for that half of T1.
     cfg = sherpa_onnx.VadModelConfig(
