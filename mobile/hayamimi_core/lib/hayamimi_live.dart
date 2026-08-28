@@ -16,11 +16,11 @@ import 'server/subtitle_event.dart';
 /// interchangeably.
 ///
 /// ```dart
-/// final live = HayamimiLive(modelDir: modelDir, vadModelPath: vadPath);
+/// final live = HayamimiLive();
 /// live.events.listen((event) {
 ///   if (event is FinalSubtitleEvent) print(event.text);
 /// });
-/// await live.start();
+/// await live.start(modelDir: modelDir, vadModelPath: vadPath);
 /// // ... later
 /// await live.stop();
 /// await live.dispose();
