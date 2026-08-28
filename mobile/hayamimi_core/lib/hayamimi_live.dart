@@ -172,12 +172,18 @@ class HayamimiLive {
   Future<void> stopDebugWavStream() => _transcriber.stopDebugWavStream();
 
   /// Releases everything, including the mic recorder. Call once when the
-  /// owner is done with this instance.
+  /// owner is done with this instance. Idempotent: a second call is a
+  /// no-op.
   Future<void> dispose() async {
+    if (_disposed) {
+      return;
+    }
+    _disposed = true;
     await _entriesSubscription.cancel();
     await _refineEntriesSubscription.cancel();
     await _decodingSubscription.cancel();
     await _draftsSubscription.cancel();
+    await _errorsSubscription.cancel();
     await _transcriber.dispose();
     await _eventsController.close();
     await _decodingController.close();

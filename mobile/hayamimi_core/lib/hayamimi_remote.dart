@@ -35,6 +35,7 @@ class HayamimiRemote {
   final RemoteTranscriber _transcriber;
   final _eventsController = StreamController<SubtitleEvent>.broadcast();
   late final StreamSubscription<RemoteEvent> _rawSubscription;
+  bool _disposed = false;
 
   /// Subtitle content received from the server: partials, finals,
   /// translations, refines, and errors, normalized to [SubtitleEvent].
@@ -52,7 +53,8 @@ class HayamimiRemote {
   /// Connects to [url] (e.g. `ws://192.168.1.10:8766/ingest`), sends the
   /// ingest handshake, and starts streaming mic audio. Reconnects
   /// automatically with a fixed backoff if the connection drops, until
-  /// [disconnect] is called.
+  /// [disconnect] is called. Throws [StateError] if already connected,
+  /// connecting, or reconnecting — call [disconnect] first.
   Future<void> connect(String url) => _transcriber.connect(url);
 
   /// Stops mic streaming and closes the connection.
@@ -93,8 +95,13 @@ class HayamimiRemote {
   }
 
   /// Releases everything, including the mic recorder. Call once when the
-  /// owner is done with this instance.
+  /// owner is done with this instance. Idempotent: a second call is a
+  /// no-op.
   Future<void> dispose() async {
+    if (_disposed) {
+      return;
+    }
+    _disposed = true;
     await _rawSubscription.cancel();
     await _transcriber.dispose();
     await _eventsController.close();

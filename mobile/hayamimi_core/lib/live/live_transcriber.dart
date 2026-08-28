@@ -742,14 +742,20 @@ class LiveTranscriber {
   }
 
   /// Releases everything, including the mic recorder itself. Call once when
-  /// the owning widget is disposed.
+  /// the owning widget is disposed. Idempotent: a second call is a no-op
+  /// rather than a "Bad state: Stream has already been closed".
   Future<void> dispose() async {
+    if (_disposed) {
+      return;
+    }
+    _disposed = true;
     await stop();
     await stopDebugWavStream();
     await _entriesController.close();
     await _decodingController.close();
     await _refineEntriesController.close();
     await _draftController.close();
+    await _errorsController.close();
     await _recorder.dispose();
   }
 
@@ -778,10 +784,36 @@ class LiveTranscriber {
     String? lidModelDir,
     bool realtime = true,
   }) async {
-    if (isRunning || _debugStreaming) {
+    if (isRunning || _debugStreaming || _starting) {
       return;
     }
+    _starting = true;
+    try {
+      await _runDebugWavStream(
+        modelKind: modelKind,
+        modelDir: modelDir,
+        vadModelPath: vadModelPath,
+        wavPath: wavPath,
+        routingProfile: routingProfile,
+        senseVoiceModelDir: senseVoiceModelDir,
+        lidModelDir: lidModelDir,
+        realtime: realtime,
+      );
+    } finally {
+      _starting = false;
+    }
+  }
 
+  Future<void> _runDebugWavStream({
+    required ModelKind modelKind,
+    required String modelDir,
+    required String vadModelPath,
+    required String wavPath,
+    required RoutingProfile routingProfile,
+    String? senseVoiceModelDir,
+    String? lidModelDir,
+    required bool realtime,
+  }) async {
     final wavFile = File(wavPath);
     if (!await wavFile.exists()) {
       throw LiveTranscriberException('WAV file not found: $wavPath');
