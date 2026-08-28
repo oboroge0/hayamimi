@@ -67,6 +67,40 @@ usual platform setup — `RECORD_AUDIO` permission on Android
 on iOS (`ios/Runner/Info.plist`) — see the `mobile/` app in this repo for a
 working example of both.
 
+### Recommended configurations (measured)
+
+Two supported profiles, both using **int8** model variants. On a real
+iPhone 15, int8 ran at **RTF 0.013** (ja zipformer, `modified_beam_search`)
+— about 4.8x faster than the same int8 files on a desktop x86-64 CPU, and
+faster than fp32 anywhere we measured, so on ARM phones int8 is both the
+smallest *and* the fastest choice; there's no speed reason to carry the
+larger fp16/fp32 files. Full measurements and conditions:
+[`docs/MOBILE.md`](../../docs/MOBILE.md), "On-device (iPhone 15)
+verification".
+
+| profile | models on device | disk | languages |
+|---|---|---|---|
+| ja only (default) | ReazonSpeech zipformer int8 + Silero VAD | ~72 MB | ja |
+| `RoutingProfile.jaSenseVoice` | + SenseVoice small int8 + whisper-tiny int8 (LID probe) | ~396 MB | ja / en / zh / ko / yue |
+
+Notes on the choice:
+
+- The multilingual profile loads all three models simultaneously (no LRU
+  eviction); 396 MB of weights is a deliberate size-vs-coverage trade-off
+  that assumes a phone with several GB of RAM. Start with ja-only unless
+  you need the language switching.
+- The refine ("清書") defaults shipped in this package are phone-tuned and
+  were exercised as-is in the on-device session: auto-refine fires after
+  **4 s** of silence or **20 s** of buffered speech, with the buffer capped
+  at **60 s** (`defaultAutoRefineSilenceSeconds` /
+  `defaultAutoRefineMaxBufferedSeconds` / `defaultRefineBufferMaxSeconds`
+  in `lib/live/refine_pass.dart`). They're constructor parameters if your
+  app wants different pacing.
+- Punctuation restoration for ja (the desktop pipeline's BERT-char model,
+  ~182 MB as fp16) is **not** part of either profile yet — mobile
+  integration is tracked in
+  [#15](https://github.com/oboroge0/hayamimi/issues/15).
+
 ## Minimal example: on-device subtitles
 
 See [`example/`](example/) for a full, runnable Flutter app built from
