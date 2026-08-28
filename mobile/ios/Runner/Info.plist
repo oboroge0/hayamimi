@@ -26,6 +26,8 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>hayamimi broadcasts live subtitles to OBS or a browser on your local network.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>hayamimi uses the microphone to transcribe your speech live.</string>
 	<key>UIApplicationSceneManifest</key>

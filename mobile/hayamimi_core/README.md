@@ -67,6 +67,27 @@ usual platform setup — `RECORD_AUDIO` permission on Android
 on iOS (`ios/Runner/Info.plist`) — see the `mobile/` app in this repo for a
 working example of both.
 
+### iOS local network permission (SubtitleBroadcastServer only)
+
+`SubtitleBroadcastServer` binds `0.0.0.0` and accepts connections from
+other devices on the LAN. On iOS 14+ that requires the local network
+entitlement, or the very first inbound connection is silently refused with
+no error your Dart code can see. Add to `ios/Runner/Info.plist`:
+
+```xml
+<key>NSLocalNetworkUsageDescription</key>
+<string>Streams live subtitles to OBS or a browser on your local network.</string>
+```
+
+`NSBonjourServices` is *not* needed for this package: the server does not
+advertise itself over Bonjour, so clients connect by IP and port (see
+`currentLanAddress()` in `lib/server/lan_address.dart` for showing the user
+which address to type). Add `NSBonjourServices` only if your own app adds mDNS
+discovery on top.
+
+Android needs nothing extra beyond `INTERNET`, which is implicit for debug
+builds and should be declared in your release manifest.
+
 ### App lifecycle
 
 This package does not observe the app lifecycle: the host app owns that
@@ -91,8 +112,8 @@ iPhone 15, int8 ran at **RTF 0.013** (ja zipformer, `modified_beam_search`)
 faster than fp32 anywhere we measured, so on ARM phones int8 is both the
 smallest *and* the fastest choice; there's no speed reason to carry the
 larger fp16/fp32 files. Full measurements and conditions:
-[`docs/MOBILE.md`](../../docs/MOBILE.md), "On-device (iPhone 15)
-verification".
+[`docs/MOBILE.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/MOBILE.md),
+"On-device (iPhone 15) verification".
 
 | profile | models on device | disk | languages |
 |---|---|---|---|
@@ -250,10 +271,12 @@ live.events.listen(broadcast.broadcast); // events are already SubtitleEvent
   `subtitle_event.dart` (the `SubtitleEvent` hierarchy: partial/final/
   translation/refine/error, all with wire-compatible JSON encoding), and
   `overlay_html.dart` (the OBS-ready transparent overlay page).
-- `test/` — unit tests for everything pure-logic above (`flutter test`);
-  I/O-heavy classes (`LiveTranscriber`, `RemoteTranscriber`) aren't unit
-  tested directly since they need a real mic/socket/native libs, but are
-  built from pieces that are.
+- `test/` — unit tests for everything pure-logic above (`flutter test`),
+  plus `lifecycle_test.dart`, which covers the start/connect/dispose
+  lifecycle of `LiveTranscriber`/`RemoteTranscriber` against a fake
+  `RecordPlatform` and a real `dart:io` WebSocket server. Their *decoding*
+  paths still aren't unit tested — those need the sherpa-onnx native libs
+  and a real mic — but are built from pieces that are.
 
 ## Consumers
 
