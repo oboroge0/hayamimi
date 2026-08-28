@@ -55,11 +55,14 @@ class LiveTranscriber {
   final _refineEntriesController =
       StreamController<LiveTranscriptEntry>.broadcast();
   final _draftController = StreamController<LiveTranscriptEntry>.broadcast();
+  final _errorsController =
+      StreamController<LiveTranscriberException>.broadcast();
 
   sherpa_onnx.VoiceActivityDetector? _vad;
   sherpa_onnx.OfflineRecognizer? _recognizer;
   RoutedRecognizerSet? _routed;
   StreamSubscription<Uint8List>? _micSubscription;
+  StreamSubscription<RecordState>? _recorderStateSubscription;
   PcmFrameBuffer? _frameBuffer;
 
   // --- Draft ("発話中の暫定字幕"): while a VAD segment is still in progress,
@@ -79,6 +82,13 @@ class LiveTranscriber {
   DateTime? _lastDraftAt;
   bool _debugStreaming = false;
   bool _debugStreamCancelRequested = false;
+  // Set synchronously by [start]/[startDebugWavStream] before their first
+  // await. [isRunning] only flips once the mic subscription exists, several
+  // awaits in, so without this a second concurrent start() would sail past
+  // the isRunning guard and build a *second* full model set (up to 396 MB),
+  // orphaning the first one's handles.
+  bool _starting = false;
+  bool _disposed = false;
 
   // --- Two-pass "refine" (清書): buffer finalized segments' audio and, on
   // demand, re-decode the whole group together for a cleaner result than
@@ -110,6 +120,14 @@ class LiveTranscriber {
   /// segment's eventual [entries] final. Never buffered/stored by this
   /// class -- purely a live "typewriter" signal for the UI/broadcast.
   Stream<LiveTranscriptEntry> get drafts => _draftController.stream;
+
+  /// Asynchronous session failures that aren't attributable to a call the
+  /// caller made — today, mic capture dying under a running session (the OS
+  /// revoking the mic on backgrounding, another app taking it). The session
+  /// is already stopped by the time the error is emitted, so [isRunning]
+  /// reflects reality; errors raised *by* [start] itself are thrown, not
+  /// emitted here.
+  Stream<LiveTranscriberException> get errors => _errorsController.stream;
 
   bool get isRunning => _micSubscription != null;
 
@@ -170,39 +188,96 @@ class LiveTranscriber {
     String? senseVoiceModelDir,
     String? lidModelDir,
   }) async {
-    if (isRunning || _debugStreaming) {
+    if (isRunning || _debugStreaming || _starting) {
       return;
     }
-
-    final hasPermission = await _recorder.hasPermission();
-    if (!hasPermission) {
-      throw LiveTranscriberException('Microphone permission was not granted.');
-    }
-
-    await _buildNativeState(
-      modelKind: modelKind,
-      modelDir: modelDir,
-      vadModelPath: vadModelPath,
-      routingProfile: routingProfile,
-      senseVoiceModelDir: senseVoiceModelDir,
-      lidModelDir: lidModelDir,
-    );
-
+    _starting = true;
     try {
-      final micStream = await _recorder.startStream(
-        const RecordConfig(
-          encoder: AudioEncoder.pcm16bits,
-          sampleRate: sampleRate,
-          numChannels: 1,
-        ),
-      );
-      _micSubscription = micStream.listen(_onMicChunk);
-    } catch (_) {
-      await _teardownNativeState();
-      rethrow;
-    }
+      final hasPermission = await _recorder.hasPermission();
+      if (!hasPermission) {
+        throw LiveTranscriberException(
+          'Microphone permission was not granted.',
+        );
+      }
 
-    _resetSessionState();
+      await _buildNativeState(
+        modelKind: modelKind,
+        modelDir: modelDir,
+        vadModelPath: vadModelPath,
+        routingProfile: routingProfile,
+        senseVoiceModelDir: senseVoiceModelDir,
+        lidModelDir: lidModelDir,
+      );
+
+      try {
+        final micStream = await _recorder.startStream(
+          const RecordConfig(
+            encoder: AudioEncoder.pcm16bits,
+            sampleRate: sampleRate,
+            numChannels: 1,
+          ),
+        );
+        _micSubscription = micStream.listen(
+          _onMicChunk,
+          onError: (Object error) {
+            unawaited(_handleCaptureFailure('Microphone capture failed: $error'));
+          },
+          onDone: () {
+            unawaited(
+              _handleCaptureFailure(
+                'Microphone capture ended unexpectedly (the OS may have '
+                'revoked mic access, e.g. on backgrounding or another app '
+                'taking the microphone).',
+              ),
+            );
+          },
+          cancelOnError: true,
+        );
+        // record 6.2.1 wraps the platform's audio stream in a broadcast
+        // controller that forwards data only (see _startRecordStream in
+        // package:record), so the source stream's error/done never reach
+        // the handlers above. Its state channel does report an OS-side
+        // stop, so watch that as well -- between the two, a revoked mic
+        // can't leave this session silently "running".
+        _recorderStateSubscription = _recorder.onStateChanged().listen(
+          (state) {
+            if (state == RecordState.stop) {
+              unawaited(
+                _handleCaptureFailure(
+                  'Microphone capture was stopped by the system (mic access '
+                  'revoked, e.g. on backgrounding or another app taking the '
+                  'microphone).',
+                ),
+              );
+            }
+          },
+          onError: (Object error) {
+            unawaited(_handleCaptureFailure('Microphone capture failed: $error'));
+          },
+        );
+      } catch (_) {
+        await _teardownNativeState();
+        rethrow;
+      }
+
+      _resetSessionState();
+    } finally {
+      _starting = false;
+    }
+  }
+
+  /// The mic stream ended or errored out from under a live session. Without
+  /// this the session would keep reporting [isRunning] while silently
+  /// receiving no audio forever, so report it on [errors] and tear the
+  /// session down so the state matches what's actually happening.
+  Future<void> _handleCaptureFailure(String message) async {
+    if (!isRunning) {
+      return;
+    }
+    if (!_errorsController.isClosed) {
+      _errorsController.add(LiveTranscriberException(message));
+    }
+    await stop();
   }
 
   /// Shared "load VAD + recognizer(s) from disk" step behind both [start]
@@ -638,6 +713,10 @@ class LiveTranscriber {
 
     await _micSubscription?.cancel();
     _micSubscription = null;
+    // Cancelled before _recorder.stop() so our own shutdown doesn't get
+    // reported back to us as a capture failure.
+    await _recorderStateSubscription?.cancel();
+    _recorderStateSubscription = null;
     await _recorder.stop();
 
     _vad?.flush();

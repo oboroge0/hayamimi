@@ -52,6 +52,9 @@ class HayamimiLive {
     _draftsSubscription = _transcriber.drafts.listen((entry) {
       _eventsController.add(PartialSubtitleEvent(entry.text));
     });
+    _errorsSubscription = _transcriber.errors.listen((error) {
+      _eventsController.add(ErrorSubtitleEvent(message: error.message));
+    });
   }
 
   final LiveTranscriber _transcriber;
@@ -61,6 +64,8 @@ class HayamimiLive {
   late final StreamSubscription _refineEntriesSubscription;
   late final StreamSubscription _decodingSubscription;
   late final StreamSubscription _draftsSubscription;
+  late final StreamSubscription _errorsSubscription;
+  bool _disposed = false;
 
   /// BCP-47-ish language tag stamped on every emitted event that doesn't
   /// carry its own (i.e. a plain single-model session, or a routed
@@ -74,8 +79,11 @@ class HayamimiLive {
   /// resolves one). Mirrors [LiveTranscriber.currentLang].
   String? get currentLang => _transcriber.currentLang;
 
-  /// Finalized transcript lines ([FinalSubtitleEvent]) and two-pass
-  /// "refine" results ([RefineSubtitleEvent]), in arrival order.
+  /// Finalized transcript lines ([FinalSubtitleEvent]), two-pass "refine"
+  /// results ([RefineSubtitleEvent]), in-progress drafts
+  /// ([PartialSubtitleEvent]), and session failures
+  /// ([ErrorSubtitleEvent] — e.g. the OS killing mic capture mid-session,
+  /// after which [isRunning] is false again), in arrival order.
   Stream<SubtitleEvent> get events => _eventsController.stream;
 
   /// Emits `true` right before a segment starts decoding and `false` right

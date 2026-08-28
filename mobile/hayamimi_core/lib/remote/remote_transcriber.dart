@@ -43,11 +43,16 @@ class RemoteTranscriber {
 
   WebSocket? _socket;
   StreamSubscription<Uint8List>? _micSubscription;
+  StreamSubscription<RecordState>? _recorderStateSubscription;
   StreamSubscription? _socketSubscription;
   Timer? _reconnectTimer;
 
   String? _url;
+  // Doubles as the connect() re-entrancy guard: set synchronously by
+  // connect() and only cleared by disconnect() (or by a failed connect
+  // attempt), so it covers connecting/connected/reconnecting alike.
   bool _desiredConnected = false;
+  bool _disposed = false;
   RemoteConnectionState _state = RemoteConnectionState.disconnected;
 
   final _eventsController = StreamController<RemoteEvent>.broadcast();
@@ -111,7 +116,34 @@ class RemoteTranscriber {
           numChannels: 1,
         ),
       );
-      _micSubscription = micStream.listen(_onMicChunk);
+      _micSubscription = micStream.listen(
+        _onMicChunk,
+        onError: (Object error) =>
+            _onCaptureFailure('Microphone capture failed: $error'),
+        onDone: () => _onCaptureFailure(
+          'Microphone capture ended unexpectedly (the OS may have revoked '
+          'mic access, e.g. on backgrounding or another app taking the '
+          'microphone).',
+        ),
+        cancelOnError: true,
+      );
+      // record 6.2.1's stream wrapper forwards data only (see
+      // _startRecordStream in package:record), so the source stream's
+      // error/done never reach the handlers above. Its state channel does
+      // report an OS-side stop -- watch both.
+      _recorderStateSubscription = _recorder.onStateChanged().listen(
+        (state) {
+          if (state == RecordState.stop) {
+            _onCaptureFailure(
+              'Microphone capture was stopped by the system (mic access '
+              'revoked, e.g. on backgrounding or another app taking the '
+              'microphone).',
+            );
+          }
+        },
+        onError: (Object error) =>
+            _onCaptureFailure('Microphone capture failed: $error'),
+      );
     } catch (e) {
       await socket.close();
       _socket = null;
@@ -125,6 +157,20 @@ class RemoteTranscriber {
 
   void _onMicChunk(Uint8List bytes) {
     _socket?.add(bytes);
+  }
+
+  /// Mic capture died under a live connection. The socket is fine, so the
+  /// automatic reconnect path would just re-establish a connection that
+  /// still has no audio to send and leave [isConnected] true forever —
+  /// report it and disconnect for real instead.
+  void _onCaptureFailure(String message) {
+    if (_micSubscription == null) {
+      return;
+    }
+    if (!_eventsController.isClosed) {
+      _eventsController.add(RemoteErrorEvent(message: message));
+    }
+    unawaited(disconnect());
   }
 
   void _onSocketData(dynamic data) {
@@ -144,6 +190,8 @@ class RemoteTranscriber {
     _socket = null;
     unawaited(_micSubscription?.cancel());
     _micSubscription = null;
+    unawaited(_recorderStateSubscription?.cancel());
+    _recorderStateSubscription = null;
     unawaited(_recorder.stop());
 
     if (!_desiredConnected) {
@@ -167,6 +215,10 @@ class RemoteTranscriber {
 
     await _micSubscription?.cancel();
     _micSubscription = null;
+    // Cancelled before _recorder.stop() so our own shutdown doesn't get
+    // reported back to us as a capture failure.
+    await _recorderStateSubscription?.cancel();
+    _recorderStateSubscription = null;
     await _recorder.stop();
 
     await _socketSubscription?.cancel();
