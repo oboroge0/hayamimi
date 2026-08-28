@@ -115,6 +115,50 @@ hayamimi内でローカル合成して同じ文字起こし経路へ流します
 番号は`.venv/bin/python scripts/realtime_transcribe.py --list-devices`で確認できます。
 会議アプリ自身のマイクは実マイク、スピーカーはBlackHoleを含む複数出力装置に設定します。
 
+### macOS会議ランチャー（Teams / Zoom / Slack / Discord / Google Meet）
+
+macOSでは、会議ごとに次をまとめて行う選択式ランチャーを利用できます。
+
+- 会議サービスを選ぶ
+- 現在接続中のMacスピーカー、有線ヘッドフォン、AirPodsなどから聞く装置を選ぶ
+- 選んだ物理出力とBlackHoleの一時的な複数出力装置を作り、システム出力を切り替える
+- BlackHoleの会議音と物理マイクを合成し、WAV、英語原文、日本語訳、清書を自動保存する
+- 終了時に選んだ通常出力へ戻し、一時的な複数出力装置を削除する
+
+初回だけ切替ツールを導入します。Core Audio補助ツールは初回起動時にローカルで
+コンパイルされるため、Swiftコンパイラ（XcodeまたはCommand Line Tools）も必要です。
+
+```bash
+brew install switchaudio-osx
+xcode-select --install  # swiftcがない場合だけ
+```
+
+Finderで`start_meeting.command`をダブルクリックするか、ターミナルで実行します。
+
+```bash
+./start_meeting.command
+
+# 選択を省略して直接開始する例
+.venv/bin/python scripts/meeting_session.py \
+  --app teams --output "MacBook Proのスピーカー"
+```
+
+各会議は`recordings/YYYY-MM-DD/時分秒_サービス/`へ分離され、`meeting.wav`、
+`meeting.txt`、`session.json`を保存します。既存会議は上書きしません。終了はランチャーを
+開いたターミナルで`Control-C`です。会議アプリがシステム出力ではなく固有の出力先を固定して
+いる場合、ランチャー開始後にアプリのスピーカーを`hayamimi 会議 + BlackHole`へ変更してください。
+アプリのマイクには物理マイクを指定します。AirPodsで聞く場合もMacまたは外部マイクを使うと、
+Bluetoothの通話用低音質モードへの切替を避けやすくなります。
+
+Google Meetの既存字幕記録はそのまま併用できます。当面は、hayamimiを音声原本・日本語訳の
+独立記録、Meet字幕を比較用の補助記録として残し、自動マージはしない運用を推奨します。
+Chrome拡張だけではTeams、Zoom、Slack、Discordのネイティブアプリ音声を共通に扱えないため、
+このランチャーはmacOSのCore Audio経路を使います。着信や通話状態そのものは検知せず、
+ランチャーでサービスと出力を選んだ時点から録音・字幕を開始します。
+会議中にMacで鳴る通知音なども録音へ入るため、集中モードの併用を推奨します。
+
+録音前に参加者へ通知し、所属組織と開催地域の録音ルールに従ってください。
+
 Apple Silicon Macで前提ツールがない場合は先に導入します。
 
 ```bash

@@ -121,6 +121,60 @@ saves the refined source text and translations. Run with `--list-devices` to fin
 indices. Keep the meeting application's microphone set to the physical mic and
 its speaker set to the multi-output device that includes BlackHole.
 
+### macOS meeting launcher (Teams / Zoom / Slack / Discord / Google Meet)
+
+The interactive macOS launcher starts a complete local meeting session:
+
+- choose a meeting service;
+- choose a currently connected physical output such as the Mac speakers,
+  wired headphones, or AirPods;
+- create a temporary stacked output that mirrors sound to the chosen device
+  and BlackHole;
+- record the mixed meeting audio and physical microphone while saving source
+  captions, Japanese translations, and refined text; and
+- restore the chosen physical output and remove the temporary device on exit.
+
+Install the output-switching helper once. The Core Audio helper is compiled
+locally on first launch, so a Swift compiler from Xcode or Command Line Tools is
+also required.
+
+```bash
+brew install switchaudio-osx
+xcode-select --install  # only when swiftc is unavailable
+```
+
+Double-click `start_meeting.command` in Finder or run it in Terminal:
+
+```bash
+./start_meeting.command
+
+# Non-interactive example
+.venv/bin/python scripts/meeting_session.py \
+  --app teams --output "MacBook Pro Speakers"
+```
+
+Every session gets its own `recordings/YYYY-MM-DD/HHMMSS_service/` directory
+containing `meeting.wav`, `meeting.txt`, and `session.json`; existing meetings
+are never overwritten. Press `Control-C` in the launcher Terminal to stop. If a
+meeting application pins an application-specific speaker instead of following
+the system output, select `hayamimi 会議 + BlackHole` in that application's audio
+settings after starting the launcher. Keep the application microphone set to a
+physical microphone. Using the Mac or an external microphone while listening
+through AirPods also helps avoid Bluetooth's lower-quality call profile.
+
+An existing Google Meet caption recorder can remain enabled. For now, use
+hayamimi as the independent audio and Japanese-translation record and keep Meet
+captions as a comparison copy; do not merge them automatically. A Chrome
+extension alone cannot capture native Teams, Zoom, Slack, and Discord audio
+through one common path, so the launcher uses macOS Core Audio. It starts
+recording and captions after the user chooses the service and output; it does
+not attempt to infer an application's private in-call state. Other Mac sounds,
+including notifications, are also captured during a session, so use a Focus
+mode while recording.
+
+Notify participants before recording and follow organizational and local
+recording rules.
+
 On a new Apple Silicon Mac, install the prerequisites first if they are
 missing:
 

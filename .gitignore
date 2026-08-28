@@ -1,5 +1,6 @@
 .venv/
 .venv-llm/
+recordings/
 models/
 testdata/
 __pycache__/
