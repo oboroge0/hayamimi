@@ -1372,6 +1372,212 @@ eval側ロジック、`eval_diar.py`は今回一切変更していない）は�
   揃えたが、独立してチューニングされていない。表示のみの変更で実害が
   小さいため、本イテレーションでは2固定のまま様子見とした。
 
+## 12. Round 2: min_duration_on/off の露出とスイープ、overlap除外採点、TS3003a miss診断
+
+### 背景
+
+Round 1（§8〜§11、DER 14.1%が到達点）で判明していたが手を付けていなかった
+3点を今回のラウンドで潰す。
+
+- **overlap（同時発話区間）がmissの構造的な下限になっている**: reference側の
+  overlap比率（≥2話者が同時に発話している時間の割合）はES2004a 15.1%、
+  ES2011a 10.1%、IS1009a 12.8%、IS1008a 2.4%、TS3003a 2.1%。hayamimiは
+  1区間=1話者ラベルしか出さないため、overlap比率とmissはほぼ1:1で連動する
+  （TS3003aだけはoverlapが2.1%しかないのにmissが8.7%あり、overlapだけでは
+  説明できない未解明のmissが残っている）。
+- **`min_silence_duration=0.5`にすると全体DERが13.5%まで下がるが、内訳を見ると
+  伸びているのはConfusionで、Missではない**（IS1009a confusion 12.4%→10.2%）。
+  ただし`min_silence_duration`は本番のライブVAD自体の設定で、0.35s→0.5sに
+  上げると字幕確定が0.15s遅れる。ライブ側のレイテンシを犠牲にしてまで
+  この設定をデフォルトにするのは割に合わないため、**本番デフォルト変更は
+  見送り、同じconfusion改善を別の経路で得られないか探す**、というのが
+  Round 1の宿題だった。
+- `scripts/diarize.py`の`GroupDiarizer`は、清書グループの音声だけを対象にした
+  オフライン再分離（`OfflineSpeakerDiarizationConfig`）を持ち、そこにも
+  `min_duration_on=0.3`/`min_duration_off=0.5`がハードコードされていた。
+  これはライブVADとは別物（清書グループが確定した*後*、そのグループの
+  バッファだけに対して働く）なので、ここを動かしてもライブの字幕確定
+  レイテンシには影響しない。Round 1の宿題（confusion改善をライブ非依存の
+  経路で得る）の候補として、まずこの2値を露出してスイープする。
+
+タスクは4つ: (T1) `min_duration_on`/`min_duration_off`の露出とスイープ、
+(T2) overlap区間を除外したDER採点オプションの追加、(T3) TS3003aの
+未解明missの内訳診断、(T4) 本セクションでのまとめ。
+
+### T1: min_duration_on/off の露出とスイープ
+
+`diarize.GroupDiarizer.__init__`に`min_duration_on`/`min_duration_off`を
+コンストラクタ引数として追加した（デフォルトは従来通り0.3/0.5、
+`DEFAULT_MIN_DURATION_ON`/`DEFAULT_MIN_DURATION_OFF`として定数化）。
+`scripts/eval_diar.py`に`--min-duration-on`/`--min-duration-off`を、
+既存の`--diar-threshold`と同じ配線パターン（`None`はモジュールデフォルトに
+フォールバック）で追加した(`scripts/diarize.py`, `scripts/eval_diar.py`)。
+
+採用基準（Round 1から継続）: 平均DERが**0.3pt以上改善**かつ**どの会議も
+0.5pt超の悪化なし**かつ**ライブ経路のレイテンシに影響しない**ことの3条件を
+すべて満たした場合のみ新デフォルトに採用する。それ以外は「試したが不採用」
+としてオプションのまま残す。
+
+AMI 5会議、collar=0.25s、`--method refine_diarize --breakdown`、他は
+デフォルト（`remap_threshold=0.35`, `sim_threshold=0.45`, `diar_threshold=0.5`,
+`min_silence=0.35`）での実測:
+
+| 設定 | 平均DER | ES2011a | IS1008a | ES2004a | IS1009a | TS3003a |
+|---|---|---|---|---|---|---|
+| baseline（Round 1到達点） | 14.1% | 17.7% | 4.0% | 17.8% | 16.9% | 14.1% |
+| min_duration_off=0.25 | 14.1% | 16.9% | **4.7%** | 17.8% | 17.2% | 14.0% |
+| min_duration_off=0.35 | 14.0% | 16.9% | 4.3% | 17.8% | 17.0% | 14.0% |
+| min_duration_on=0.15 | 14.1%（baselineと完全一致） | 17.7% | 4.0% | 17.8% | 16.9% | 14.1% |
+
+内訳（Miss/FalseAlarm/Confusion、参照総発話時間比）:
+
+| 設定 | ES2011a | IS1008a | ES2004a | IS1009a | TS3003a |
+|---|---|---|---|---|---|
+| baseline | miss11.3/fa3.5/conf6.8 | miss2.6/fa3.5/conf0.7 | miss14.5/fa3.7/conf5.0 | miss6.8/fa4.5/conf12.4 | miss8.7/fa6.5/conf0.7 |
+| off=0.25 | miss11.5/fa3.5/conf5.8 | miss3.3/fa3.2/conf0.7 | miss14.6/fa3.5/conf4.9 | miss7.7/fa4.0/conf11.9 | miss8.8/fa6.0/conf0.8 |
+| off=0.35 | miss11.5/fa3.5/conf5.8 | miss2.8/fa3.4/conf0.7 | miss14.5/fa3.6/conf5.0 | miss7.4/fa4.1/conf12.0 | miss8.8/fa6.0/conf0.8 |
+| on=0.15 | miss11.3/fa3.5/conf6.8 | miss2.6/fa3.5/conf0.7 | miss14.5/fa3.7/conf5.0 | miss6.8/fa4.5/conf12.4 | miss8.7/fa6.5/conf0.7 |
+
+**`min_duration_on=0.15`は全会議・全指標がbaselineと完全一致** —
+清書グループ内で0.3秒未満の短い発話ターンがそもそもほとんど存在しない
+（下げても拾うものがない）ことを意味する。これは後述T3の診断結果
+（min_duration_onで説明できるmissは実質ゼロ）とも整合する。
+
+`min_duration_off`は動きはするが小さい。0.25側はIS1008aが4.0%→4.7%
+（+0.7pt、採用基準の0.5pt超悪化に抵触）、平均も横ばい（14.1%→14.1%、
+実測は14.10%台での微増）で**却下**。0.35側は平均14.1%→14.0%
+（0.1pt改善、採用基準の0.3pt未満）、どの会議も0.5pt超の悪化はないが
+**改善幅が採用基準に届かず却下**。confusionへの効き方もES2011aで
+6.8%→5.8%と多少動くが、Round 1の`min_silence=0.5`ほどの明確な
+confusion改善（IS1009a 12.4%→10.2%）には届かなかった。
+
+**コンボ実行は行わなかった**: タスク設計では「min_duration_offで改善が
+見えたら最良ペアで1回だけコンボを回す」としていたが、off=0.25/0.35
+いずれも採用基準（0.3pt以上）を満たす改善を示さず、on=0.15は無効
+だったため、組み合わせる意味のある候補が無かった。
+
+**結論（T1）: `min_duration_on`・`min_duration_off`とも、デフォルト変更は
+不採用。オプションとして`--min-duration-on`/`--min-duration-off`は
+残すが、本番の`GroupDiarizer`呼び出しはデフォルト値（0.3/0.5）のまま
+据え置く。** Round 1の宿題だった「`min_silence=0.5`と同じconfusion改善を
+ライブ非依存の経路で得る」は、この2値では達成できなかった —
+理由はT3の診断で明らかになる通り、清書グループ内の短時間ターン自体が
+そもそも少ないため。
+
+### T2: overlap区間を除外したDER採点オプション
+
+`der_breakdown()`に`skip_overlap`引数を追加し、
+`pyannote.metrics.diarization.DiarizationErrorRate(collar=..., skip_overlap=...)`
+にそのまま渡すようにした。`eval_diar.py`に`--skip-overlap`フラグを追加
+(`scripts/eval_diar.py`)。**`--skip-overlap`は`--breakdown`の内訳
+（Miss/FalseAlarm/Confusion、およびpyannote側DER値）だけに効く
+オプションで、`simpleder`ベースの主指標（`DER=`として毎行先頭に出る値）
+には影響しない** — 二つのDER実装を混同しないよう、意図的にそう設計した。
+
+baseline設定（`remap_threshold=0.35`等、他はデフォルト）でoverlap区間を
+除外した内訳:
+
+| 会議 | Miss | FalseAlarm | Confusion | 内訳合計(≒overlap除外DER) |
+|---|---|---|---|---|
+| ES2011a | 9.9% | 4.2% | 5.7% | 19.8% |
+| IS1008a | 2.0% | 3.6% | 0.6% | 6.2% |
+| ES2004a | 9.7% | 4.6% | 1.7% | 16.0% |
+| IS1009a | 3.6% | 5.4% | 9.8% | 18.8% |
+| TS3003a | 7.7% | 6.7% | 0.5% | 14.9% |
+| **平均** | | | | **15.1%** |
+
+overlap込み（§8実測、baseline）の内訳合計は平均18.2%
+（(21.6+6.8+23.2+23.7+15.9)/5、内訳は本セクションT1表参照）だったので、
+overlapを除外すると内訳合計で**約3.1pt下がる**。会議別ではoverlap比率が
+高いES2004a（15.1%）とIS1009a（12.8%）で下がり幅が大きい
+（ES2004a: miss14.5→9.7、IS1009a: miss6.8→3.6/confusion12.4→9.8）。
+overlap比率が低いIS1008a（2.4%）・TS3003a（2.1%）はほぼ動かない。
+§1で挙げていた「overlapがmissの構造的下限」という見立てが、
+overlap除外採点でも定量的に裏付けられた形。
+
+**結論（T2）: `--skip-overlap`は採点オプションとして採用（本番挙動には
+無関係、評価スクリプトの機能追加のみ）。overlap除外DER（内訳合計で
+平均15.1%）は「hayamimiの1区間1話者という設計を所与としたときに
+実際に狙える上限」であり、overlap込みのDER 14.1%との差分約3.1ptは、
+overlap自体に手を入れない限り解消できない構造的な床であることが
+確認された。**
+
+### T3: TS3003aの未解明missの診断
+
+Round 1の観察: TS3003aはoverlap比率がわずか2.1%（5会議中最小）にも
+かかわらずmissが8.7%ある。他の会議はoverlap比率とmissがほぼ1:1で
+連動するのに対し、TS3003aだけ「overlapで説明できないmiss」が残っている。
+このmissの内訳を3カテゴリに分けて秒数で診断した（比較対象として
+overlap比率が高い側のES2011aも同時に計測）。
+
+**手法**: 生成した清書グループ（`group_segments()`と同じロジック）の
+音声スパン単位で、(a) そもそもどの清書グループにも入らなかった
+（＝ライブVADが一度も音声として検出しなかった）参照発話時間、
+(b) グループには入ったが`GroupDiarizer`のraw出力に現れず、
+`min_duration_on`を0.3→0.02まで下げると新たに現れる時間
+（＝`min_duration_on`フィルタに直接起因する分だけを分離）、
+(c) それ以外（グループには入り、`min_duration_on`を下げても回収できない
+が、最終的な仮説には反映されなかった時間 — pyannote segmentationの
+ターン境界誤差や、`eval_diar.py`側の0.3秒未満ターン破棄など、
+「境界のずれ／清書内部の検出漏れ」の寄せ集め）に分類した。
+（この診断スクリプト自体はcollarを掛けない単純な区間差分で計測しており、
+collar付き・pyannote.metrics換算のmiss%（Round 1の8.7%等）とは
+定義が異なるため厳密には一致しない。カテゴリ間の内訳比率を見る
+相対比較として使う。）
+
+| 会議 | 参照発話合計 | 実測miss(uncollared) | (a) VAD未検出 | (b) min_duration_on起因 | (c) 境界ズレ／清書内部その他 |
+|---|---|---|---|---|---|
+| TS3003a | 490.6s | 40.3s (8.2%) | 27.8s (5.7%) | 0.2s (0.0%) | 12.3s (2.5%) |
+| ES2011a | 394.9s | 38.7s (9.8%) | 30.2s (7.6%) | 0.0s (0.0%) | 8.5s (2.1%) |
+
+**結論（T3）: どちらの会議も`min_duration_on`起因のmissは実質ゼロ
+（0.0〜0.2秒）** — T1で`min_duration_on=0.15`が全指標でbaselineと
+完全一致した理由がここで裏付けられた。miss の大半（TS3003aで
+5.7pt/8.2pt≒70%、ES2011aで7.6pt/9.8pt≒78%）は**(a) ライブSilero VADが
+そもそも音声として検出せず、清書グループにすら入らなかった区間**に
+起因する。残り（TS3003a 2.5pt、ES2011a 2.1pt）は(c)境界ズレ／清書内部の
+検出漏れで、こちらはグループ後のpyannote segmentation側の問題であり
+`min_duration_on`では触れない領域。
+
+TS3003aのoverlap比率がわずか2.1%なのにmissが8.7%（Round 1の
+collarベース実測）ある理由は、overlapではなく**ライブVAD側の検出漏れ
+（カテゴリa）が主因**という診断結果になる。fix自体は今回のスコープ外
+だが、Round 3の優先候補は「清書グループ内のオフライン診断パラメータ
+（`min_duration_on`/`off`）」ではなく、**ライブSilero VADの感度側**
+（`min_speech_duration`、VAD確率しきい値、または2段VAD構成そのもの）
+であることが今回の診断で示された。
+
+### 採用/不採用まとめ
+
+| 施策 | 変更内容 | 平均DERへの効果 | 判定 |
+|---|---|---|---|
+| `min_duration_off=0.25` | 0.5→0.25 | ±0.0pt、IS1008a +0.7pt悪化 | **不採用**（悪化基準に抵触） |
+| `min_duration_off=0.35` | 0.5→0.35 | -0.1pt改善 | **不採用**（改善0.3pt未満） |
+| `min_duration_on=0.15` | 0.3→0.15 | 効果なし（全指標一致） | **不採用**（効果なし） |
+| `--skip-overlap`採点オプション | 新規CLIフラグ | 主指標DERには非影響、内訳のみ | **採用**（評価スクリプト機能として） |
+
+Round 1の宿題「`min_silence=0.5`と同じconfusion改善をライブ非依存の
+経路で得る」は本ラウンドでは未達成のまま持ち越し。T3の診断結果から、
+Round 3では清書側のオフラインパラメータではなく、ライブVADの感度
+チューニング（本番の字幕確定レイテンシとのトレードオフを伴う）を
+検討対象にすべきと判断する。
+
+### 残課題
+
+- ライブSilero VADの感度パラメータ（`min_speech_duration`、VAD確率閾値）
+  のスイープは未実施。§1で見送った理由と同じく、感度を上げると
+  誤検出（FA）が増える可能性があり、Miss改善とのトレードオフを
+  T3の分析と同じ粒度（VAD検出漏れ vs 境界ズレ）で見る必要がある。
+- T3の(c)「境界ズレ／清書内部その他」はTS3003a 12.3秒・ES2011a 8.5秒と
+  カテゴリ(a)より小さいが無視できる量ではない。pyannote segmentationの
+  ターン境界がRTTM参照とどれだけずれているか、秒単位でさらに分解する
+  診断は未実施（今回はcollarなしの粗い差分までに留めた）。
+- `--skip-overlap`はDER内訳のみに効くよう意図的に設計したが、
+  「overlap区間を積極的に2話者ラベルで出す」機能自体（overlap detection）
+  はhayamimiに存在しない。overlap除外DER 15.1% と overlap込みDER 14.1%
+  の差分3.1ptを縮めるには、overlap detection自体の実装が必要になり、
+  スコープが大きい（Round 3以降の検討事項）。
+
 ## 出典
 
 - [Speaker Diarization — sherpa-onnx docs](https://k2-fsa.github.io/sherpa/onnx/speaker-diarization/index.html)
