@@ -202,6 +202,57 @@ divergence rather than dropped/garbled/wrong-language output. Combined with
 the loadability check above, there's no evidence the mobile INT8 pipeline
 degrades accuracy relative to the PC pipeline it's copied from.
 
+## On-device (iPhone 15) verification
+
+First real ARM RTF measurement, resolving the "RTF must be re-measured on
+an actual device" caveat in "Speed caveat" above. Measured via the Bench
+tab (`mobile/`) on a physical iPhone 15 (iOS 27.0 beta), zipformer
+full_int8, `modified_beam_search`, model pushed to `Documents/model/` and
+`Documents/test.wav` (`test_ja_1.wav` from the ReazonSpeech release's
+`test_wavs/`) via `xcrun devicectl device copy to` — see
+`docs/IOS_VERIFY.md` for the setup steps.
+
+| environment | RTF (ja int8, `modified_beam_search`) | notes |
+|---|---|---|
+| PC (Windows, x86-64), int8 | 0.062 | "Accuracy" section above |
+| PC (Windows, x86-64), fp32 | 0.024 | same |
+| Android emulator (x86_64, host PC) | (informational only) | host CPU, not representative |
+| **iPhone 15 (real device), int8** | **0.013** (processing time 0.17s) | Bench tab, single run |
+
+Confirms the "Speed caveat" section's prediction: unlike the x86-64 PC
+(where int8 was *slower* than fp32 for lack of an int8-specific kernel
+path), ARM's NEON/dot-product int8 path makes the phone ~4.8x faster than
+the PC's int8 RTF and ~1.8x faster than the PC's own fp32 RTF. This is a
+single run on one clip, not yet averaged over multiple clips/runs the way
+the PC number is — a strong signal, not a final benchmark.
+
+### Live screen, real mic (first-ever on real hardware)
+
+Same iPhone 15, Live tab, ja model + Silero VAD from `Documents/`.
+Transcription worked end-to-end on real mic input; owner-reported
+observations over the session (subjective, not instrumented):
+
+- No noticeable heat.
+- No UI stutter/jank during decode (the sync-FFI-in-`async` concern noted
+  in `mobile/README.md`'s Status section didn't show up in practice here).
+- Language routing (`ja + SenseVoice`, `Documents/sense_voice/` +
+  `Documents/lid/`) was exercised with real speech switching between ja
+  and en. Badge-switch accuracy was mixed, but the session had multiple
+  people talking in the room — cross-talk/background speech is the
+  suspected cause rather than a routing bug; not conclusive either way
+  without a cleaner single-speaker retest.
+
+This resolves the "Open items" bullet below about the routed live-mic path
+only having been exercised through the wav-based debug test, not a real
+multi-segment live session — it has now been run live, just not yet in
+conditions clean enough to call the accuracy number itself trustworthy.
+
+Remote mode (WS streaming to a PC) was ruled out of scope for this session
+by the repo owner — the Mac's Wi-Fi IP turned out to be outside the usual
+private-LAN ranges (`104.194.96.0/20`), and rather than chase phone-side
+reachability the owner chose to skip it. Not attempted; not a known
+failure.
+
 ## Punctuation model INT8 (`scripts/punct_ja.py` model)
 
 Second mobile-sizing target: the ja punctuation-restoration BERT-char model
@@ -748,12 +799,12 @@ SenseVoice CER range (0.000-0.242) for the same models on the fuller
 - `resolve_sticky_lang` is ported and tested but unused by the live
   pipeline (see architecture note above) — it's there for a future tier
   beyond SenseVoice's 5 languages, not exercised by `jaSenseVoice` today.
-- The emulator has no usable microphone, so the routed live-mic path
-  (as opposed to the routed *manifest* eval, which doesn't need a mic and
-  is now measured above) is exercised only through
-  `LiveTranscriber.runDebugWavRefineTest`'s existing wav-based debug path
-  — not through an actual multi-segment live session with real language
-  switches mid-conversation.
+- The routed live-mic path has now been run on a real device (see
+  "On-device (iPhone 15) verification" → "Live screen, real mic" above),
+  resolving the emulator-only gap this bullet used to describe. The
+  session had multiple speakers in the room, though, so the observed
+  language-badge accuracy isn't a clean single-speaker number — a quieter
+  retest would be needed before trusting it as a routing-accuracy figure.
 - The 20-clip on-device sample above (5 per language) is a quarter to a
   third of `docs/SCORECARD.md`'s 12-15-clip-per-language PC sample; the
   en result in particular (mobile nominally *beating* PC's dedicated v3
@@ -953,8 +1004,9 @@ worth a follow-up routed-profile wav-stream run).
 ## Next steps for a mobile profile
 
 - Load + accuracy validated on an Android emulator via `sherpa_onnx.dart`
-  (see "On-emulator accuracy parity" above); RTF still needs a real ARM
-  device, since the emulator's CPU is just the host PC's.
+  (see "On-emulator accuracy parity" above); real ARM RTF now measured on
+  an iPhone 15 (see "On-device (iPhone 15) verification" above) — still
+  needs the equivalent on a real Android device.
 - Consider static (calibrated) quantization if dynamic INT8 RTF on-device
   turns out worse than fp16 (`*.fp16.onnx`, already shipped upstream at
   ~136.6 MB total — a middle ground between 270.3 MB fp32 and 72.2 MB int8).
