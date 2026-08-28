@@ -44,25 +44,23 @@ copied from the `mobile/` reference app.
 
 ## Running this example yourself
 
-Model files aren't bundled (same as the parent package — see its README's
-"Model files" section for where to get them). Push them onto the device
-under this app's private storage, matching the layout `lib/main.dart`
-expects:
-
-```
-<app docs dir>/model/            # ReazonSpeech ja zipformer transducer (int8)
-<app docs dir>/vad/silero_vad.onnx
-<app docs dir>/sense_voice/      # SenseVoice small (en/zh/ko/yue)
-<app docs dir>/lid/              # whisper-tiny LID
-```
-
-Then:
-
 ```
 flutter pub get
 flutter run
 ```
 
-Tap "Start listening" and speak — draft text appears above the list while
-you're mid-sentence, then a finalized, language-badged line lands in the
-list once you pause.
+Tap **"Download models (~396 MB)"** first — this is `downloadProfile`
+(`ModelProfile.jaSenseVoice`) from `lib/setup/model_downloader.dart`,
+wired up in `lib/main.dart`'s `_downloadModels`. It fetches, verifies, and
+extracts everything into this app's Documents directory in the layout
+`_resolveModelPaths` expects (`<app docs dir>/model/`, `/vad/`,
+`/sense_voice/`, `/lid/`); safe to tap again later, since re-runs are
+checksum-verified and only re-fetch what's missing.
+
+Then tap "Start listening" and speak — draft text appears above the list
+while you're mid-sentence, then a finalized, language-badged line lands in
+the list once you pause.
+
+(If you'd rather place the files yourself — a CI step, an emulator with
+no network, … — see the parent package's README "Model files" section for
+the manual layout and exact asset names.)

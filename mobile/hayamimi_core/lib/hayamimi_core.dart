@@ -35,3 +35,4 @@ export 'routing/routed_recognizer.dart';
 export 'routing/routing_profile.dart';
 export 'server/lan_address.dart';
 export 'server/subtitle_broadcast_server.dart';
+export 'setup/model_downloader.dart';

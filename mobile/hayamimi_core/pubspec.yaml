@@ -22,6 +22,8 @@ dependencies:
     sdk: flutter
   sherpa_onnx: ^1.13.6
   record: ^6.0.0
+  archive: ^4.2.0
+  crypto: ^3.0.7
 
 dev_dependencies:
   flutter_test:
