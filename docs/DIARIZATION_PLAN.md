@@ -1709,6 +1709,224 @@ latency-neutral**（このスイープに関する限りレイテンシ論点は
 - IS1009aのconfusion 12.4%（§0の既知の最大要因）は今回のスコープ外の
   まま未着手。
 
+## 14. Round 4: confusionの内訳診断（LOCAL/REMAP/FAST-PATH）、REMAP対策の実験、overlap対応可否調査
+
+### 背景
+
+§0でconfusionが「今もっとも対応の余地がある」最大要因と確認済み
+（IS1009a 12.4%、ES2011a ~6-7%、他は≤5%）。だがこれまでのラウンドは
+confusionを一枚岩の数字としてしか見ておらず、清書パイプラインの
+どの段階（局所クラスタリングそのもの／グローバル話者へのremap／
+そもそも再分離を経ないfast-pathの残差）が原因なのかを切り分けたことが
+なかった。本ラウンドはこの内訳診断（T1）、内訳の支配的要因への対策
+実験（T2）、overlap発話への対応可否のコード調査（T3、実装なし）の3本。
+
+### T1: confusion内訳診断
+
+**定義**（3カテゴリ、時間の合計はconfusion全体と一致するよう相互排他に設計）:
+
+- **LOCAL誤り**: そのconfusion区間を生んだ清書グループについて、
+  グループの時間範囲に限定した「ローカルクラスタid→参照話者」の
+  最適割当（Hungarian法、重複時間最大化）を計算し、それでもなお
+  参照と食い違う場合。完璧なremapがあってもこの誤りは直らない。
+- **REMAP誤り**: 上記のローカル最適割当は参照と一致するのに、
+  `speaker_id.SpeakerLabeler.match_embedding()`（remap_threshold経由）
+  が選んだグローバルS{n}が食い違う場合。ローカルクラスタリング自体は
+  正しく、remapステップだけが誤っている。
+- **FAST-PATH残差**: そのhypスパンの最終ラベルが、実際の局所再分離＋
+  remapを経ておらず、グループ内ローカルクラスタが1種類以下だった
+  （＝多数決fast-pathラベルへのフォールバック）ことに由来する場合。
+
+診断は`scripts/eval_diar.py`の`generate_diarize_hypothesis()`と全く
+同じアルゴリズム・同じ定数を使う独自インストルメント版（スクラッチ、
+コミットせず）で、各hypスパンに「どのグループ由来か」「fast-path
+フォールバックか」「ローカルクラスタid」を付与記録した。confusion
+区間そのものの特定（どの時間・どのラベルがconfusionか、collar=0.25s
+込み）は`pyannote.metrics.errors.identification.IdentificationErrorAnalysis`
+の`.difference()`を使用 — これは`eval_diar.py`の`der_breakdown()`が使う
+`DiarizationErrorRate`と同じcollar/マッチング機構だが、**内部でhyp/ref
+ラベル空間のHungarian最適置換（`DiarizationErrorRate.optimal_mapping()`）
+を先に適用しないと使えない**ことが実装中に判明した（最初の実装では
+このマッピングを忘れ、ES2011aのconfusionが354.3s＝正しい値27.0sの
+13倍という明らかにおかしい値が出た。原因はhypのS{n}ラベルと参照の
+A/B/C/DラベルをIdentificationErrorAnalysisが素の文字列比較していた
+ため）。修正後は`DiarizationErrorRate`が返すconfusion秒数と
+`IdentificationErrorAnalysis`側の合計が両meetingで完全一致（ES2011a
+27.0s=27.0s、IS1009a 57.3s=57.3s）することを確認済み — 以下の内訳は
+この検証済み手法による。
+
+| meeting | confusion合計 | LOCAL | REMAP | FAST-PATH残差 |
+|---|---|---|---|---|
+| ES2011a | 27.0s | 6.4s（23.8%） | 13.2s（**49.0%**） | 7.4s（27.3%） |
+| IS1009a | 57.3s | 22.1s（38.6%） | 35.1s（**61.3%**） | 0.04s（0.1%） |
+
+（confusion合計はDiarizationErrorRate実測値。§0で参照した5.9%/12.4%
+という比率とは実行間の非決定性ノイズで数秒ズレる — §13で確認済みの
+±0.2pt級のノイズと同水準、GroupDiarizerのFastClustering・remap
+マッチングは実行間で完全に決定論的ではない。)
+
+**両meetingともREMAP誤りが最大カテゴリ**（ES2011a 49%、IS1009a 61%）。
+LOCAL誤りは2位（24-39%）で、こちらは「そもそもgroup内の局所クラスタ
+リングが参照と食い違う」という、remapを直しても解決しない根本的な
+限界に近い。FAST-PATH残差はES2011aで27%（fallbackグループが17/32と
+多い）、IS1009aではほぼゼロ（fallbackグループ4/24のみで、たまたま
+それらの区間はconfusionを起こしていない）。
+
+**T2の方針決定**: タスク設計どおりREMAP誤りが両meetingで支配的
+だったため、REMAP対策の実験に進む。
+
+### T2: REMAP対策実験 — `min_remap_update_s`（クラスタ長でcentroid更新を制限）
+
+T1の候補2つ（duration-weighted remap／best-of-group assignment）から
+前者を選択。理由: `match_embedding()`のcentroid更新は既に単純な累積平均
+（`(centroids[i]*n + emb) / (n+1)`、`speaker_id.py`）で、極端に短い
+ローカルクラスタ（数百msなど）の埋め込みはノイズが大きく、これが
+centroidを実際の話者から動かしてしまい後続のremapを狂わせる、という
+仮説が「クラスタ<1sはcentroid更新から除外する」という具体的な対策に
+直結しやすかったため。
+
+**実装**（`scripts/eval_diar.py`の`generate_diarize_hypothesis()`に
+`min_remap_update_s`引数、`--min-remap-update-s`CLIフラグ。本番側
+`scripts/realtime_transcribe.py`の`Refiner`にも同じ挙動を
+`min_remap_update_s`コンストラクタ引数／`--speaker-min-remap-update-s`
+CLIフラグとして追加し、評価専用にしない）: ローカルクラスタの合計
+発話長がこの秒数未満なら、`match_embedding(update=True)`ではなく
+`match_embedding(update=False)`（読み取り専用probe）を使う —
+既存centroidにマッチすればそのラベルを使う（centroidの平均は動かさ
+ない）が、マッチしなければ新規centroidを開かず、グループの
+fast-path多数決ラベルにフォールバックする。デフォルト0.0は完全な
+no-op（既存の全ラウンドの挙動と同一）。
+
+**スイープ**（AMI 5会議、collar=0.25s、`--method refine_diarize`、
+他はデフォルト）:
+
+| min-remap-update-s | 平均DER | ES2011a | IS1008a | ES2004a | IS1009a | TS3003a |
+|---|---|---|---|---|---|---|
+| 0.0（baseline再実測） | 13.900% | 16.82% | 3.98% | 17.76% | 16.88% | 14.06% |
+| 0.5 | 13.885%（-0.015pt） | 16.82% | 3.98% | 17.70% | 16.88% | 14.05% |
+| 1.0 | 13.884%（-0.016pt） | 16.82% | 3.98% | 17.70% | 16.87% | 14.05% |
+| 1.5 | 13.838%（-0.062pt） | 16.82% | 3.98% | 17.70% | 16.87% | 13.82% |
+| 2.0 | 14.0%（**+0.1pt悪化**） | **17.7%**（+0.9pt） | 4.0% | 17.7% | 16.9% | 13.8% |
+
+0.5〜1.5では改善方向だが**採用基準の0.3pt改善に遠く届かない**
+（最良の1.5でも-0.062pt）。2.0まで上げるとES2011aのconfusionが
+5.9%→6.8%へ悪化して回帰（+0.9pt、「0.5pt超悪化なし」基準に抵触）し、
+平均も逆に悪化する。
+
+**なぜ効かなかったかの検証**: 1.5（一番マシだった値）でT1と同じ
+インストルメント診断を再実行し、REMAP誤りの秒数自体が減っているか
+確認した。
+
+| meeting | min_remap_update_s | confusion合計 | LOCAL | REMAP | FAST-PATH残差 |
+|---|---|---|---|---|---|
+| ES2011a | 0.0 | 27.0s | 6.4s | 13.2s | 7.4s |
+| ES2011a | 1.5 | 24.3s（-2.7s） | 6.4s（±0） | 13.2s（**±0**） | 4.6s（-2.8s） |
+| IS1009a | 0.0 | 57.3s | 22.1s | 35.1s | 0.04s |
+| IS1009a | 1.5 | 57.3s（±0） | 21.3s | 35.9s（**+0.8s**） | 0.04s（±0） |
+
+ES2011aの改善（confusion 27.0s→24.3s）は**REMAP秒数が全く変わらず**
+（13.2s→13.2s）、FAST-PATH残差だけが減ったこと（7.4s→4.6s）で起きて
+いる — この施策が意図した「remap誤りを直す」効果は測定上ゼロで、
+副次的にfallback経路の挙動がわずかに変わった結果らしい。IS1009aに
+至ってはREMAP秒数がむしろ微増（35.1s→35.9s）している。
+
+**結論（仮説の反証）**: 「短いクラスタのノイズがcentroidを汚して
+remapを誤らせる」という仮説は、この施策では裏付けられなかった。
+`match_embedding(update=False)`で更新を止めても、そもそものマッチング
+判定（centroidとの類似度がremap_threshold=0.35を超えるか）自体は
+変わらないため、centroid更新の有無が結果に反映されるのは「その
+centroidが後で別のクラスタのマッチングに使われた場合」のみで、
+今回の2 meeting・この時間窓では効果が測定できるほど蓄積しなかった
+とみられる。REMAP誤りの真因はcentroidのドリフトではなく、**その場の
+埋め込み自体がどのグローバル話者にも十分近くない**（threshold=0.35を
+割り込む、または僅差の誤答が生じる）ことにありそうだが、これを
+確定させる追加診断は今回のスコープ外。
+
+### 採用/不採用まとめ（T2）
+
+| 施策 | 変更内容 | 平均DERへの効果 | 判定 |
+|---|---|---|---|
+| `min_remap_update_s`の露出 | `Refiner`/`generate_diarize_hypothesis()`/両CLIフラグ追加 | 機能追加のみ、デフォルト0.0で本番非影響 | **採用**（評価・本番双方の機能として） |
+| `min_remap_update_s=0.5/1.0/1.5` | centroid更新をクラスタ長でゲート | 最良0.062pt改善（基準0.3pt未達） | **不採用** |
+| `min_remap_update_s=2.0` | 同上、より広いゲート | +0.1pt悪化、ES2011a+0.9pt回帰 | **不採用**（悪化基準に抵触） |
+
+ライブレイテンシへの影響: この施策はremap呼び出し自体の回数もタイミング
+も変えず（`match_embedding()`の`update`引数を切り替えるだけ）、レイテンシ
+中立。今回不採用になった理由はDER側の効果不足のみ。
+
+### T3: overlap発話への対応可否（調査のみ、実装なし）
+
+**問い**: 構造的floor（§で確認済み、~3.1pt）はhayamimiが常に1区間=1話者
+のシングルラベル出力である前提から来ている。インストール済み
+`sherpa_onnx`（1.13.6）の`OfflineSpeakerDiarization`は、そもそも
+overlap（重複発話）区間を扱う余地があるのか？
+
+**Python API層の確認**: `sherpa_onnx.OfflineSpeakerDiarizationSegment`
+は`speaker`（単一int）・`start`・`end`・`text`・`duration`のみを持ち、
+複数話者を保持するフィールドがない。`OfflineSpeakerDiarizationResult`
+は`sort_by_start_time()`/`sort_by_speaker()`でこの単一話者セグメントの
+列を並べ替えるだけ。`FastClusteringConfig`にoverlap関連の設定項目は
+無い。Python側に公開されているのは`OfflineSpeakerSegmentationModelConfig`
+と`OfflineSpeakerSegmentationPyannoteModelConfig`（＝モデルファイルの
+パス設定のみ）で、セグメンテーションモデルの生の出力（フレーム単位の
+確率）にアクセスするAPIは存在しない。
+
+**C++実装層の確認**（`gh api`で`k2-fsa/sherpa-onnx`の
+`sherpa-onnx/csrc/offline-speaker-diarization-pyannote-impl.h`を直接取得
+して読んだ）: pyannote segmentation-3.0モデルは**powerset分類**
+（`InitPowersetMapping()`、pyannote-audioの`utils/powerset.py`を参照する
+コメント付き）を出力しており、`ToMultiLabel()`がpowersetクラスを
+「フレームごとの話者0/1マトリクス」にデコードする。このデコード結果は
+**構造上、1フレームに複数話者が同時にactiveになり得る**（powersetの
+クラスにはペア・トリプルの組み合わせが含まれる — pyannote本来の
+overlap対応の仕組みそのもの）。しかし`GetChunkSpeakerSampleIndexes()`
+はこの結果に対して真っ先に`ExcludeOverlap()`を呼んでおり、その
+コメントは明示的に「If there are multiple speakers at a frame, then
+this frame is excluded.」— **overlapフレームは話者セグメント抽出前に
+意図的に捨てられている**。つまりモデル自体はoverlap対応の情報を
+出力しているが、sherpa-onnxの公開パイプラインがそれをクラスタリング
+に渡す前段で破棄している。
+
+**判定: possible-with-work**（upstream変更なしでは不可能、ではない）。
+根拠:
+- overlap対応に必要な情報（powersetデコード後のマルチラベル）は
+  モデル出力に存在する。アルゴリズム（pyannote-audioの
+  `utils/powerset.py`）も公開されている。
+- ただしPython APIからこの生出力に到達する手段が無い
+  （`OfflineSpeakerSegmentationModelConfig`はパス設定のみ）ため、
+  sherpa_onnxの`OfflineSpeakerDiarization`を経由する限りoverlapは
+  常にゼロになる。
+- 回避策は「sherpa_onnxをバイパスし、`model.onnx`
+  （`models/sherpa-onnx-pyannote-segmentation-3-0/model.onnx`、
+  既にダウンロード済み）を自前でonnxruntime推論し、powersetデコード
+  ロジックを自前実装する」こと。モデルファイルもアルゴリズムも既知・
+  入手可能なため技術的には可能だが、新規のセグメンテーション専用
+  推論パス（チャンク分割・受容野からのサンプルインデックス復元・
+  powersetデコード・複数話者フレームのマージ）を丸ごと書く規模の
+  作業で、今回のT1〜T3の範囲を大きく超える。upstream（k2-fsa/
+  sherpa-onnx）にoverlap保持オプションを追加してもらう方が現実的な
+  可能性もあるが、今回は問い合わせ・PR提案までは行っていない。
+- 従って次ラウンド以降でこのfloorを攻めるなら、この自前実装
+  （またはupstreamへの機能要望）が前提になる、という結論。今回は
+  調査のみで実装はしない。
+
+### 残課題
+
+- REMAP誤りの真因（centroidドリフトではなさそうと分かったのみ）は
+  未確定。次の候補は「remap_threshold=0.35自体を僅差で割り込む/僅差で
+  跨ぐケースの分布を見る」診断（閾値そのものの再チューニングではなく、
+  T1と同じ手法でREMAP誤りをさらに「閾値未満で新規centroidを開いた」
+  ケースと「既存centroidに誤ってマッチした」ケースに割るなど）。
+- LOCAL誤り（24-39%、2番目に大きいカテゴリ）は今回T2の対象外のまま。
+  `num_clusters`ヒント（グローバル台帳の確信済み話者数を
+  `FastClusteringConfig.num_clusters`に渡す）はT1のタスク設計が
+  「LOCALが支配的な場合の代替案」として用意していたが、今回は
+  REMAPが支配的だったため試していない。次ラウンドでLOCAL側を狙う
+  ならこれが候補として残っている。
+- T3で判定した「possible-with-work」の自前実装（またはupstream機能
+  要望）は着手していない。構造的floor（~3.1pt）を動かす唯一の既知
+  経路だが、スコープの大きい別イテレーションが必要。
+
 ## 出典
 
 - [Speaker Diarization — sherpa-onnx docs](https://k2-fsa.github.io/sherpa/onnx/speaker-diarization/index.html)
@@ -1722,6 +1940,8 @@ latency-neutral**（このスイープに関する限りレイテンシ論点は
 - [pyannote.metrics (GitHub)](https://github.com/pyannote/pyannote-metrics) / [pyannote-metrics (PyPI)](https://pypi.org/project/pyannote-metrics/) (導入・実測: 本イテレーション⑤)
 - [simpleder (PyPI)](https://pypi.org/project/simpleder/)
 - `.venv` 内 `sherpa_onnx` 1.13.6 実体の `dir()`/`help()` 出力（本調査で直接確認）
+- [k2-fsa/sherpa-onnx `offline-speaker-diarization-pyannote-impl.h`](https://github.com/k2-fsa/sherpa-onnx/blob/master/sherpa-onnx/csrc/offline-speaker-diarization-pyannote-impl.h)（Round 4 T3、`gh api`で取得して直接確認: `ExcludeOverlap()`/`ToMultiLabel()`/`InitPowersetMapping()`）
+- [pyannote-audio `utils/powerset.py`](https://github.com/pyannote/pyannote-audio/blob/develop/pyannote/audio/utils/powerset.py)（上記C++コード内で直接参照されているpowersetデコードの元アルゴリズム）
 - リポジトリ内: `scripts/speaker_id.py`, `scripts/realtime_transcribe.py`,
   `scripts/download_models.py`, `README.md`, `docs/GOALS.md`,
   `docs/BENCHMARKS.md`
