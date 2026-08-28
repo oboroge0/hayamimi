@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa_onnx;
 
 import '../bench/model_file_resolver.dart';
+import '../live/native_model_loader.dart';
 import 'lang_routing.dart';
 import 'routing_profile.dart';
 
@@ -95,7 +96,7 @@ class RoutedRecognizerSet {
       throw RoutedRecognizerException(e.message);
     }
     final sep = Platform.pathSeparator;
-    final reazon = sherpa_onnx.OfflineRecognizer(
+    final reazon = await buildOfflineRecognizerOffIsolate(
       sherpa_onnx.OfflineRecognizerConfig(
         model: sherpa_onnx.OfflineModelConfig(
           transducer: sherpa_onnx.OfflineTransducerModelConfig(
@@ -143,7 +144,7 @@ class RoutedRecognizerSet {
         'SenseVoice model/tokens not found in: $senseVoiceModelDir',
       );
     }
-    final senseVoice = sherpa_onnx.OfflineRecognizer(
+    final senseVoice = await buildOfflineRecognizerOffIsolate(
       sherpa_onnx.OfflineRecognizerConfig(
         model: sherpa_onnx.OfflineModelConfig(
           senseVoice: sherpa_onnx.OfflineSenseVoiceModelConfig(
@@ -190,7 +191,7 @@ class RoutedRecognizerSet {
         'whisper-tiny LID encoder/decoder not found in: $lidModelDir',
       );
     }
-    final lid = sherpa_onnx.SpokenLanguageIdentification(
+    final lid = await buildSpokenLanguageIdentificationOffIsolate(
       sherpa_onnx.SpokenLanguageIdentificationConfig(
         whisper: sherpa_onnx.SpokenLanguageIdentificationWhisperConfig(
           encoder: '$lidModelDir$sep${lidFiles.first}',
