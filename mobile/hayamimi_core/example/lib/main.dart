@@ -49,6 +49,13 @@ class _SubtitlePageState extends State<SubtitlePage> {
   bool _isRunning = false;
   String? _error;
 
+  // Model download state -- see _downloadModels below. Not started
+  // automatically: ModelProfile.jaSenseVoice is ~396 MB, so this only
+  // happens when the user taps the button.
+  bool _downloading = false;
+  ModelDownloadEvent? _downloadEvent;
+  String? _downloadError;
+
   @override
   void initState() {
     super.initState();
@@ -88,6 +95,33 @@ class _SubtitlePageState extends State<SubtitlePage> {
     );
   }
 
+  /// Downloads every model file `RoutingProfile.jaSenseVoice` needs (see
+  /// [_resolveModelPaths]) into this app's Documents directory, guarded
+  /// behind a button tap so the ~396 MB transfer never starts on its own
+  /// (see README "Model files"). Safe to tap again later -- `downloadProfile`
+  /// re-verifies by checksum and only re-fetches what's missing/corrupt.
+  Future<void> _downloadModels() async {
+    setState(() {
+      _downloading = true;
+      _downloadError = null;
+      _downloadEvent = null;
+    });
+    try {
+      final docsDir = await getApplicationDocumentsDirectory();
+      await downloadProfile(
+        ModelProfile.jaSenseVoice,
+        docsDir.path,
+        onProgress: (event) {
+          if (mounted) setState(() => _downloadEvent = event);
+        },
+      );
+    } catch (e) {
+      setState(() => _downloadError = e.toString());
+    } finally {
+      if (mounted) setState(() => _downloading = false);
+    }
+  }
+
   Future<void> _toggle() async {
     if (_isRunning) {
       await _live.stop();
@@ -121,6 +155,13 @@ class _SubtitlePageState extends State<SubtitlePage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            _ModelDownloadSection(
+              downloading: _downloading,
+              event: _downloadEvent,
+              error: _downloadError,
+              onDownload: _downloadModels,
+            ),
+            const SizedBox(height: 12),
             FilledButton.icon(
               onPressed: _live.isDebugStreaming ? null : _toggle,
               icon: Icon(_isRunning ? Icons.stop : Icons.mic),
@@ -161,6 +202,70 @@ class _SubtitlePageState extends State<SubtitlePage> {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// A "Download models" button + progress readout, standing in for
+/// whatever onboarding UI a host app would build around
+/// [downloadProfile] -- see this package's README "Model files" section
+/// for the full snippet this widget is built from.
+class _ModelDownloadSection extends StatelessWidget {
+  const _ModelDownloadSection({
+    required this.downloading,
+    required this.event,
+    required this.error,
+    required this.onDownload,
+  });
+
+  final bool downloading;
+  final ModelDownloadEvent? event;
+  final String? error;
+  final VoidCallback onDownload;
+
+  String _label() {
+    if (!downloading) return 'Download models (~396 MB)';
+    final e = event;
+    if (e == null) return 'Starting download…';
+    switch (e.phase) {
+      case ModelDownloadPhase.skipped:
+        return 'Already downloaded (${e.sourceIndex + 1}/${e.sourceCount})';
+      case ModelDownloadPhase.downloading:
+        final total = e.totalBytes;
+        final mb = (e.bytesReceived / 1e6).toStringAsFixed(1);
+        final totalMb = total == null ? '?' : (total / 1e6).toStringAsFixed(1);
+        return 'Downloading ${e.sourceIndex + 1}/${e.sourceCount}: '
+            '$mb / $totalMb MB';
+      case ModelDownloadPhase.verifyingDownload:
+        return 'Verifying ${e.sourceIndex + 1}/${e.sourceCount}…';
+      case ModelDownloadPhase.extracting:
+        return 'Extracting ${e.sourceIndex + 1}/${e.sourceCount}…';
+      case ModelDownloadPhase.done:
+        return 'Done ${e.sourceIndex + 1}/${e.sourceCount}';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final progress = event?.totalBytes == null
+        ? null
+        : event!.bytesReceived / event!.totalBytes!;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        OutlinedButton(
+          onPressed: downloading ? null : onDownload,
+          child: Text(_label()),
+        ),
+        if (downloading &&
+            event?.phase == ModelDownloadPhase.downloading)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: LinearProgressIndicator(value: progress),
+          ),
+        if (error != null)
+          Text(error!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
+      ],
     );
   }
 }

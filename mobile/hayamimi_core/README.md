@@ -49,17 +49,78 @@ import 'package:hayamimi_core/hayamimi_core.dart';
 
 ### Model files
 
-You'll need to get model files onto the device yourself (this package
-doesn't bundle any):
+`HayamimiLive` needs sherpa-onnx model files on disk (72-396 MB depending
+on the profile — see "Recommended configurations" below); this package
+doesn't bundle any, but ships a downloader so you don't have to hand-roll
+the fetch/verify/unpack/placement yourself:
 
-- A zipformer transducer ASR model (encoder/decoder/joiner/tokens.txt) from
-  the [sherpa-onnx releases](https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models)
-  — pick an `int8` variant. See `resolveZipformerTransducerFiles` in
-  `lib/bench/model_file_resolver.dart` for the filename matching rules
-  (exact names aren't required).
+```dart
+import 'package:hayamimi_core/hayamimi_core.dart';
+import 'package:path_provider/path_provider.dart';
+
+final docsDir = await getApplicationDocumentsDirectory();
+
+await downloadProfile(
+  ModelProfile.jaOnly, // or ModelProfile.jaSenseVoice
+  docsDir.path,
+  onProgress: (event) {
+    // event.phase: skipped/downloading/verifyingDownload/extracting/done
+    // event.bytesReceived / event.totalBytes for a progress bar
+    // (totalBytes is null if the server didn't send Content-Length)
+  },
+);
+
+final live = HayamimiLive();
+await live.start(
+  modelDir: '${docsDir.path}/model',
+  vadModelPath: '${docsDir.path}/vad/silero_vad.onnx',
+  // Only for ModelProfile.jaSenseVoice:
+  // routingProfile: RoutingProfile.jaSenseVoice,
+  // senseVoiceModelDir: '${docsDir.path}/sense_voice',
+  // lidModelDir: '${docsDir.path}/lid',
+);
+```
+
+`downloadProfile` downloads each asset from the sherpa-onnx GitHub
+releases (`asr-models` tag), verifies its sha256, extracts only the
+`int8` members from the archives that bundle multiple precisions, and
+places everything under `<targetDir>/model`, `/vad`, `/sense_voice`,
+`/lid` — the exact layout `HayamimiLive.start` (and this snippet) expect,
+so nothing needs renaming or resolving by hand. It's idempotent: call it
+again (e.g. on every app start) and it re-verifies what's already on disk
+by checksum and only re-fetches what's missing or corrupt, so it's safe
+to call unconditionally rather than gating it on "is this the first
+launch."
+
+See [`lib/setup/model_downloader.dart`](lib/setup/model_downloader.dart)
+for the full manifest (`modelManifest`) — exact asset URLs, sha256s, and
+which files each profile places where — and
+[`example/`](example/)'s `_downloadModels` for a guarded, tap-to-download
+version of the snippet above (it doesn't fetch 396 MB without the user
+asking for it).
+
+<details>
+<summary>Getting the models yourself instead</summary>
+
+If you'd rather manage the files by hand (a CI step, a custom CDN, …),
+`downloadProfile`'s manifest names the exact assets:
+
+- ReazonSpeech ja zipformer transducer (int8): [`sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17.tar.bz2`](https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17.tar.bz2)
+  — extract the `encoder`/`decoder`/`joiner` `.int8.onnx` files (this
+  archive also ships fp32/fp16, which you don't need on a phone) plus
+  `tokens.txt` into one directory. See `resolveZipformerTransducerFiles`
+  in `lib/bench/model_file_resolver.dart` for the filename matching rules
+  if you use a different sherpa-onnx model (exact names aren't required).
 - [`silero_vad.onnx`](https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx)
   for VAD, only needed for `HayamimiLive` (not `HayamimiRemote`, which has
   no ASR of its own).
+- For `RoutingProfile.jaSenseVoice` only: [`sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2`](https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2)
+  (`model.int8.onnx` + `tokens.txt`) and [`sherpa-onnx-whisper-tiny.tar.bz2`](https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.tar.bz2)
+  (only its `tiny-encoder.int8.onnx`/`tiny-decoder.int8.onnx` — the LID
+  probe doesn't need `tiny-tokens.txt` or the fp32 files also in that
+  archive).
+
+</details>
 
 `sherpa_onnx` and `record` (both dependencies of this package) need their
 usual platform setup — `RECORD_AUDIO` permission on Android
@@ -271,6 +332,9 @@ live.events.listen(broadcast.broadcast); // events are already SubtitleEvent
   `subtitle_event.dart` (the `SubtitleEvent` hierarchy: partial/final/
   translation/refine/error, all with wire-compatible JSON encoding), and
   `overlay_html.dart` (the OBS-ready transparent overlay page).
+- `lib/setup/model_downloader.dart` — `downloadProfile`/`downloadModelSource`
+  (fetch → verify sha256 → extract → place) and `modelManifest` (the two
+  profiles' exact sherpa-onnx release URLs, checksums, and on-disk layout).
 - `test/` — unit tests for everything pure-logic above (`flutter test`),
   plus `lifecycle_test.dart`, which covers the start/connect/dispose
   lifecycle of `LiveTranscriber`/`RemoteTranscriber` against a fake
