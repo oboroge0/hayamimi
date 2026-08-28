@@ -101,6 +101,31 @@ Notes on the choice:
   integration is tracked in
   [#15](https://github.com/oboroge0/hayamimi/issues/15).
 
+## Threading / known limitations
+
+**Model loading is off the main isolate.** `HayamimiLive.start()` /
+`LiveTranscriber.start()` build the sherpa-onnx recognizer(s) and the VAD on
+a short-lived background isolate and hand the native handles back — see
+[`lib/live/native_model_loader.dart`](lib/live/native_model_loader.dart) for
+why that handoff is safe. Loading 72 MB (ja only) to 396 MB
+(`RoutingProfile.jaSenseVoice`) of ONNX weights is a multi-second
+*synchronous* FFI call; doing it inline on Flutter's UI isolate — which is
+what this package used to do — froze the whole app for that entire time,
+which is what a "freezes at startup" report on a real iPhone 15 turned out
+to be.
+
+**Per-segment decode still runs on the caller's isolate.** Once a session is
+live, each VAD-bounded segment is decoded with a synchronous FFI call on
+whichever isolate drives the mic stream — for a normal host app, the UI
+isolate. Budget roughly **0.1–0.5 s of blocked UI per utterance** for the
+fast per-segment pass on a modern phone, and noticeably longer for a refine
+("清書") pass, which re-decodes a whole buffered group at once (up to 60 s of
+audio by default). If your app animates continuously while transcribing,
+this shows up as dropped frames. Moving the decode path onto a persistent
+worker isolate is tracked upstream in the
+[hayamimi issue tracker](https://github.com/oboroge0/hayamimi/issues) and is
+*not* fixed by the loading change above.
+
 ## Minimal example: on-device subtitles
 
 See [`example/`](example/) for a full, runnable Flutter app built from

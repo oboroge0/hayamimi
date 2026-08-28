@@ -11,6 +11,7 @@ import '../routing/routed_recognizer.dart';
 import '../routing/routing_profile.dart';
 import 'draft_pass.dart';
 import 'live_transcript_entry.dart';
+import 'native_model_loader.dart';
 import 'pcm_frame_buffer.dart';
 import 'refine_pass.dart';
 import 'speech_segment_filter.dart';
@@ -37,6 +38,11 @@ class LiveTranscriberException implements Exception {
 /// real device/emulator mic and the sherpa-onnx native libs). The pure
 /// pieces it's built from — [pcm16BytesToFloat32], [PcmFrameBuffer], and
 /// [isSegmentWorthDecoding] — are unit tested separately.
+///
+/// Threading: model *loading* happens on a background isolate (see
+/// `native_model_loader.dart`), so [start] doesn't freeze the UI. Per-segment
+/// *decoding* still runs synchronously on whichever isolate drives the mic
+/// stream — see the README's "Threading / known limitations".
 class LiveTranscriber {
   LiveTranscriber({AudioRecorder? recorder})
     : _recorder = recorder ?? AudioRecorder();
@@ -151,6 +157,11 @@ class LiveTranscriber {
   /// (en/zh/ko/yue) per the dual-LID policy in
   /// `../routing/lang_routing.dart`, and emitted [LiveTranscriptEntry]s
   /// carry [LiveTranscriptEntry.lang].
+  ///
+  /// Model loading runs on a background isolate (see
+  /// `native_model_loader.dart`), so awaiting this does not block the UI.
+  /// A call made while a session is already running — or while an earlier
+  /// [start]/[startDebugWavStream] is still loading — is a no-op.
   Future<void> start({
     required ModelKind modelKind,
     required String modelDir,
@@ -253,7 +264,7 @@ class LiveTranscriber {
       }
 
       final sep = Platform.pathSeparator;
-      _recognizer = sherpa_onnx.OfflineRecognizer(
+      _recognizer = await buildOfflineRecognizerOffIsolate(
         sherpa_onnx.OfflineRecognizerConfig(
           model: sherpa_onnx.OfflineModelConfig(
             transducer: sherpa_onnx.OfflineTransducerModelConfig(
@@ -274,7 +285,7 @@ class LiveTranscriber {
       sileroVad: sherpa_onnx.SileroVadModelConfig(model: vadModelPath),
       sampleRate: sampleRate,
     );
-    _vad = sherpa_onnx.VoiceActivityDetector(
+    _vad = await buildVadOffIsolate(
       config: vadConfig,
       bufferSizeInSeconds: 30,
     );
@@ -852,7 +863,7 @@ class LiveTranscriber {
       }
 
       final sep = Platform.pathSeparator;
-      recognizer = sherpa_onnx.OfflineRecognizer(
+      recognizer = await buildOfflineRecognizerOffIsolate(
         sherpa_onnx.OfflineRecognizerConfig(
           model: sherpa_onnx.OfflineModelConfig(
             transducer: sherpa_onnx.OfflineTransducerModelConfig(
