@@ -96,6 +96,37 @@ def test_match_embedding_picks_nearest_of_several_centroids():
 
 
 # ---------------------------------------------------------------------------
+# Round 5 (docs/DIARIZATION_PLAN.md section 15) T3: exclude_provisional
+# ---------------------------------------------------------------------------
+
+def test_exclude_provisional_skips_a_one_off_centroid_as_a_match_target():
+    labeler = make_labeler(threshold=0.3)
+    labeler.match_embedding(unit([1.0, 0.0]))  # S1: confirmed (2 hits)
+    labeler.match_embedding(unit([0.99, 0.01]))
+    labeler.match_embedding(unit([0.0, 1.0]))  # S2: still provisional (1 hit)
+    assert PROVISIONAL_CONFIRM_HITS == 2
+    # would ordinarily match S2 (closest), but S2 is still provisional
+    probe = unit([0.05, 0.95])
+    label = labeler.match_embedding(probe, update=False, exclude_provisional=True)
+    assert label == ""  # no eligible confirmed centroid close enough either
+
+
+def test_exclude_provisional_still_matches_a_confirmed_centroid():
+    labeler = make_labeler(threshold=0.3)
+    labeler.match_embedding(unit([1.0, 0.0]))  # S1: confirmed
+    labeler.match_embedding(unit([0.99, 0.01]))
+    label = labeler.match_embedding(unit([0.98, 0.02]), update=False, exclude_provisional=True)
+    assert label == "S1"
+
+
+def test_exclude_provisional_false_is_a_no_op_default():
+    labeler = make_labeler(threshold=0.3)
+    labeler.match_embedding(unit([0.0, 1.0]))  # S1: provisional (1 hit)
+    label = labeler.match_embedding(unit([0.05, 0.95]), update=False)
+    assert label == "S1"
+
+
+# ---------------------------------------------------------------------------
 # Round 5 (docs/DIARIZATION_PLAN.md section 15) T1: constrained joint remap
 # ---------------------------------------------------------------------------
 
