@@ -96,6 +96,79 @@ def test_match_embedding_picks_nearest_of_several_centroids():
 
 
 # ---------------------------------------------------------------------------
+# Round 5 (docs/DIARIZATION_PLAN.md section 15) T1: constrained joint remap
+# ---------------------------------------------------------------------------
+
+def test_joint_remap_single_cluster_matches_independent_match_embedding():
+    # single-local-cluster groups must take the exact old path -- no joint
+    # machinery, byte-for-byte the same as calling match_embedding().
+    labeler = make_labeler(threshold=0.3)
+    labeler.match_embedding(unit([1.0, 0.0]))  # S1
+    emb = unit([0.99, 0.01])
+    labels = labeler.match_embeddings_joint([emb], update=True, threshold=0.3)
+    assert labels == ["S1"]
+
+
+def test_joint_remap_no_live_centroids_opens_distinct_new_speakers():
+    labeler = make_labeler(threshold=0.3)
+    labels = labeler.match_embeddings_joint(
+        [unit([1.0, 0.0]), unit([0.0, 1.0])], update=True, threshold=0.3, source="remap")
+    assert labels == ["S1", "S2"]
+    assert labeler.centroid_open_counts() == {"remap": 2}
+
+
+def test_joint_remap_keeps_two_clusters_on_distinct_speakers_when_both_eligible():
+    # Without the joint constraint, two local clusters that are BOTH
+    # individually closest to the same global centroid but still eligible
+    # (>= threshold) for the other one would greedily collapse onto one
+    # speaker. The Hungarian assignment instead picks the higher-total
+    # pairing that keeps them apart.
+    labeler = make_labeler(threshold=0.02)
+    labeler.match_embedding(unit([1.0, 0.0]))  # S1
+    labeler.match_embedding(unit([0.0, 1.0]))  # S2
+    a = unit([0.95, 0.05])  # closer to S1, but still eligible for S2
+    b = unit([0.9, 0.1])    # closer to S1 too, but still eligible for S2
+    labels = labeler.match_embeddings_joint([a, b], update=True, threshold=0.02, source="remap")
+    assert labels == ["S1", "S2"]
+
+
+def test_joint_remap_falls_back_to_independent_match_when_below_threshold():
+    # b's jointly-optimal partner (S2) falls below the eligibility floor,
+    # so it has no eligible candidate and falls back to an independent
+    # match_embedding() call -- which, unconstrained, matches its own
+    # nearest centroid (S1, already claimed by a). This is the documented
+    # fallback trade-off, not a bug: eligibility floor first, constraint
+    # second.
+    labeler = make_labeler(threshold=0.3)
+    labeler.match_embedding(unit([1.0, 0.0]))  # S1
+    labeler.match_embedding(unit([0.0, 1.0]))  # S2
+    a = unit([0.95, 0.05])
+    b = unit([0.9, 0.1])
+    labels = labeler.match_embeddings_joint([a, b], update=True, threshold=0.3, source="remap")
+    assert labels == ["S1", "S1"]
+
+
+def test_joint_remap_update_false_does_not_mutate_centroids():
+    labeler = make_labeler(threshold=0.02)
+    labeler.match_embedding(unit([1.0, 0.0]))  # S1
+    labeler.match_embedding(unit([0.0, 1.0]))  # S2
+    before = [c.copy() for c in labeler._centroids]
+    counts_before = list(labeler._counts)
+    a = unit([0.95, 0.05])
+    b = unit([0.1, 0.99])
+    labels = labeler.match_embeddings_joint([a, b], update=False, threshold=0.02, source="remap")
+    assert labels == ["S1", "S2"]
+    assert counts_before == labeler._counts
+    for old, new in zip(before, labeler._centroids):
+        assert np.allclose(old, new)
+
+
+def test_joint_remap_empty_input_returns_empty_list():
+    labeler = make_labeler(threshold=0.3)
+    assert labeler.match_embeddings_joint([]) == []
+
+
+# ---------------------------------------------------------------------------
 # docs/DIARIZATION_PLAN.md section 10.6/10.8: centroid-open diagnostics
 # ---------------------------------------------------------------------------
 

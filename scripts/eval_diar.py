@@ -200,7 +200,8 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
                                 min_duration_on: float = None,
                                 min_duration_off: float = None,
                                 vad_threshold: float = 0.5,
-                                min_remap_update_s: float = 0.0
+                                min_remap_update_s: float = 0.0,
+                                joint_remap: bool = False,
                                 ) -> tuple[list[tuple[str, float, float]], dict]:
     """Score the new method: same VAD + fast SpeakerLabeler as the baseline,
     but grouped exactly the way production's Refiner groups utterances
@@ -262,6 +263,17 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     dominates confusion on both IS1009a (61%) and ES2011a (49%); this
     flag is the "ignore clusters <1s for centroid updates" experiment T2
     describes as one candidate fix for that.
+
+    joint_remap (Round 5, docs/DIARIZATION_PLAN.md section 15 T1): False
+    (default) is a no-op -- each group's local clusters (other than any
+    excluded by min_remap_update_s above) still remap independently via
+    match_embedding(), exactly the pre-existing behavior. When True,
+    those clusters are remapped together via
+    speaker_id.SpeakerLabeler.match_embeddings_joint() (Hungarian
+    assignment maximizing total similarity, constrained so distinct local
+    clusters can't land on the same global speaker) -- see that method's
+    docstring. Mirrors realtime_transcribe.Refiner._emit_turns() exactly,
+    same as every other flag here.
     """
     import numpy as np
     from realtime_transcribe import GROUP_GAP_S, GROUP_MAX_S, SAMPLE_RATE, AudioHistory, build_vad, read_wave, wav_chunks
@@ -346,22 +358,45 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
 
         local_ids = sorted({t[0] for t in turns})
         global_label: dict[int, str] = {}
+        cluster_embs: dict[int, np.ndarray] = {}
+        empty_ids = []
         for local_id in local_ids:
             pieces = [buf[int(round(s * sr)):int(round(e * sr))]
                       for lid, s, e in turns if lid == local_id]
             cluster_audio = np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)
             if len(cluster_audio) == 0:
                 global_label[local_id] = majority
+                empty_ids.append(local_id)
                 continue
-            emb = labeler.embed(cluster_audio, sr)
+            cluster_embs[local_id] = labeler.embed(cluster_audio, sr)
+
+        # min_remap_update_s (Round 4 T2) still gates short clusters to a
+        # read-only probe, independent of joint_remap below -- see
+        # generate_diarize_hypothesis()'s docstring. Only the remaining
+        # clusters are eligible for the Round 5 T1 joint assignment.
+        short_ids = []
+        for local_id in cluster_embs:
             cluster_dur_s = sum(e - s for lid, s, e in turns if lid == local_id)
             if min_remap_update_s > 0 and cluster_dur_s < min_remap_update_s:
+                short_ids.append(local_id)
                 probe = labeler.match_embedding(
-                    emb, update=False, threshold=labeler.remap_threshold, source="remap")
+                    cluster_embs[local_id], update=False, threshold=labeler.remap_threshold,
+                    source="remap")
                 global_label[local_id] = probe if probe else majority
+
+        joint_ids = [lid for lid in local_ids if lid not in short_ids and lid not in empty_ids]
+        if joint_ids:
+            if joint_remap:
+                labels = labeler.match_embeddings_joint(
+                    [cluster_embs[lid] for lid in joint_ids], update=True,
+                    threshold=labeler.remap_threshold, source="remap")
+                for local_id, label in zip(joint_ids, labels):
+                    global_label[local_id] = label
             else:
-                global_label[local_id] = labeler.match_embedding(
-                    emb, update=True, threshold=labeler.remap_threshold, source="remap")
+                for local_id in joint_ids:
+                    global_label[local_id] = labeler.match_embedding(
+                        cluster_embs[local_id], update=True, threshold=labeler.remap_threshold,
+                        source="remap")
 
         # iteration 6 (section 9): this group's remap is exactly the "clean
         # copy" boundary merge_centroids() is meant for -- give it a chance
@@ -445,7 +480,8 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
                   hysteresis_enabled: bool | None = None, hysteresis_min_hits: int = None,
                   min_duration_on: float = None, min_duration_off: float = None,
                   breakdown: bool = False, skip_overlap: bool = False,
-                  vad_threshold: float = 0.5, min_remap_update_s: float = 0.0) -> dict:
+                  vad_threshold: float = 0.5, min_remap_update_s: float = 0.0,
+                  joint_remap: bool = False) -> dict:
     import simpleder
 
     ref = segments_to_der_tuples(parse_rttm(rttm_path))
@@ -455,7 +491,7 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
         hyp_raw, extra = generate_diarize_hypothesis(
             wav_path, min_silence, max_speech, diar_threshold, sim_threshold, remap_threshold,
             merge_enabled, merge_threshold, hysteresis_enabled, hysteresis_min_hits,
-            min_duration_on, min_duration_off, vad_threshold, min_remap_update_s)
+            min_duration_on, min_duration_off, vad_threshold, min_remap_update_s, joint_remap)
     else:
         hyp_raw = generate_speaker_hypothesis(
             wav_path, min_silence, max_speech, hysteresis_enabled, hysteresis_min_hits,
@@ -570,6 +606,14 @@ def main():
                          "fast-path label instead). Only meaningful with --method "
                          "refine_diarize. 0.0 (default) is a no-op, matching every earlier "
                          "round's behavior.")
+    ap.add_argument("--joint-remap", action="store_true",
+                    help="Round 5 (docs/DIARIZATION_PLAN.md section 15) T1 experiment: within "
+                         "one refine group, solve the local-cluster-to-global remap jointly "
+                         "(Hungarian assignment maximizing total similarity, scipy.optimize."
+                         "linear_sum_assignment) instead of matching each local cluster "
+                         "independently, so two distinct local clusters can't both land on the "
+                         "same global speaker. Only meaningful with --method refine_diarize. Off "
+                         "by default. See speaker_id.SpeakerLabeler.match_embeddings_joint().")
     ap.add_argument("--skip-overlap", action="store_true",
                     help="T2 (docs/DIARIZATION_PLAN.md section 12): exclude reference regions "
                          "with >=2 concurrent speakers from DER scoring (pyannote.metrics "
@@ -605,7 +649,8 @@ def main():
                                min_duration_off=args.min_duration_off,
                                breakdown=args.breakdown, skip_overlap=args.skip_overlap,
                                vad_threshold=args.vad_threshold,
-                               min_remap_update_s=args.min_remap_update_s)
+                               min_remap_update_s=args.min_remap_update_s,
+                               joint_remap=args.joint_remap)
         extra = ""
         if "diar_time_s" in result and result.get("audio_s"):
             rtf = result["diar_time_s"] / result["audio_s"]

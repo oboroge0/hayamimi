@@ -396,7 +396,8 @@ class Refiner:
     def __init__(self, asr: RoutedASR, history: AudioHistory, sample_rate: int,
                  printer: PartialPrinter, transcript_path: str | None = None,
                  translators: dict | None = None, stats: "SessionStats | None" = None,
-                 speaker_labeler=None, diarizer=None, min_remap_update_s: float = 0.0):
+                 speaker_labeler=None, diarizer=None, min_remap_update_s: float = 0.0,
+                 joint_remap: bool = False):
         self.asr = asr
         self.history = history
         self.sr = sample_rate
@@ -418,6 +419,11 @@ class Refiner:
         # eval_diar.generate_diarize_hypothesis()'s min_remap_update_s
         # docstring. 0.0 (default) is a no-op.
         self.min_remap_update_s = min_remap_update_s
+        # Round 5 (docs/DIARIZATION_PLAN.md section 15) T1 experiment: see
+        # speaker_id.SpeakerLabeler.match_embeddings_joint()'s docstring.
+        # False (default) is a no-op -- every local cluster still remaps
+        # independently via match_embedding(), same as before.
+        self.joint_remap = joint_remap
         self.spans: list[tuple[int, int, str, str, str]] = []
         self._transcript = open(transcript_path, "a", encoding="utf-8") if transcript_path else None
         # A single FIFO worker (not "spawn a thread per refine") is what makes
@@ -522,22 +528,50 @@ class Refiner:
         # one representative embedding per local cluster, matched onto the
         # global centroid set -- this is the iteration-4 remap step.
         local_ids = sorted({t[0] for t in turns})
-        global_label = {}
+        cluster_embs = {}
+        cluster_durs = {}
         for local_id in local_ids:
             cluster_audio = np.concatenate(
                 [buf[start:end] for lid, start, end in turns if lid == local_id]
             )
-            emb = self.speaker_labeler.embed(cluster_audio, self.sr)
-            cluster_dur_s = sum((end - start) / self.sr for lid, start, end in turns if lid == local_id)
-            if self.min_remap_update_s > 0 and cluster_dur_s < self.min_remap_update_s:
-                probe = self.speaker_labeler.match_embedding(
-                    emb, update=False, threshold=self.speaker_labeler.remap_threshold,
-                    source="remap")
-                global_label[local_id] = probe if probe else majority_speaker
+            cluster_embs[local_id] = self.speaker_labeler.embed(cluster_audio, self.sr)
+            cluster_durs[local_id] = sum(
+                (end - start) / self.sr for lid, start, end in turns if lid == local_id)
+
+        global_label = {}
+        # min_remap_update_s (Round 4 T2) still gates short clusters to a
+        # read-only probe, independent of joint_remap below -- see
+        # min_remap_update_s's docstring. Only the remaining ("long
+        # enough") clusters are eligible for the Round 5 T1 joint
+        # assignment; a short cluster is never a joint-assignment
+        # candidate (it can't fold into or claim a centroid either way).
+        short_ids = [lid for lid in local_ids
+                     if self.min_remap_update_s > 0 and cluster_durs[lid] < self.min_remap_update_s]
+        for local_id in short_ids:
+            probe = self.speaker_labeler.match_embedding(
+                cluster_embs[local_id], update=False, threshold=self.speaker_labeler.remap_threshold,
+                source="remap")
+            global_label[local_id] = probe if probe else majority_speaker
+
+        joint_ids = [lid for lid in local_ids if lid not in short_ids]
+        if joint_ids:
+            if self.joint_remap:
+                # Round 5 (docs/DIARIZATION_PLAN.md section 15) T1: solve
+                # this group's remaining clusters' assignment jointly so
+                # two distinct local clusters can't collapse onto the same
+                # global speaker. match_embeddings_joint() itself falls
+                # back to the old independent match_embedding() path for a
+                # single-cluster input, so behavior is unchanged there.
+                labels = self.speaker_labeler.match_embeddings_joint(
+                    [cluster_embs[lid] for lid in joint_ids], update=True,
+                    threshold=self.speaker_labeler.remap_threshold, source="remap")
+                for local_id, label in zip(joint_ids, labels):
+                    global_label[local_id] = label
             else:
-                global_label[local_id] = self.speaker_labeler.match_embedding(
-                    emb, update=True, threshold=self.speaker_labeler.remap_threshold,
-                    source="remap")
+                for local_id in joint_ids:
+                    global_label[local_id] = self.speaker_labeler.match_embedding(
+                        cluster_embs[local_id], update=True, threshold=self.speaker_labeler.remap_threshold,
+                        source="remap")
 
         # iteration 6 (docs/DIARIZATION_PLAN.md section 9): this refine
         # group's remap is the natural "clean copy" boundary -- give
@@ -897,6 +931,13 @@ def main():
                          "embedding into that speaker's centroid and never opens a brand-new "
                          "S{n} on a miss, falling back to the group's majority fast-path label "
                          "instead. 0.0 (default) is a no-op.")
+    ap.add_argument("--speaker-joint-remap", action="store_true",
+                    help="Round 5 (docs/DIARIZATION_PLAN.md section 15) T1 experiment: within "
+                         "one refine group, solve the local-cluster-to-global remap jointly "
+                         "(Hungarian assignment maximizing total similarity) instead of matching "
+                         "each local cluster independently, so two distinct local clusters "
+                         "can't both land on the same global speaker. Off by default pending "
+                         "measurement; see speaker_id.SpeakerLabeler.match_embeddings_joint().")
     ap.add_argument("--translate", nargs="?", const="en", default=None, metavar="LANGS",
                     help="translate Japanese lines to these languages, comma-separated "
                          "(default en). en=FuguMT; any other M2M-100 target code "
@@ -998,7 +1039,8 @@ def main():
                                                   translators=translators, stats=stats,
                                                   speaker_labeler=speaker_labeler,
                                                   diarizer=diarizer,
-                                                  min_remap_update_s=args.speaker_min_remap_update_s)
+                                                  min_remap_update_s=args.speaker_min_remap_update_s,
+                                                  joint_remap=args.speaker_joint_remap)
 
     def finish(sr):
         vad.flush()
