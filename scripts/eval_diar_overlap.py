@@ -73,6 +73,10 @@ from eval_diar import (  # noqa: E402
     parse_rttm,
     segments_to_der_tuples,
 )
+from global_recluster import (  # noqa: E402
+    assign_by_centroid,
+    cluster_reliable as cluster_local_speakers,
+)
 
 SEG_MODEL = os.path.join(ROOT, "models", "sherpa-onnx-pyannote-segmentation-3-0", "model.onnx")
 
@@ -198,69 +202,6 @@ def window_speaker_audio(samples: np.ndarray, win_start: int, activity: np.ndarr
         a = win_start + int(i) * FRAME_SHIFT
         pieces.append(samples[a:a + FRAME_SHIFT])
     return np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)
-
-
-def cluster_local_speakers(embeddings: np.ndarray, window_ids: list[int],
-                           threshold: float, num_clusters: int | None,
-                           method: str = "average") -> np.ndarray:
-    """Constrained agglomerative clustering of window-local speakers.
-
-    Cosine distance, `method` linkage. Two local speakers detected in the SAME
-    window are, by construction, different people, so their pairwise distance
-    is forced to a value above any achievable merge height -- the standard
-    cannot-link trick for hierarchical clustering. Without it a single window
-    where the model splits one talker in two, or where the CAM++ embeddings of
-    two co-present talkers happen to be close, can collapse two real speakers.
-    """
-    from scipy.cluster.hierarchy import fcluster, linkage
-    from scipy.spatial.distance import pdist, squareform
-
-    n = len(embeddings)
-    if n == 0:
-        return np.zeros(0, dtype=int)
-    if n == 1:
-        return np.zeros(1, dtype=int)
-    dist = squareform(pdist(embeddings, metric="cosine"))
-    cannot_link = np.array(window_ids)[:, None] == np.array(window_ids)[None, :]
-    np.fill_diagonal(cannot_link, False)
-    dist[cannot_link] = 10.0
-    condensed = squareform(dist, checks=False)
-    z = linkage(condensed, method=method)
-    if num_clusters:
-        labels = fcluster(z, t=min(num_clusters, n), criterion="maxclust")
-    else:
-        labels = fcluster(z, t=threshold, criterion="distance")
-    return labels - 1
-
-
-def assign_by_centroid(embeddings: np.ndarray, reliable: np.ndarray,
-                       labels_reliable: np.ndarray) -> np.ndarray:
-    """Two-stage stitching: cluster only the trustworthy embeddings, then pull
-    the rest in by nearest centroid.
-
-    A window-local speaker with only a fraction of a second of clean speech
-    produces a CAM++ embedding that is mostly noise. Letting those points take
-    part in the agglomerative merge is what produced the first prototype run's
-    dendrogram cliff (30+ clusters just above the cut, 2 just below): the noisy
-    points bridge otherwise well-separated speakers. Here they are excluded
-    from the merge entirely and afterwards assigned to whichever reliable
-    cluster centroid they are closest to -- they still contribute their speech
-    time to the hypothesis, they just do not get a vote on the speaker
-    inventory.
-    """
-    n_clusters = int(labels_reliable.max()) + 1 if len(labels_reliable) else 0
-    if n_clusters == 0:
-        return np.zeros(len(embeddings), dtype=int)
-    rel_emb = embeddings[reliable]
-    centroids = np.stack([rel_emb[labels_reliable == g].mean(axis=0)
-                          for g in range(n_clusters)])
-    centroids /= np.linalg.norm(centroids, axis=1, keepdims=True) + 1e-9
-    out = np.empty(len(embeddings), dtype=int)
-    out[reliable] = labels_reliable
-    other = ~reliable
-    if other.any():
-        out[other] = np.argmax(embeddings[other] @ centroids.T, axis=1)
-    return out
 
 
 def activity_to_segments(active: np.ndarray, frame_s: float,
