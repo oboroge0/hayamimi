@@ -23,6 +23,7 @@ from eval_diar_overlap import (  # noqa: E402
     powerset_decode,
     strip_overlap,
 )
+from global_recluster import pool_audio_for_group  # noqa: E402
 
 
 # ---- powerset_decode --------------------------------------------------------
@@ -112,3 +113,47 @@ def test_assign_by_centroid_pulls_unreliable_points_to_nearest_cluster():
     labels = assign_by_centroid(emb, reliable, np.array([0, 1]))
     assert labels[0] == 0 and labels[1] == 1
     assert labels[2] == 0  # the unreliable point lands with the point it resembles
+
+
+# ---- pool_audio_for_group (Round 8, docs/DIARIZATION_PLAN.md section 18 T1) -
+
+def test_pool_audio_for_group_uses_diarizer_turns_when_present():
+    # a single-speaker group where the diarizer still found real (filtered)
+    # speech turns -- the pool entry should be built from exactly that
+    # speech, concatenated, not the raw group buffer (which may include
+    # non-speech samples the diarizer didn't call speech).
+    buf = np.arange(100, dtype=np.float32)
+    turns = [(0, 10, 20), (0, 50, 65)]  # (local_id, start_sample, end_sample)
+    audio, dur_s = pool_audio_for_group(buf, sr=10, turns=turns)
+    assert audio.tolist() == list(range(10, 20)) + list(range(50, 65))
+    # 10 samples + 15 samples at sr=10 -> 1.0s + 1.5s
+    assert abs(dur_s - 2.5) < 1e-9
+
+
+def test_pool_audio_for_group_falls_back_to_full_buffer_when_declined():
+    # the diarizer produced no usable turns at all (exception, or every
+    # candidate turn below the duration floor) -- something is better than
+    # nothing, so the pool entry falls back to the whole group buffer.
+    buf = np.arange(20, dtype=np.float32)
+    audio, dur_s = pool_audio_for_group(buf, sr=10, turns=[])
+    assert audio.tolist() == list(range(20))
+    assert abs(dur_s - 2.0) < 1e-9
+
+
+def test_pool_audio_for_group_declined_duration_prefers_group_span_over_buffer_length():
+    # eval_diar.py's convention: g_start/g_end are sample indices into the
+    # ORIGINAL (whole-file) audio, which can differ from len(buf) if the
+    # caller ever passes a buffer that isn't exactly [g_start, g_end) --
+    # when given, they take precedence over len(buf) for the duration.
+    buf = np.arange(20, dtype=np.float32)
+    audio, dur_s = pool_audio_for_group(buf, sr=10, turns=[], g_start=100, g_end=135)
+    assert abs(dur_s - 3.5) < 1e-9  # (135 - 100) / 10, not len(buf) / 10 == 2.0
+
+
+def test_pool_audio_for_group_empty_group_yields_empty_audio():
+    # an entirely empty group (no turns, zero-length buffer) must not crash
+    # and must signal "nothing to embed" via a zero-length array -- callers
+    # skip adding a pool entry in that case, same as they already do for an
+    # empty real local-cluster embedding.
+    audio, dur_s = pool_audio_for_group(np.zeros(0, dtype=np.float32), sr=10, turns=[])
+    assert len(audio) == 0

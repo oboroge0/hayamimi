@@ -315,6 +315,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     from realtime_transcribe import GROUP_GAP_S, GROUP_MAX_S, SAMPLE_RATE, AudioHistory, build_vad, read_wave, wav_chunks
     from speaker_id import SIM_THRESHOLD, SpeakerLabeler
     from diarize import DEFAULT_MIN_DURATION_OFF, DEFAULT_MIN_DURATION_ON, DEFAULT_THRESHOLD, GroupDiarizer
+    from global_recluster import pool_audio_for_group
 
     samples, sr = read_wave(wav_path, target_rate=SAMPLE_RATE)
     vad = build_vad(min_silence, max_speech, vad_threshold)
@@ -404,8 +405,32 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
         if len({lid for lid, _, _ in turns}) < 2:
             # single speaker (or diarizer declined): same fallback
             # Refiner._emit_turns() takes -- one majority-vote span.
+            #
+            # Round 8 (section 18) T1: this group still contributes a
+            # group-level embedding to the re-cluster pool (local_id=-1
+            # sentinel -- there is no real per-cluster id to key on) when
+            # global_recluster is on, so its turn's label is rewritten
+            # along with every other turn in the session instead of
+            # permanently keeping its fast-path label. That fast-path/
+            # untouched split (a group judged single-speaker never entered
+            # the pool at all) is what caused Round 7's rejection -- see
+            # global_recluster.py's module docstring.
             hyp.append((majority, g_start / sr, g_end / sr))
-            hyp_keys.append(None)
+            if global_recluster:
+                sample_turns = [(lid, int(round(s * sr)), int(round(e * sr)))
+                                for lid, s, e in turns]
+                pool_audio, pool_dur_s = pool_audio_for_group(
+                    buf, sr, sample_turns, g_start, g_end)
+                if len(pool_audio) > 0:
+                    recluster_entries.append({
+                        "group_idx": group_idx, "local_id": -1,
+                        "embedding": labeler.embed(pool_audio, sr), "duration_s": pool_dur_s,
+                    })
+                    hyp_keys.append((group_idx, -1))
+                else:
+                    hyp_keys.append(None)
+            else:
+                hyp_keys.append(None)
             continue
 
         local_ids = sorted({t[0] for t in turns})

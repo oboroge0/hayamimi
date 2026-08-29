@@ -537,8 +537,43 @@ class Refiner:
         except Exception as exc:
             print(f"[refine] diarization failed, falling back to single-speaker line: {exc}",
                   file=sys.stderr)
-            return False
+            raw = []
+
+        # Round 8 (docs/DIARIZATION_PLAN.md section 18) T1: this helper
+        # records a group-level pool entry (local_id=-1 sentinel) for
+        # whichever `turns` view was live at the moment this group declines,
+        # when global_recluster is on -- mirrors eval_diar.
+        # generate_diarize_hypothesis()'s pool-completeness fix (see
+        # global_recluster.py's module docstring for why a group that never
+        # contributes to the pool broke Round 7). Only feeds
+        # run_global_recluster()'s end-of-session diagnostic mapping (see
+        # that method's docstring for why live output is never revised), so
+        # it changes no printed/published/written output either way. Kept
+        # as a closure (not hoisted out) so the two decline points below can
+        # each pass their own `turns` snapshot without duplicating the
+        # bookkeeping.
+        def record_pool_entry(turns_snapshot):
+            if not self.global_recluster:
+                return
+            from global_recluster import pool_audio_for_group
+
+            pool_audio, pool_dur_s = pool_audio_for_group(buf, self.sr, turns_snapshot)
+            if len(pool_audio) > 0:
+                self._recluster_entries.append({
+                    "group_idx": self._recluster_group_idx, "local_id": -1,
+                    "embedding": self.speaker_labeler.embed(pool_audio, self.sr),
+                    "duration_s": pool_dur_s,
+                })
+                self._recluster_group_idx += 1
+
         if len({local for local, _, _ in raw}) < 2:
+            # single speaker (or the diarizer declined): same fallback the
+            # caller (maybe_refine) takes -- one majority-vote line. No
+            # `turns` view exists yet at this decline point (unchanged from
+            # pre-Round-8 control flow -- the duration filter below never
+            # runs), so the pool entry falls back to the whole group buffer,
+            # same as eval_diar.py's true-decline case.
+            record_pool_entry([])
             return False
 
         turns = []  # (local_id, start_sample, end_sample) within buf
@@ -548,6 +583,13 @@ class Refiner:
             if end - start >= int(self.MIN_TURN_S * self.sr):
                 turns.append((local_id, start, end))
         if len(turns) < 2:
+            # duration filtering left fewer than 2 usable turns -- same
+            # decline condition as before Round 8 (a plain turn count, not
+            # a distinct-id count: two turns from the SAME local_id still
+            # counts as "enough" here, unchanged). Whatever turns did
+            # survive filtering are still real speech, so the pool entry
+            # uses them instead of falling all the way back to the buffer.
+            record_pool_entry(turns)
             return False
 
         # one representative embedding per local cluster, matched onto the
