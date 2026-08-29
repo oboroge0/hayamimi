@@ -188,6 +188,10 @@ def group_segments(fast_segments: list[tuple[int, int, str]], sample_rate: int,
     return groups
 
 
+DEFAULT_GLOBAL_RECLUSTER_THRESHOLD = 0.65  # Round 7, docs/DIARIZATION_PLAN.md section 17
+DEFAULT_GLOBAL_RECLUSTER_RELIABLE_S = 1.5  # same "reliable" cutoff Round 6 settled on
+
+
 def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
                                 max_speech: float = 12.0,
                                 diar_threshold: float = None,
@@ -203,6 +207,9 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
                                 min_remap_update_s: float = 0.0,
                                 joint_remap: bool = False,
                                 exclude_provisional_remap: bool = False,
+                                global_recluster: bool = False,
+                                global_recluster_threshold: float = DEFAULT_GLOBAL_RECLUSTER_THRESHOLD,
+                                global_recluster_reliable_s: float = DEFAULT_GLOBAL_RECLUSTER_RELIABLE_S,
                                 ) -> tuple[list[tuple[str, float, float]], dict]:
     """Score the new method: same VAD + fast SpeakerLabeler as the baseline,
     but grouped exactly the way production's Refiner groups utterances
@@ -284,6 +291,25 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     so a global centroid that hasn't yet been matched a second time can
     never be chosen as a remap target -- see match_embedding()'s
     exclude_provisional docstring.
+
+    global_recluster (Round 7, docs/DIARIZATION_PLAN.md section 17): False
+    (default) is a no-op -- every local cluster's global label comes
+    entirely from the incremental remap above, exactly as every earlier
+    round's behavior. When True, this function ALSO keeps every
+    remap-eligible local cluster's own embedding (plus its refine-group
+    index as a cannot-link key and its speech duration), and once every
+    group has been processed, re-clusters all of them at once with
+    global_recluster.two_stage_cluster() (the same two-stage design Round 6
+    proved out: only clusters with >= global_recluster_reliable_s of
+    speech join the agglomerative merge at global_recluster_threshold
+    cosine distance, two clusters from the same refine group can never
+    merge, short clusters are assigned to the nearest resulting centroid
+    afterward). The resulting cluster-id -> "S{n}" mapping REWRITES every
+    eligible turn's label in the returned hypothesis; incremental labels
+    are only used as this pass's input, not its output. This never changes
+    turn timing, never changes which VAD/diarization spans exist, and
+    never touches the fast path -- only which S{n} string a refine-group
+    turn ends up with.
     """
     import numpy as np
     from realtime_transcribe import GROUP_GAP_S, GROUP_MAX_S, SAMPLE_RATE, AudioHistory, build_vad, read_wave, wav_chunks
@@ -345,8 +371,23 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     groups = group_segments(fast_segments, sr, GROUP_GAP_S, GROUP_MAX_S)
 
     hyp: list[tuple[str, float, float]] = []
+    # Round 7 (section 17) global_recluster bookkeeping: hyp_keys[i] names
+    # which (group_idx, local_id) hyp[i] came from, when that turn's label
+    # is eligible to be rewritten by the post-hoc re-cluster below (None for
+    # a turn that never had its own embedding -- the single-speaker-group
+    # fallback, or a local cluster with no audio -- there is nothing to
+    # re-cluster for those, so their incremental label is final either way).
+    # recluster_entries accumulates one row per DISTINCT (group_idx,
+    # local_id) that got a real embedding, across the whole session/eval --
+    # exactly the "retain per-group local-cluster embeddings as the session
+    # runs" T1 asks for. Built unconditionally (cheap: one array append per
+    # local cluster) so turning global_recluster on/off doesn't change
+    # anything about hypothesis generation up to this point -- only whether
+    # the accumulated rows are ever clustered and used to rewrite hyp.
+    hyp_keys: list[tuple[int, int] | None] = []
+    recluster_entries: list[dict] = []
     diar_time = 0.0
-    for group in groups:
+    for group_idx, group in enumerate(groups):
         g_start, g_end = group[0][0], group[-1][1]
         buf = samples[g_start:g_end]
         fast_labels = [lbl for _, _, lbl in group]
@@ -364,6 +405,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
             # single speaker (or diarizer declined): same fallback
             # Refiner._emit_turns() takes -- one majority-vote span.
             hyp.append((majority, g_start / sr, g_end / sr))
+            hyp_keys.append(None)
             continue
 
         local_ids = sorted({t[0] for t in turns})
@@ -379,6 +421,12 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
                 empty_ids.append(local_id)
                 continue
             cluster_embs[local_id] = labeler.embed(cluster_audio, sr)
+            if global_recluster:
+                cluster_dur_s = sum(e - s for lid, s, e in turns if lid == local_id)
+                recluster_entries.append({
+                    "group_idx": group_idx, "local_id": local_id,
+                    "embedding": cluster_embs[local_id], "duration_s": cluster_dur_s,
+                })
 
         # min_remap_update_s (Round 4 T2) still gates short clusters to a
         # read-only probe, independent of joint_remap below -- see
@@ -416,12 +464,41 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
 
         for local_id, s, e in turns:
             hyp.append((global_label[local_id], (g_start + s * sr) / sr, (g_start + e * sr) / sr))
+            hyp_keys.append((group_idx, local_id) if local_id in cluster_embs else None)
+
+    global_recluster_time_s = 0.0
+    n_recluster_entries = len(recluster_entries)
+    n_recluster_clusters = 0
+    if global_recluster and recluster_entries:
+        from global_recluster import two_stage_cluster
+
+        t0 = time.time()
+        embeddings = np.stack([e["embedding"] for e in recluster_entries])
+        group_ids = [e["group_idx"] for e in recluster_entries]
+        durations = [e["duration_s"] for e in recluster_entries]
+        labels = two_stage_cluster(embeddings, group_ids, durations,
+                                   threshold=global_recluster_threshold,
+                                   reliable_s=global_recluster_reliable_s)
+        global_recluster_time_s = time.time() - t0
+        n_recluster_clusters = int(labels.max()) + 1 if len(labels) else 0
+
+        key_to_label: dict[tuple[int, int], str] = {
+            (entry["group_idx"], entry["local_id"]): f"S{int(cluster_id) + 1}"
+            for entry, cluster_id in zip(recluster_entries, labels)
+        }
+        hyp = [
+            (key_to_label[key] if key is not None and key in key_to_label else label, s, e)
+            for (label, s, e), key in zip(hyp, hyp_keys)
+        ]
 
     stats = {
         "diar_time_s": diar_time,
         "n_groups": len(groups),
         "audio_s": len(samples) / sr,
         "merge_history": labeler.merge_history(),
+        "global_recluster_time_s": global_recluster_time_s,
+        "n_recluster_entries": n_recluster_entries,
+        "n_recluster_clusters": n_recluster_clusters,
         # docs/DIARIZATION_PLAN.md section 10.6 diagnostics: compare against
         # realtime_transcribe.py's "session summary" refine_groups_closed /
         # centroid_open_counts lines for the same file -- this eval path has
@@ -491,7 +568,9 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
                   min_duration_on: float = None, min_duration_off: float = None,
                   breakdown: bool = False, skip_overlap: bool = False,
                   vad_threshold: float = 0.5, min_remap_update_s: float = 0.0,
-                  joint_remap: bool = False, exclude_provisional_remap: bool = False) -> dict:
+                  joint_remap: bool = False, exclude_provisional_remap: bool = False,
+                  global_recluster: bool = False,
+                  global_recluster_threshold: float = DEFAULT_GLOBAL_RECLUSTER_THRESHOLD) -> dict:
     import simpleder
 
     ref = segments_to_der_tuples(parse_rttm(rttm_path))
@@ -502,7 +581,7 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
             wav_path, min_silence, max_speech, diar_threshold, sim_threshold, remap_threshold,
             merge_enabled, merge_threshold, hysteresis_enabled, hysteresis_min_hits,
             min_duration_on, min_duration_off, vad_threshold, min_remap_update_s, joint_remap,
-            exclude_provisional_remap)
+            exclude_provisional_remap, global_recluster, global_recluster_threshold)
     else:
         hyp_raw = generate_speaker_hypothesis(
             wav_path, min_silence, max_speech, hysteresis_enabled, hysteresis_min_hits,
@@ -633,6 +712,19 @@ def main():
                          "already-recurring speaker. Only meaningful with --method refine_diarize. "
                          "Off by default. See speaker_id.SpeakerLabeler.match_embedding()'s "
                          "exclude_provisional docstring.")
+    ap.add_argument("--global-recluster", action="store_true",
+                    help="Round 7 (docs/DIARIZATION_PLAN.md section 17) T1 experiment: at "
+                         "session end, re-cluster every refine group's local-cluster "
+                         "embeddings together (two-stage constrained agglomerative, same "
+                         "design as eval_diar_overlap.py's Round 6 prototype, via "
+                         "global_recluster.two_stage_cluster()) and rewrite the hypothesis's "
+                         "labels with the result, instead of the incremental per-group remap. "
+                         "Only meaningful with --method refine_diarize. Off by default.")
+    ap.add_argument("--global-recluster-threshold", type=float,
+                    default=DEFAULT_GLOBAL_RECLUSTER_THRESHOLD, metavar="T",
+                    help=f"cosine-distance threshold for --global-recluster's agglomerative "
+                         f"merge stage (default {DEFAULT_GLOBAL_RECLUSTER_THRESHOLD}, the "
+                         f"value Round 6 found best on this same AMI subset).")
     ap.add_argument("--skip-overlap", action="store_true",
                     help="T2 (docs/DIARIZATION_PLAN.md section 12): exclude reference regions "
                          "with >=2 concurrent speakers from DER scoring (pyannote.metrics "
@@ -670,12 +762,18 @@ def main():
                                vad_threshold=args.vad_threshold,
                                min_remap_update_s=args.min_remap_update_s,
                                joint_remap=args.joint_remap,
-                               exclude_provisional_remap=args.exclude_provisional_remap)
+                               exclude_provisional_remap=args.exclude_provisional_remap,
+                               global_recluster=args.global_recluster,
+                               global_recluster_threshold=args.global_recluster_threshold)
         extra = ""
         if "diar_time_s" in result and result.get("audio_s"):
             rtf = result["diar_time_s"] / result["audio_s"]
             extra = (f"  diar={result['diar_time_s']:.1f}s over {result['n_groups']} groups "
                      f"(diar_rtf={rtf:.3f})")
+        if args.global_recluster and "global_recluster_time_s" in result:
+            extra += (f"  recluster={result['global_recluster_time_s']:.2f}s "
+                      f"({result['n_recluster_entries']} entries -> "
+                      f"{result['n_recluster_clusters']} clusters)")
         if args.breakdown:
             extra += (f"  [miss={result['miss'] * 100:.1f}% fa={result['false_alarm'] * 100:.1f}% "
                       f"confusion={result['confusion'] * 100:.1f}%]")

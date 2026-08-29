@@ -397,7 +397,9 @@ class Refiner:
                  printer: PartialPrinter, transcript_path: str | None = None,
                  translators: dict | None = None, stats: "SessionStats | None" = None,
                  speaker_labeler=None, diarizer=None, min_remap_update_s: float = 0.0,
-                 joint_remap: bool = False, exclude_provisional_remap: bool = False):
+                 joint_remap: bool = False, exclude_provisional_remap: bool = False,
+                 global_recluster: bool = False,
+                 global_recluster_threshold: float = 0.65):
         self.asr = asr
         self.history = history
         self.sr = sample_rate
@@ -428,6 +430,25 @@ class Refiner:
         # speaker_id.SpeakerLabeler.match_embedding()'s exclude_provisional
         # docstring. False (default) is a no-op.
         self.exclude_provisional_remap = exclude_provisional_remap
+        # Round 7 (docs/DIARIZATION_PLAN.md section 17): see
+        # eval_diar.generate_diarize_hypothesis()'s global_recluster
+        # docstring for the full design. False (default) is a no-op: no
+        # extra bookkeeping happens in _emit_turns() and live output is
+        # therefore byte-identical to every earlier round's behavior.
+        # global_recluster_entries accumulates one row per DISTINCT
+        # (refine-group index, local diarization cluster id) that got a
+        # real embedding, across the WHOLE SESSION -- unlike eval_diar.py
+        # (one process per meeting), a live session can run indefinitely,
+        # so this list grows for as long as the process runs; it is only
+        # ever read (never rewritten mid-session) by run_global_recluster()
+        # at shutdown. Deliberately NOT wired into any live/incremental
+        # output path -- see run_global_recluster()'s docstring for why
+        # "revise already-printed lines" is explicitly out of scope this
+        # round.
+        self.global_recluster = global_recluster
+        self.global_recluster_threshold = global_recluster_threshold
+        self._recluster_entries: list[dict] = []
+        self._recluster_group_idx = 0
         self.spans: list[tuple[int, int, str, str, str]] = []
         self._transcript = open(transcript_path, "a", encoding="utf-8") if transcript_path else None
         # A single FIFO worker (not "spawn a thread per refine") is what makes
@@ -541,6 +562,13 @@ class Refiner:
             cluster_embs[local_id] = self.speaker_labeler.embed(cluster_audio, self.sr)
             cluster_durs[local_id] = sum(
                 (end - start) / self.sr for lid, start, end in turns if lid == local_id)
+            if self.global_recluster:
+                self._recluster_entries.append({
+                    "group_idx": self._recluster_group_idx, "local_id": local_id,
+                    "embedding": cluster_embs[local_id], "duration_s": cluster_durs[local_id],
+                })
+        if self.global_recluster:
+            self._recluster_group_idx += 1
 
         global_label = {}
         # min_remap_update_s (Round 4 T2) still gates short clusters to a
@@ -619,6 +647,57 @@ class Refiner:
                     self._transcript.write(f"  →{tlang} {out}\n")
                 self._transcript.flush()
         return True
+
+    def run_global_recluster(self) -> dict:
+        """Session-end (post-hoc) global re-cluster, Round 7 (docs/
+        DIARIZATION_PLAN.md section 17). No-op unless self.global_recluster.
+
+        Re-clusters every (refine-group, local-cluster) embedding
+        accumulated by _emit_turns() across the whole session with
+        global_recluster.two_stage_cluster() -- the same two-stage design
+        Round 6 (eval_diar_overlap.py) proved out and eval_diar.py's
+        --global-recluster reuses for the eval path. Returns a small stats
+        dict (entry/cluster counts, wall time) and PRINTS a one-line
+        summary of the resulting mapping, purely as a diagnostic -- this is
+        explicitly NOT wired into live output, the SSE stream, or the
+        transcript file.
+
+        Why not: lines under the incremental S{n} labels have already been
+        printed/published/written to the transcript by the time this runs
+        (it's called at shutdown, after every group has already gone
+        through _emit_turns() once). Retroactively revising them would need
+        a "relabel" event/UX for every downstream consumer (console,
+        subtitle overlay SSE, transcript file) to redraw already-shown
+        lines under a new label -- an out-of-scope production/UX design
+        decision this round's task explicitly defers (see the T1 docstring
+        in eval_diar.generate_diarize_hypothesis()). Call this only after
+        every already-queued refine task has finished (self._task_queue.
+        join()), or the entry list may still be growing.
+        """
+        stats = {"time_s": 0.0, "n_entries": len(self._recluster_entries), "n_clusters": 0,
+                 "mapping": {}}
+        if not self.global_recluster or not self._recluster_entries:
+            return stats
+        from global_recluster import two_stage_cluster
+
+        t0 = time.time()
+        entries = self._recluster_entries
+        embeddings = np.stack([e["embedding"] for e in entries])
+        group_ids = [e["group_idx"] for e in entries]
+        durations = [e["duration_s"] for e in entries]
+        labels = two_stage_cluster(embeddings, group_ids, durations,
+                                   threshold=self.global_recluster_threshold,
+                                   reliable_s=1.5)
+        stats["time_s"] = time.time() - t0
+        stats["n_clusters"] = int(labels.max()) + 1 if len(labels) else 0
+        stats["mapping"] = {
+            f"group{e['group_idx']}/local{e['local_id']}": f"S{int(c) + 1}"
+            for e, c in zip(entries, labels)
+        }
+        print(f"=== global re-cluster: {stats['n_entries']} local-cluster embeddings -> "
+              f"{stats['n_clusters']} session-global speakers in {stats['time_s']:.2f}s "
+              f"(diagnostic only, not applied to already-printed output) ===")
+        return stats
 
     def maybe_refine(self, now_sample: int, force: bool = False, force_sync: bool | None = None):
         if not self.spans:
@@ -950,6 +1029,19 @@ def main():
                          "to a real, already-recurring speaker. Off by default. See "
                          "speaker_id.SpeakerLabeler.match_embedding()'s exclude_provisional "
                          "docstring.")
+    ap.add_argument("--speaker-global-recluster", action="store_true",
+                    help="Round 7 (docs/DIARIZATION_PLAN.md section 17) experiment: at "
+                         "shutdown, re-cluster every refine group's local diarization cluster "
+                         "embeddings accumulated over the whole session (two-stage constrained "
+                         "agglomerative, same design as eval_diar_overlap.py's Round 6 "
+                         "prototype) and print a diagnostic summary of the result. Off by "
+                         "default. Does NOT change live output, the SSE stream, or the "
+                         "transcript file -- see Refiner.run_global_recluster()'s docstring "
+                         "for why revising already-printed labels is out of scope this round.")
+    ap.add_argument("--speaker-global-recluster-threshold", type=float, default=0.65,
+                    metavar="T",
+                    help="cosine-distance threshold for --speaker-global-recluster's "
+                         "agglomerative merge stage (default 0.65).")
     ap.add_argument("--translate", nargs="?", const="en", default=None, metavar="LANGS",
                     help="translate Japanese lines to these languages, comma-separated "
                          "(default en). en=FuguMT; any other M2M-100 target code "
@@ -1053,7 +1145,9 @@ def main():
                                                   diarizer=diarizer,
                                                   min_remap_update_s=args.speaker_min_remap_update_s,
                                                   joint_remap=args.speaker_joint_remap,
-                                                  exclude_provisional_remap=args.speaker_exclude_provisional_remap)
+                                                  exclude_provisional_remap=args.speaker_exclude_provisional_remap,
+                                                  global_recluster=args.speaker_global_recluster,
+                                                  global_recluster_threshold=args.speaker_global_recluster_threshold)
 
     def finish(sr):
         vad.flush()
@@ -1075,6 +1169,7 @@ def main():
             # mid-backlog and silently drop those groups' refine output.
             # Block until every already-queued task has actually run.
             refiner._task_queue.join()
+            refiner.run_global_recluster()
 
     input_mode = args.input or ("wav" if args.wav else "mic")
 
