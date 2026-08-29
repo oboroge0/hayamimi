@@ -16,8 +16,67 @@ of sliding-window local speakers -- via eval_diar.py's --global-recluster and
 realtime_transcribe.py's --speaker-global-recluster. This module is the
 single place the two-stage algorithm lives; eval_diar_overlap.py imports it
 rather than keeping its own copy.
+
+Round 7 shipped rejected (+22.5pt simpleder regression, 100% confusion):
+the root cause was pool INCOMPLETENESS, not the clustering algorithm above.
+A refine group the local diarizer judges single-speaker (or declines
+entirely) never built a per-cluster embedding in the first place, so it kept
+its fast-path label forever and never entered the re-cluster pool -- the
+session split into two disconnected label spaces (re-clustered vs.
+untouched) and the same real speaker could land in either one depending on
+which space their groups happened to fall into. Round 8 (docs/
+DIARIZATION_PLAN.md section 18) T1 closes that gap: every accumulation site
+now also embeds a *group-level* representative for a single-speaker/declined
+group (pool_audio_for_group() below picks the audio), so every refine
+group -- not just the multi-cluster ones -- contributes exactly one entry to
+the pool and every turn's label is eligible for the post-hoc rewrite.
 """
 import numpy as np
+
+
+def pool_audio_for_group(buf: np.ndarray, sr: int, turns: list,
+                         g_start: int | None = None, g_end: int | None = None):
+    """Pick the audio + duration to embed for a refine group's re-cluster
+    pool contribution, when the group is single-speaker or the local
+    diarizer declined (Round 8, docs/DIARIZATION_PLAN.md section 18 T1).
+
+    turns: list of (local_id, start, end) tuples ALREADY FILTERED to the
+    diarizer's own >=0.3s (or equivalent MIN_TURN_S) speech turns, in the
+    same sample-index units as buf (eval_diar.py) or (start, end) already in
+    sample units (realtime_transcribe.py) -- either way, slice-and-concat
+    semantics only, no timestamp math happens in here.
+
+    When turns is non-empty (the diarizer found real speech, just judged it
+    one speaker), the pool entry is built from exactly that speech -- the
+    diarizer's own speech-only view, cleaner than the raw group buffer
+    (which can include VAD gaps the diarizer didn't call speech). When turns
+    is empty (diarizer declined entirely, or every candidate turn was below
+    the duration floor), falls back to the group's full buffer -- something
+    is better than nothing, and this group's turn still needs a pool entry
+    for its label to ever be eligible for rewrite.
+
+    g_start/g_end (sample indices into the *original* audio, eval_diar.py's
+    convention) are only used for the duration fallback when turns is empty
+    and buf itself isn't reliable for a sample count (kept optional so
+    realtime_transcribe.py, which always passes a self-contained buf, can
+    omit them and use len(buf) directly).
+
+    Returns (audio: np.ndarray, duration_s: float). audio can be a
+    zero-length array (e.g. an entirely empty group) -- callers should skip
+    adding a pool entry when that happens, same as they already skip an
+    empty embedding for a real local cluster.
+    """
+    if turns:
+        pieces = [buf[s:e] for _, s, e in turns]
+        duration_s = sum((e - s) / sr for _, s, e in turns)
+    else:
+        pieces = [buf] if len(buf) else []
+        if g_start is not None and g_end is not None:
+            duration_s = (g_end - g_start) / sr
+        else:
+            duration_s = len(buf) / sr
+    audio = np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)
+    return audio, duration_s
 
 
 def cluster_reliable(embeddings: np.ndarray, group_ids: list, threshold: float,
