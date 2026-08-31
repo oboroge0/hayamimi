@@ -52,5 +52,5 @@ second-opinion を transcribe に適用するオプション」を RoutedASR に
 
 - [x] 実装
 - [x] ユニットテスト
-- [ ] FLEURS 検証
-- [ ] realset 検証
+- [x] FLEURS 検証 (ja 5.89% <= 6.2%, en/zh/ko/yue 変化なし)
+- [x] realset 検証 (ja 4.01% <= 6.5%)
