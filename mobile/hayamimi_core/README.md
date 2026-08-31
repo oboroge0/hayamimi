@@ -267,6 +267,19 @@ await live.stop();
 await live.dispose();
 ```
 
+### Text post-processing hook
+
+`HayamimiLive(textTransform: ...)` (or the settable `live.textTransform`
+field, changeable mid-session) lets a host app rewrite each draft/final/
+refine entry's text right where it becomes a `SubtitleEvent` — before it
+reaches `events` and therefore before `SubtitleBroadcastServer` or any other
+consumer sees it. The callback takes `(text, lang)` and returns the text to
+publish; `null` (the default) is a no-op. This is deliberately just an
+insertion point, not an implementation: CJK inverse-text-normalization
+(kanji numerals -> arabic digits, `scripts/itn_cjk.py` on the desktop side)
+and user find/replace dictionaries are not ported to Dart yet, so a host app
+that wants them today supplies its own `textTransform`.
+
 ## Minimal example: remote subtitles (PC does the recognition)
 
 ```dart

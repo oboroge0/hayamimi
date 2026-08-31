@@ -26,22 +26,24 @@ import 'server/subtitle_event.dart';
 /// await live.dispose();
 /// ```
 class HayamimiLive {
-  HayamimiLive({LiveTranscriber? transcriber})
+  HayamimiLive({LiveTranscriber? transcriber, this.textTransform})
     : _transcriber = transcriber ?? LiveTranscriber() {
     _entriesSubscription = _transcriber.entries.listen((entry) {
+      final entryLang = entry.lang ?? lang;
       _eventsController.add(
         FinalSubtitleEvent(
-          text: entry.text,
-          lang: entry.lang ?? lang,
+          text: _transform(entry.text, entryLang),
+          lang: entryLang,
           latencyMs: entry.latencyMs,
         ),
       );
     });
     _refineEntriesSubscription = _transcriber.refineEntries.listen((entry) {
+      final entryLang = entry.lang ?? lang;
       _eventsController.add(
         RefineSubtitleEvent(
-          text: entry.text,
-          lang: entry.lang ?? lang,
+          text: _transform(entry.text, entryLang),
+          lang: entryLang,
           latencyMs: entry.latencyMs,
         ),
       );
@@ -50,7 +52,10 @@ class HayamimiLive {
       _decodingController.add,
     );
     _draftsSubscription = _transcriber.drafts.listen((entry) {
-      _eventsController.add(PartialSubtitleEvent(entry.text));
+      final entryLang = entry.lang ?? lang;
+      _eventsController.add(
+        PartialSubtitleEvent(_transform(entry.text, entryLang)),
+      );
     });
     _errorsSubscription = _transcriber.errors.listen((error) {
       _eventsController.add(ErrorSubtitleEvent(message: error.message));
@@ -66,6 +71,29 @@ class HayamimiLive {
   late final StreamSubscription _draftsSubscription;
   late final StreamSubscription _errorsSubscription;
   bool _disposed = false;
+
+  /// Optional text-postprocessing hook applied to every draft/final/refine
+  /// entry's text, right here where [LiveTranscriber] entries become
+  /// [SubtitleEvent]s -- before they reach [events] and therefore before
+  /// any consumer (including `SubtitleBroadcastServer`) sees the text. Takes
+  /// the raw decoded text and the entry's language tag (`entry.lang`, or
+  /// this facade's [lang] when the entry doesn't carry its own) and returns
+  /// the text to actually publish.
+  ///
+  /// Settable at any time, including mid-session: the next entry to arrive
+  /// picks up the new transform. `null` (the default) is a no-op. This is
+  /// deliberately just an insertion point -- e.g. for CJK ITN
+  /// (`scripts/itn_cjk.py` on the desktop side) or a user find/replace
+  /// dictionary -- and does not itself implement any postprocessing.
+  String Function(String text, String lang)? textTransform;
+
+  String _transform(String text, String entryLang) {
+    final transform = textTransform;
+    if (transform == null) {
+      return text;
+    }
+    return transform(text, entryLang);
+  }
 
   /// BCP-47-ish language tag stamped on every emitted event that doesn't
   /// carry its own (i.e. a plain single-model session, or a routed
