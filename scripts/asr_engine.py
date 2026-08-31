@@ -16,6 +16,7 @@ many languages a session wanders through.
 import difflib
 import glob
 import os
+import re
 import sys
 import threading
 import time
@@ -32,6 +33,7 @@ OMNI_MODEL_DIR = os.path.join(MODELS_DIR, "omnilingual-300m-ctc-int8")
 WHISPER_TINY_DIR = os.path.join(MODELS_DIR, "sherpa-onnx-whisper-tiny")
 RZ_MODEL_DIR = os.path.join(MODELS_DIR, "sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17")
 PARA_ZH_DIR = os.path.join(MODELS_DIR, "sherpa-onnx-paraformer-zh-int8-2025-10-07")
+PJA_MODEL_DIR = os.path.join(MODELS_DIR, "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8")
 VAD_MODEL_PATH = os.path.join(MODELS_DIR, "silero_vad.onnx")
 
 # ReazonSpeech ja-en zipformer: on real broadcast Japanese it beats even
@@ -139,6 +141,61 @@ RETRY_TAIL_MATCH = 0.6
 # with nothing at all, everything else gets a single space.
 NO_SPACE_LANGS = {"ja", "zh", "yue", "ko"}
 
+# --- ja second-opinion agreement gate ---------------------------------------
+#
+# parakeet-tdt_ctc-0.6b-ja is more accurate than the ReazonSpeech tier on
+# clean single-speaker audio (FLEURS ja CER 6.6% vs 7.4%) but transcribes
+# off-caption speech (background commentary, adjacent utterances) on real
+# broadcast audio, where the caption-trained ReazonSpeech stays on the main
+# utterance (realset 31.2% vs 7.2%). When the two DISAGREE, that off-caption
+# pickup is almost always why -- so agreement between them is a clean-audio
+# signal. Simulated on both eval sets (hayamimi-paper candidate results):
+# adopting parakeet only when the hypotheses' mutual CER <= 0.25 scores
+# FLEURS 5.9% / realset 5.8%, better than either model alone on both.
+SECOND_OPINION_THRESHOLD = 0.25
+
+_AGREE_STRIP_RE = re.compile(r"[\s。、．，,\.!?！？]")
+
+
+def _levenshtein(a: str, b: str) -> int:
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def hyp_agreement_cer(a: str, b: str) -> float:
+    """Character error rate between two hypotheses (whitespace/punct-blind).
+
+    Symmetric enough for gating: the denominator is the first argument's
+    length, and callers pass the primary (ReazonSpeech) text first.
+    """
+    a = _AGREE_STRIP_RE.sub("", a)
+    b = _AGREE_STRIP_RE.sub("", b)
+    if not a:
+        return 0.0 if not b else 1.0
+    return _levenshtein(a, b) / len(a)
+
+
+def choose_second_opinion(primary: str, second: str,
+                          threshold: float = SECOND_OPINION_THRESHOLD) -> tuple[str, bool]:
+    """Return (chosen_text, used_second).
+
+    Adopt the second opinion only when it broadly agrees with the primary
+    (mutual CER <= threshold). An empty or wildly different second opinion --
+    the background-speech failure mode -- leaves the primary standing.
+    """
+    if not second.strip() or not primary.strip():
+        return primary, False
+    if hyp_agreement_cer(primary, second) <= threshold:
+        return second, True
+    return primary, False
+
 
 def _find(model_dir: str, pattern: str) -> str:
     hits = glob.glob(os.path.join(model_dir, pattern))
@@ -188,6 +245,18 @@ def _build_v3_recognizer(threads: int):
         tokens=os.path.join(V3_MODEL_DIR, "tokens.txt"),
         num_threads=threads,
         model_type="nemo_transducer",
+    )
+
+
+def _build_parakeet_ja(threads: int):
+    # Second-opinion model for the ja refine gate (docs: fix_plan.md /
+    # hayamimi-paper candidate results). Better than ReazonSpeech on clean
+    # read speech but transcribes off-caption background speech on broadcast
+    # audio, so it is only ever consulted through choose_second_opinion().
+    return sherpa_onnx.OfflineRecognizer.from_nemo_ctc(
+        model=_find(PJA_MODEL_DIR, "model*.onnx"),
+        tokens=os.path.join(PJA_MODEL_DIR, "tokens.txt"),
+        num_threads=threads,
     )
 
 
@@ -557,6 +626,7 @@ _BUILDERS = {
     "sv": _build_sense_voice,
     "v3": _build_v3_recognizer,
     "omni": _build_omnilingual,
+    "pja": _build_parakeet_ja,
 }
 
 # preload priority when a residency cap is in effect
@@ -583,7 +653,9 @@ class RoutedASR:
                  max_resident: int | None = None, punctuate: bool = True,
                  hotwords_file: str = "", replace_file: str = "",
                  lid_switch_confirm: int = 2, dual_confirm: bool = True,
-                 forced_lang: str | None = None):
+                 forced_lang: str | None = None,
+                 ja_second_opinion: bool = False,
+                 agree_threshold: float = SECOND_OPINION_THRESHOLD):
         self._threads = threads
         self.dual_confirm = dual_confirm  # --mode balanced (default); False = --mode fast
         self.forced_lang = forced_lang    # --mode single: skip all LID/switch logic
@@ -598,6 +670,11 @@ class RoutedASR:
         self._warn_hotwords_encodability(hotwords_file)
         self._replacements = _load_replacements(replace_file)
         self._itn_overrides = itn_cjk.EMPTY_OVERRIDES
+        # refine-time ja second opinion (parakeet-ja agreement gate); live
+        # finals are never affected -- see transcribe()'s second_opinion arg.
+        self._ja_second_opinion = ja_second_opinion
+        self._agree_threshold = agree_threshold
+        self._pja_warned = False
         self._load_lock = threading.Lock()  # punct + registry bookkeeping
         self._seg_lock = threading.Lock()  # the offline-split VAD is stateful
         self._seg_vad = None          # lazily built VAD for offline splitting
@@ -1150,11 +1227,42 @@ class RoutedASR:
         self._pending_lang = None
         self._pending_count = 0
 
+    def _maybe_second_opinion(self, text: str, samples: np.ndarray,
+                              sample_rate: int) -> str:
+        """Decode `samples` with parakeet-ja and adopt its text only when it
+        agrees with the standing ReazonSpeech text (choose_second_opinion).
+
+        Model missing on disk: warn once, permanently disable the gate for
+        this session, and keep the standing text -- never fail a refine over
+        an optional model.
+        """
+        try:
+            rec = self._get("pja")
+        except ModelUnavailable:
+            if not self._pja_warned:
+                print("[hayamimi] warning: ja second opinion requested but "
+                      f"{os.path.basename(PJA_MODEL_DIR)} is not installed; "
+                      "gate disabled (run download_models.py --eval-baselines).")
+                self._pja_warned = True
+            self._ja_second_opinion = False
+            return text
+        try:
+            second = self._decode(rec, samples, sample_rate)
+        except Exception:
+            return text  # a second-opinion failure must never lose the primary
+        chosen, _used = choose_second_opinion(text, second, self._agree_threshold)
+        return chosen
+
     def transcribe(self, samples: np.ndarray, sample_rate: int,
                    known_lang: str | None = None, speech_s: float | None = None,
-                   live: bool = True) -> dict:
+                   live: bool = True, second_opinion: bool | None = None) -> dict:
         """live=False (e.g. the refine pass re-decoding past audio) must not
-        touch the sticky/pending language state of the live stream."""
+        touch the sticky/pending language state of the live stream.
+
+        second_opinion: apply the ja parakeet agreement gate to this decode.
+        None (default) resolves to "enabled by the constructor AND this is a
+        refine decode (live=False)" -- live finals never pay the second
+        decode. Pass True/False to override (evaluation harnesses)."""
         if self.forced_lang is not None:
             # --mode single: no LID, no switch logic, ever.
             lang, lid_ms = self.forced_lang, 0.0
@@ -1322,6 +1430,15 @@ class RoutedASR:
         buffer_s = len(samples) / float(sample_rate)
         if self._looks_truncated(text, buffer_s, lang):
             text = self._split_retry(text, samples, sample_rate, lang, text_model)
+
+        # ja second-opinion agreement gate (refine decodes only by default):
+        # runs AFTER the language decision and head-dropout retry are final,
+        # BEFORE ITN/punctuation so the adopted text flows through the same
+        # postprocessing as any other ja text.
+        if second_opinion is None:
+            second_opinion = self._ja_second_opinion and not live
+        if second_opinion and lang == "ja" and text.strip():
+            text = self._maybe_second_opinion(text, samples, sample_rate)
 
         # Fixed postprocessing order (see itn_cjk.py's module docstring):
         #   ITN -> punctuation restore -> user --replace, applied LAST so it
