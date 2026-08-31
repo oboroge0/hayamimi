@@ -580,6 +580,9 @@ def test_transcribe_bootstrap_zh_yue_reuses_single_sv_probe_decode():
         _pending_lang = None
         _pending_count = 0
         _unavailable = set()
+        _itn_overrides = asr_engine.itn_cjk.EMPTY_OVERRIDES
+        ko_spacer = None
+        punct = None
 
         def _decode_full(self, rec, samples, sample_rate):
             nonlocal call_count
