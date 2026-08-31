@@ -989,6 +989,13 @@ def main():
                     help="serve an OBS browser-source overlay at http://localhost:PORT (default 8833)")
     ap.add_argument("--no-refine", action="store_true",
                     help="disable the second-pass re-decode of utterance groups")
+    ap.add_argument("--refine-ja-second-opinion", action="store_true",
+                    help="refine pass only: also decode ja utterance groups with "
+                         "parakeet-ja and adopt its text when both models agree "
+                         "(needs download_models.py --eval-baselines; +~625MB resident)")
+    ap.add_argument("--refine-agree-threshold", type=float, default=None, metavar="CER",
+                    help="agreement threshold for --refine-ja-second-opinion "
+                         "(mutual CER between the two hypotheses; default 0.25)")
     ap.add_argument("--transcript", metavar="PATH",
                     help="append refined transcript lines to this file")
     ap.add_argument("--hotwords", metavar="PATH", default="",
@@ -1128,7 +1135,10 @@ def main():
                     hotwords_file=args.hotwords, replace_file=args.replace,
                     lid_switch_confirm=max(args.lid_switch_confirm, 1),
                     dual_confirm=(args.mode != "fast"),
-                    forced_lang=args.lang if args.mode == "single" else None)
+                    forced_lang=args.lang if args.mode == "single" else None,
+                    ja_second_opinion=args.refine_ja_second_opinion,
+                    **({"agree_threshold": args.refine_agree_threshold}
+                       if args.refine_agree_threshold is not None else {}))
     asr.min_switch_s = max(args.lang_switch_guard, 0.0)
     if server is not None:
         # lets /replacements and /itn_overrides on the subtitle server read
