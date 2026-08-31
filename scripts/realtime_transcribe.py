@@ -1130,6 +1130,10 @@ def main():
                     dual_confirm=(args.mode != "fast"),
                     forced_lang=args.lang if args.mode == "single" else None)
     asr.min_switch_s = max(args.lang_switch_guard, 0.0)
+    if server is not None:
+        # lets /replacements and /itn_overrides on the subtitle server read
+        # and update this engine's live postprocessing dictionaries
+        server.asr = asr
     vad = build_vad(args.min_silence, args.max_speech)
     stats = SessionStats()
     printer = PartialPrinter(enabled=not args.no_partial, server=server)
