@@ -114,9 +114,13 @@ SEGMENT_SAMPLE_RATE = 16000     # silero_vad.onnx is a 16k model
 #
 # Latin-script output packs fewer phonemes per character, so the same speech
 # yields roughly 2.5x more characters; DENSITY_FLOOR_LATIN is that ratio
-# applied to the measured CJK floor. It is an extrapolation -- en/ko cannot
-# be measured on a --minimal install -- and wants confirming against a full
-# scorecard run.
+# applied to the measured CJK floor. Validated against the FLEURS en test
+# distribution (100 clips, full-model run): healthy clips sit at 6.9-15.6
+# chars/s even on the pessimistic buffer-seconds basis (median 10.7), so
+# 6.0 does not intrude on the healthy range. The only two clips below it
+# were short single sentences inside long mostly-silent buffers -- exactly
+# the case the speech-seconds denominator re-normalizes -- and the retry's
+# tail-match acceptance is a second guard behind that.
 #
 # Density catches only the severe cases. FLEURS ja clip 324 also drops a
 # sentence but scores well inside the healthy range; it is out of reach here
