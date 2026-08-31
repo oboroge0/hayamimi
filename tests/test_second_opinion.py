@@ -23,8 +23,9 @@ def test_agreement_cer_scales_with_divergence():
 
 
 def test_choose_adopts_second_when_close():
-    text, used = choose_second_opinion("百Mのターンを迎える", "100Mのターンを迎える", 0.25)
-    assert used and text == "100Mのターンを迎える"
+    text, used = choose_second_opinion("きょうのニュースをお伝えします",
+                                       "今日のニュースをお伝えします", 0.25)
+    assert used and text == "今日のニュースをお伝えします"
 
 
 def test_choose_keeps_primary_when_divergent():
@@ -41,12 +42,12 @@ def test_choose_keeps_primary_on_empty_second():
 class _FakeASR:
     """Just enough of RoutedASR to drive _maybe_second_opinion unbound."""
 
-    def __init__(self, get=None, decode_text=None):
+    def __init__(self, get=None, decode=None):
         self._pja_warned = False
         self._ja_second_opinion = True
         self._agree_threshold = 0.25
         self._get_impl = get
-        self._decode_text = decode_text
+        self._decode_impl = decode
 
     def _get(self, name):
         assert name == "pja"
@@ -54,9 +55,8 @@ class _FakeASR:
             return self._get_impl(name)
         return object()
 
-    @classmethod
-    def _decode(cls, rec, samples, sr):  # matched via instance attr below
-        raise NotImplementedError
+    def _decode(self, rec, samples, sr):
+        return self._decode_impl(rec, samples, sr)
 
 
 def test_missing_model_warns_once_and_disables(capsys):
@@ -71,17 +71,16 @@ def test_missing_model_warns_once_and_disables(capsys):
     assert "second opinion" in capsys.readouterr().out
 
 
-def test_second_decode_failure_keeps_primary(monkeypatch):
-    fake = _FakeASR()
-    monkeypatch.setattr(asr_engine.RoutedASR, "_decode",
-                        classmethod(lambda cls, rec, s, sr: (_ for _ in ()).throw(RuntimeError())))
+def test_second_decode_failure_keeps_primary():
+    def boom(rec, s, sr):
+        raise RuntimeError("decode failed")
+
+    fake = _FakeASR(decode=boom)
     out = asr_engine.RoutedASR._maybe_second_opinion(fake, "元テキスト", None, 16000)
     assert out == "元テキスト"
 
 
-def test_agreeing_second_is_adopted(monkeypatch):
-    fake = _FakeASR()
-    monkeypatch.setattr(asr_engine.RoutedASR, "_decode",
-                        classmethod(lambda cls, rec, s, sr: "元テキストです"))
+def test_agreeing_second_is_adopted():
+    fake = _FakeASR(decode=lambda rec, s, sr: "元テキストです")
     out = asr_engine.RoutedASR._maybe_second_opinion(fake, "元テキストてす", None, 16000)
     assert out == "元テキストです"
