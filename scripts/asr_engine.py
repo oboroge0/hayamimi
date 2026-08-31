@@ -1436,7 +1436,9 @@ class RoutedASR:
         # BEFORE ITN/punctuation so the adopted text flows through the same
         # postprocessing as any other ja text.
         if second_opinion is None:
-            second_opinion = self._ja_second_opinion and not live
+            # getattr: transcribe() is also exercised against minimal stubs in
+            # tests that predate this attribute
+            second_opinion = getattr(self, "_ja_second_opinion", False) and not live
         if second_opinion and lang == "ja" and text.strip():
             text = self._maybe_second_opinion(text, samples, sample_rate)
 
