@@ -38,6 +38,8 @@ models -- including the languages where hayamimi loses -- is in
 | Speaker labels | `--speakers` tags each utterance S1/S2/... live via CAM++ nearest-centroid matching, then the refine pass re-diarizes each group with pyannote segmentation-3.0 and remaps clusters onto the same S{n} labels (mean DER 25.7% -> 13.9% on 5 AMI meetings, see Limitations) |
 | Translation | `--translate en,zh,ko,es,...` translates Japanese lines live (en via FuguMT; any other M2M-100 target code is accepted if the model's vocabulary supports it -- zh/ko/es have measured quality, see docs/TRANSLATE_M2M.md) |
 | Hotwords / user dictionary | `--hotwords` biases decoding toward proper nouns (currently has no effect on the ja tier -- see Limitations); `--replace` does post-hoc find/replace and works everywhere |
+| CJK number normalization | conservative kanji-numeral -> arabic-digit conversion (ja/zh/yue only): magnitude numbers, 点-decimals, and digit-string years/codes; idioms/proper nouns are left alone by default (`scripts/itn_cjk.py`) |
+| Runtime dictionary APIs | `RoutedASR.set_replacements()`/`set_itn_overrides()` swap the find/replace and ITN exclude/force dictionaries mid-session; with `--serve`, `GET`/`POST /replacements` and `/itn_overrides` do the same over HTTP |
 | OBS overlay + dashboard | `--serve` starts a local HTTP server with a browser-source overlay and a live dashboard |
 | Network audio input | `--input ws` accepts mic audio over a WebSocket (phone, ESP32/stackchan) and feeds it through the same pipeline, including `--serve`'s dashboard/overlay |
 | Memory-bounded | LRU model eviction keeps resident models under a configurable cap (default: <2GB total) |
@@ -276,6 +278,13 @@ Headline numbers from that log:
   preserved in ja->zh/ko translation (see `docs/TRANSLATE.md` and
   `docs/TRANSLATE_M2M.md` for measured failure cases before you rely on this
   for anything numeric or financial).
+- **Multi-sentence speech with no breathing pause can still lose its leading
+  sentence(s).** The offline recognizers collapse a VAD segment with no
+  internal silence into one decode call; hayamimi splits on internal
+  silences of at least 0.35s to work around this, but a run of sentences
+  spoken back-to-back with shorter gaps than that still decodes as a single
+  utterance and can drop everything before the last one (the clip-324 class
+  from the head-dropout investigation).
 - **The end-to-end mic pipeline has not been independently verified beyond
   this project's own testing** -- see `docs/GOALS.md`'s remaining-work
   section. File an issue if your results differ from the numbers above.
