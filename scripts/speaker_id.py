@@ -9,7 +9,6 @@ import os
 
 import numpy as np
 import sherpa_onnx
-from scipy.optimize import linear_sum_assignment
 
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
 EMBED_MODEL = os.path.join(MODELS_DIR, "campplus_sv.onnx")
@@ -357,6 +356,10 @@ class SpeakerLabeler:
             for j, ci in enumerate(live):
                 c = self._centroids[ci]
                 sim[i, j] = float(np.dot(emb, c) / (np.linalg.norm(c) + 1e-9))
+
+        # scipy is an eval-time dependency only (requirements-dev); import
+        # lazily so the base install and CI can import this module without it.
+        from scipy.optimize import linear_sum_assignment
 
         row_ind, col_ind = linear_sum_assignment(-sim)
         winners: dict[int, int] = {}  # local row -> centroid index, only if >= thr
