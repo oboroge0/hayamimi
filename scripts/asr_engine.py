@@ -29,6 +29,7 @@ OMNI_MODEL_DIR = os.path.join(MODELS_DIR, "omnilingual-300m-ctc-int8")
 WHISPER_TINY_DIR = os.path.join(MODELS_DIR, "sherpa-onnx-whisper-tiny")
 RZ_MODEL_DIR = os.path.join(MODELS_DIR, "sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17")
 PARA_ZH_DIR = os.path.join(MODELS_DIR, "sherpa-onnx-paraformer-zh-int8-2025-10-07")
+VAD_MODEL_PATH = os.path.join(MODELS_DIR, "silero_vad.onnx")
 
 # ReazonSpeech ja-en zipformer: on real broadcast Japanese it beats even
 # whisper-turbo (CER 8.6% vs 13.8%) at RTF 0.02. See docs/EVAL_REAL.md.
@@ -51,6 +52,53 @@ V3_LANGS = {
 }
 
 LID_MAX_SECONDS = 4.0  # only feed the first N seconds of a segment to the LID model
+
+# --- offline multi-utterance splitting -------------------------------------
+#
+# The catalog's offline recognizers are trained on single caption-length
+# utterances and collapse a buffer that holds SEVERAL of them into one: given
+# a multi-sentence clip in a single create_stream/decode_stream call, the
+# leading sentences simply never come out. Measured on FLEURS ja test with
+# ReazonSpeech (int8, fp16 and fp32 all identical; greedy and
+# modified_beam_search all identical):
+#
+#   clip 15 (18.3s, 4 sentences)  -> "植物がなければ動物は生きていけません"
+#                                    (first three sentences lost, CER 0.67)
+#   two 2.4s/3.0s utterances glued with a 0.4s pause (5.85s total)
+#                                 -> only the second one comes back
+#
+# It is NOT a duration limit -- a pause-free buffer decodes fine at any length
+# we tested, and a 5.85s two-utterance buffer already fails -- so the trigger
+# is "more than one utterance in the buffer", and the fix is to hand the
+# recognizer one utterance at a time. Splitting clip 15 at its internal
+# silences recovers all four sentences (CER 0.67 -> 0.11).
+#
+# Not every case is reachable this way: FLEURS ja clip 324 says three
+# sentences in one 5.1s breath with no pause Silero can see at any
+# min_silence, and there the recognizer still drops the first one. Splitting
+# only helps where there is a silence to split on.
+#
+# The live path never hit this: it decodes one VAD segment per call, and a VAD
+# segment is by construction a speech run with no internal silence >=
+# min_silence (0.35s in realtime_transcribe.build_vad). The offline callers do:
+# scripts/eval_engine.py feeds a whole clip, and the refine pass
+# (realtime_transcribe.Refiner.maybe_refine) re-decodes a whole group buffer
+# that spans several VAD segments *including the silences between them*.
+#
+# SEGMENT_MIN_SILENCE_S is deliberately equal to the live VAD's min_silence:
+# any buffer the live VAD produced then splits into exactly one piece and is
+# decoded unchanged, so the live path stays byte-identical.
+SEGMENT_MIN_S = 4.0             # below this a buffer can't hold two real utterances
+SEGMENT_MIN_SILENCE_S = 0.35    # only cut at silences at least this long
+SEGMENT_MIN_SPEECH_S = 0.25     # ignore shorter blips (same as the live VAD)
+SEGMENT_PAD_S = 0.15            # give each piece a little air on both sides
+SEGMENT_FALLBACK_CHUNK_S = 8.0  # no silero_vad.onnx: coarse fixed-length chunks
+SEGMENT_FALLBACK_OVERLAP_S = 0.25
+SEGMENT_SAMPLE_RATE = 16000     # silero_vad.onnx is a 16k model
+
+# Languages written without spaces between words: their pieces are joined
+# with nothing at all, everything else gets a single space.
+NO_SPACE_LANGS = {"ja", "zh", "yue", "ko"}
 
 
 def _find(model_dir: str, pattern: str) -> str:
@@ -511,6 +559,10 @@ class RoutedASR:
         self._warn_hotwords_encodability(hotwords_file)
         self._replacements = _load_replacements(replace_file)
         self._load_lock = threading.Lock()  # punct + registry bookkeeping
+        self._seg_lock = threading.Lock()  # the offline-split VAD is stateful
+        self._seg_vad = None          # lazily built VAD for offline splitting
+        self._seg_vad_capacity = 0.0  # its buffer_size_in_seconds
+        self._seg_vad_ok = True       # False once silero_vad.onnx proves missing
         self._model_locks = {name: threading.Lock() for name in _BUILDERS}
         self.last_lang = None  # sticky language from the most recent final
         self._unavailable: set[str] = set()  # models missing on disk (--minimal installs)
@@ -688,6 +740,144 @@ class RoutedASR:
     @classmethod
     def _decode(cls, rec, samples: np.ndarray, sample_rate: int) -> str:
         return cls._decode_full(rec, samples, sample_rate)[0]
+
+    def _segment_vad(self, seconds: float):
+        """Lazily built Silero VAD used only to split offline buffers.
+
+        Separate from the live capture VAD in realtime_transcribe.py: this one
+        never force-splits on length (max_speech_duration is effectively
+        disabled) because its job is to find the real silences in a buffer,
+        not to endpoint a stream. Rebuilt only when a longer buffer than any
+        seen so far arrives, since buffer_size_in_seconds is fixed at
+        construction and a buffer that overflows it loses segments.
+
+        Callers must hold self._seg_lock: the detector carries per-stream
+        state, and the refine worker thread transcribes concurrently with the
+        main thread's finals (realtime_transcribe.Refiner runs its own FIFO
+        worker), so two buffers must never be pushed through it at once.
+        """
+        need = max(60.0, seconds + 2.0)
+        if self._seg_vad is not None and self._seg_vad_capacity >= need:
+            self._seg_vad.reset()
+            return self._seg_vad
+        cfg = sherpa_onnx.VadModelConfig(
+            silero_vad=sherpa_onnx.SileroVadModelConfig(
+                model=VAD_MODEL_PATH,
+                threshold=0.5,
+                min_silence_duration=SEGMENT_MIN_SILENCE_S,
+                min_speech_duration=SEGMENT_MIN_SPEECH_S,
+                window_size=512,
+                # a large finite value: this VAD must never force-split a long
+                # pause-free run, that is the recognizer's business
+                max_speech_duration=need,
+            ),
+            sample_rate=SEGMENT_SAMPLE_RATE,
+            num_threads=1,
+        )
+        self._seg_vad = sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=need)
+        self._seg_vad_capacity = need
+        return self._seg_vad
+
+    def _speech_pieces(self, samples: np.ndarray, sample_rate: int):
+        """Split a long offline buffer into one piece per utterance.
+
+        Returns None when the buffer must be decoded as-is: too short to hold
+        two utterances, an unsupported sample rate, or -- the important case
+        for live parity -- a buffer with no internal silence, which comes back
+        as a single piece and is therefore handed to the recognizer untouched.
+        """
+        seconds = len(samples) / float(sample_rate)
+        if seconds <= SEGMENT_MIN_S or sample_rate != SEGMENT_SAMPLE_RATE:
+            return None
+        if self._seg_vad_ok and not os.path.exists(VAD_MODEL_PATH):
+            self._seg_vad_ok = False
+            print(f"[hayamimi] {os.path.basename(VAD_MODEL_PATH)} not found under "
+                  f"models/: long offline buffers fall back to fixed "
+                  f"{SEGMENT_FALLBACK_CHUNK_S:.0f}s chunking", file=sys.stderr)
+        if not self._seg_vad_ok:
+            return self._fixed_chunks(samples, sample_rate)
+
+        try:
+            with self._seg_lock:
+                vad = self._segment_vad(seconds)
+                spans, pos = [], 0
+                audio = np.ascontiguousarray(samples, dtype=np.float32)
+                while pos < len(audio):
+                    chunk = audio[pos:pos + 512]
+                    if len(chunk) < 512:
+                        chunk = np.pad(chunk, (0, 512 - len(chunk)))
+                    vad.accept_waveform(chunk)
+                    pos += 512
+                    while not vad.empty():
+                        spans.append((vad.front.start, len(vad.front.samples)))
+                        vad.pop()
+                vad.flush()
+                while not vad.empty():
+                    spans.append((vad.front.start, len(vad.front.samples)))
+                    vad.pop()
+        except Exception as exc:  # a VAD failure must never lose the audio
+            self._seg_vad, self._seg_vad_ok = None, False
+            print(f"[hayamimi] offline segmentation VAD failed ({exc}): long "
+                  f"buffers fall back to fixed chunking", file=sys.stderr)
+            return self._fixed_chunks(samples, sample_rate)
+
+        if len(spans) < 2:
+            # one utterance (or none): nothing to split, decode the original
+            # buffer verbatim so short/live segments behave exactly as before
+            return None
+        pad = int(SEGMENT_PAD_S * sample_rate)
+        pieces = []
+        for start, count in spans:
+            a = max(start - pad, 0)
+            b = min(start + count + pad, len(samples))
+            if b <= a:
+                continue
+            # Real audio on both sides for context, then a margin of actual
+            # silence around it. A piece that opens on speech loses its first
+            # word -- the ja model dropped "東京の" off "東京の天気は晴れです"
+            # when the piece started on the onset -- and the VAD's own onset
+            # can land a little late, so the leading silence has to be
+            # synthesized rather than borrowed from the buffer.
+            silence = np.zeros(pad, dtype=np.float32)
+            pieces.append(np.concatenate(
+                [silence, np.asarray(samples[a:b], dtype=np.float32), silence]))
+        return pieces or None
+
+    @staticmethod
+    def _fixed_chunks(samples: np.ndarray, sample_rate: int):
+        """VAD-less fallback for a --minimal install missing silero_vad.onnx.
+
+        Blind fixed-length chunks with a small overlap so a word straddling a
+        seam is at least whole in one of the two chunks. The overlap can make
+        a word at the seam appear twice; that is the documented cost of having
+        no VAD, and it is still far better than losing whole sentences.
+        """
+        step = int((SEGMENT_FALLBACK_CHUNK_S - SEGMENT_FALLBACK_OVERLAP_S) * sample_rate)
+        size = int(SEGMENT_FALLBACK_CHUNK_S * sample_rate)
+        if step <= 0 or len(samples) <= size:
+            return None
+        pieces = [samples[i:i + size] for i in range(0, len(samples), step)]
+        return [p for p in pieces if len(p) > int(0.2 * sample_rate)] or None
+
+    @staticmethod
+    def _join_pieces(parts: list[str], lang: str) -> str:
+        sep = "" if lang in NO_SPACE_LANGS else " "
+        return sep.join(p.strip() for p in parts if p.strip())
+
+    def _decode_seg(self, rec, samples: np.ndarray, sample_rate: int,
+                    lang: str, pieces) -> str:
+        """Decode `samples` through `rec`, one utterance per decode.
+
+        `pieces` is whatever _speech_pieces() returned for this exact buffer
+        (None = decode it in one go, the pre-existing behavior). Language
+        routing already happened at the buffer level; every piece goes through
+        the same recognizer, and post-processing (punctuation, --replace) still
+        runs once on the joined text back in transcribe().
+        """
+        if not pieces:
+            return self._decode(rec, samples, sample_rate)
+        return self._join_pieces(
+            [self._decode(rec, piece, sample_rate) for piece in pieces], lang)
 
     def _sv_probe(self, cached, samples: np.ndarray, sample_rate: int):
         """Run SenseVoice's confirmation-probe decode on `samples`, memoized
@@ -893,12 +1083,30 @@ class RoutedASR:
                 )
 
         t0 = time.perf_counter()
+        # Language routing above is deliberately buffer-level (one LID, one
+        # switch resolution, one sticky-state update); only the DECODE below
+        # is split per utterance, because the offline recognizers collapse a
+        # multi-utterance buffer to a single utterance. None for anything the
+        # live path produces, which then decodes exactly as it did before.
+        pieces = self._speech_pieces(samples, sample_rate)
         sv_text, sv_lang2 = (sv_probe if sv_probe is not None else (None, None))
+
+        def sv_final(probe_text: str, tag: str) -> str:
+            """SenseVoice's probe text, re-decoded per utterance when the
+            buffer holds several (the probe itself stays whole-buffer: it is
+            a language decision, and LID wants all the audio)."""
+            if not pieces:
+                return probe_text
+            try:
+                return self._decode_seg(self._get("sv"), samples, sample_rate, tag, pieces)
+            except ModelUnavailable:
+                return probe_text
+
         if self.forced_lang is not None:
             # --mode single: route straight to the forced language, no
             # zh/yue arbitration and no script-based re-decode below.
             rec, tier = self._route(lang)
-            text = self._decode(rec, samples, sample_rate)
+            text = self._decode_seg(rec, samples, sample_rate, lang, pieces)
         elif lang == "zh":
             # whisper-tiny LID labels Cantonese as "zh" (measured 0/12 correct
             # on FLEURS yue), so let SenseVoice's internal LID arbitrate: keep
@@ -909,29 +1117,30 @@ class RoutedASR:
                 sv_probe, _elapsed_ms = self._sv_probe(sv_probe, samples, sample_rate)
                 sv_text, sv_lang2 = sv_probe if sv_probe is not None else (None, None)
             if sv_text is not None:
-                text = sv_text
                 if "yue" in sv_lang2:
                     lang, tier = "yue", "sv"
+                    text = sv_final(sv_text, lang)
                 else:
+                    text = sv_final(sv_text, lang)
                     rec, tier = self._get_with_fallback("pz")
-                    text2 = self._decode(rec, samples, sample_rate)
+                    text2 = self._decode_seg(rec, samples, sample_rate, lang, pieces)
                     if text2.strip():
                         text = text2
             else:
                 rec, tier = self._route(lang)
-                text = self._decode(rec, samples, sample_rate)
+                text = self._decode_seg(rec, samples, sample_rate, lang, pieces)
         elif lang in ("ko", "yue") and sv_text is not None and sv_lid_tag(sv_lang2) == lang:
             # the switch-confirmation probe already decoded this exact audio
             # through the tier "ko"/"yue" routes to anyway; reuse it instead
             # of a second SenseVoice pass over the same samples.
-            text, tier = sv_text, "sv"
+            text, tier = sv_final(sv_text, lang), "sv"
         else:
             rec, tier = self._route(lang)
-            text = self._decode(rec, samples, sample_rate)
+            text = self._decode_seg(rec, samples, sample_rate, lang, pieces)
         if not text.strip() and tier != "omni" and not suppress_fallback:
             # safety net: the specialist came back empty (likely LID mistake);
             # the 1600-language generalist gets the last word.
-            text = self._decode(self._get("omni"), samples, sample_rate)
+            text = self._decode_seg(self._get("omni"), samples, sample_rate, lang, pieces)
             tier = "omni"
         corrected = script_corrected_lang(lang, text)
         if self.forced_lang is None and live and text.strip() and corrected != lang:
@@ -950,18 +1159,22 @@ class RoutedASR:
                                   if sv2 is not None else ("", ""))
                 if text2.strip():
                     if "yue" in sv_lang:
-                        lang, tier, text = "yue", "sv", text2
+                        lang, tier, text = "yue", "sv", sv_final(text2, "yue")
                     elif "zh" in sv_lang:
-                        text3 = self._decode(self._get_with_fallback("pz")[0], samples, sample_rate)
-                        lang, tier, text = "zh", "pz", (text3 if text3.strip() else text2)
+                        text3 = self._decode_seg(self._get_with_fallback("pz")[0],
+                                                 samples, sample_rate, "zh", pieces)
+                        lang, tier, text = "zh", "pz", (text3 if text3.strip()
+                                                        else sv_final(text2, "zh"))
                     elif "ja" in sv_lang:
-                        text3 = self._decode(self._get_with_fallback("rz")[0], samples, sample_rate)
-                        lang, tier, text = "ja", "rz", (text3 if text3.strip() else text2)
+                        text3 = self._decode_seg(self._get_with_fallback("rz")[0],
+                                                 samples, sample_rate, "ja", pieces)
+                        lang, tier, text = "ja", "rz", (text3 if text3.strip()
+                                                        else sv_final(text2, "ja"))
                     elif "ko" in sv_lang:
-                        lang, tier, text = "ko", "sv", text2
+                        lang, tier, text = "ko", "sv", sv_final(text2, "ko")
             else:
                 rec2, tier2 = self._route(corrected)
-                text2 = self._decode(rec2, samples, sample_rate)
+                text2 = self._decode_seg(rec2, samples, sample_rate, corrected, pieces)
                 if text2.strip():
                     lang, tier, text = corrected, tier2, text2
 
