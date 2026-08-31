@@ -538,10 +538,9 @@ def test_transcribe_bootstrap_too_short_decodes_but_does_not_seed_last_lang():
             return "sv-recognizer"
 
         _sv_probe = asr_engine.RoutedASR._sv_probe
-        # transcribe() asks these two whether the buffer holds several
-        # utterances; on a 0.3s stub buffer they short-circuit to "no".
-        _speech_pieces = asr_engine.RoutedASR._speech_pieces
-        _decode_seg = asr_engine.RoutedASR._decode_seg
+        # transcribe() asks this whether the decode looks like it dropped its
+        # leading content; on a 0.3s stub buffer it short-circuits to "no".
+        _looks_truncated = staticmethod(asr_engine.RoutedASR._looks_truncated)
 
         def _route(self, lang):
             assert lang == "en"
@@ -594,10 +593,9 @@ def test_transcribe_bootstrap_zh_yue_reuses_single_sv_probe_decode():
             return "sv-recognizer"
 
         _sv_probe = asr_engine.RoutedASR._sv_probe
-        # transcribe() asks these two whether the buffer holds several
-        # utterances; on a 0.3s stub buffer they short-circuit to "no".
-        _speech_pieces = asr_engine.RoutedASR._speech_pieces
-        _decode_seg = asr_engine.RoutedASR._decode_seg
+        # transcribe() asks this whether the decode looks like it dropped its
+        # leading content; on a 0.3s stub buffer it short-circuits to "no".
+        _looks_truncated = staticmethod(asr_engine.RoutedASR._looks_truncated)
 
         def _replace(self, text):
             return text

@@ -13,6 +13,7 @@ Models are loaded lazily on first use and, when `max_resident` is set, the
 least-recently-used ones are unloaded so memory stays bounded no matter how
 many languages a session wanders through.
 """
+import difflib
 import glob
 import os
 import sys
@@ -55,48 +56,80 @@ V3_LANGS = {
 
 LID_MAX_SECONDS = 4.0  # only feed the first N seconds of a segment to the LID model
 
-# --- offline multi-utterance splitting -------------------------------------
+# --- head-dropout retry ----------------------------------------------------
 #
 # The catalog's offline recognizers are trained on single caption-length
-# utterances and collapse a buffer that holds SEVERAL of them into one: given
-# a multi-sentence clip in a single create_stream/decode_stream call, the
-# leading sentences simply never come out. Measured on FLEURS ja test with
-# ReazonSpeech (int8, fp16 and fp32 all identical; greedy and
-# modified_beam_search all identical):
+# utterances and can collapse a buffer that holds SEVERAL of them into one:
+# given a multi-sentence clip in a single create_stream/decode_stream call,
+# the leading sentences sometimes never come out. Measured on FLEURS ja test
+# with ReazonSpeech (int8, fp16 and fp32 all identical; greedy and
+# modified_beam_search all identical): clip 15 (18.3s, 4 sentences) came back
+# as just "植物がなければ動物は生きていけません", CER 0.67.
 #
-#   clip 15 (18.3s, 4 sentences)  -> "植物がなければ動物は生きていけません"
-#                                    (first three sentences lost, CER 0.67)
-#   two 2.4s/3.0s utterances glued with a 0.4s pause (5.85s total)
-#                                 -> only the second one comes back
+# Splitting the buffer at its internal silences and decoding one piece per
+# call recovers clip 15 (CER 0.67 -> 0.11). But doing that UNCONDITIONALLY is
+# a net loss: an external FLEURS 5x100 A/B measured ja 8.6% -> 9.9%,
+# en 9.4% -> 10.2%, ko 8.1% -> 9.1% -- on ja, 16 clips improved and 26 got
+# worse, because words that straddle a piece boundary get lost and the
+# per-piece decodes are shorter and therefore worse-conditioned. Most buffers
+# do not have the defect and must not be touched.
 #
-# It is NOT a duration limit -- a pause-free buffer decodes fine at any length
-# we tested, and a 5.85s two-utterance buffer already fails -- so the trigger
-# is "more than one utterance in the buffer", and the fix is to hand the
-# recognizer one utterance at a time. Splitting clip 15 at its internal
-# silences recovers all four sentences (CER 0.67 -> 0.11).
+# So the split is a RETRY, not a decode path: the whole buffer is decoded
+# exactly as it always was, and only if the result looks like it dropped its
+# leading content (see _looks_truncated) is the split attempted, and only if
+# the split result is plausibly better (see _retry_is_better) is it kept.
+# When in doubt the whole-buffer decode wins.
 #
-# Not every case is reachable this way: FLEURS ja clip 324 says three
-# sentences in one 5.1s breath with no pause Silero can see at any
-# min_silence, and there the recognizer still drops the first one. Splitting
-# only helps where there is a silence to split on.
+# The live path is untouched twice over: it decodes one VAD segment per call
+# (a speech run with no internal silence >= min_silence, so there is nothing
+# to split), and a single VAD segment is short and dense enough never to trip
+# the suspicion gate in the first place.
 #
-# The live path never hit this: it decodes one VAD segment per call, and a VAD
-# segment is by construction a speech run with no internal silence >=
-# min_silence (0.35s in realtime_transcribe.build_vad). The offline callers do:
-# scripts/eval_engine.py feeds a whole clip, and the refine pass
-# (realtime_transcribe.Refiner.maybe_refine) re-decodes a whole group buffer
-# that spans several VAD segments *including the silences between them*.
-#
-# SEGMENT_MIN_SILENCE_S is deliberately equal to the live VAD's min_silence:
-# any buffer the live VAD produced then splits into exactly one piece and is
-# decoded unchanged, so the live path stays byte-identical.
+# SEGMENT_MIN_SILENCE_S is deliberately equal to the live VAD's min_silence
+# (0.35s in realtime_transcribe.build_vad), so a buffer the live VAD produced
+# splits into exactly one piece and the retry becomes a no-op.
 SEGMENT_MIN_S = 4.0             # below this a buffer can't hold two real utterances
 SEGMENT_MIN_SILENCE_S = 0.35    # only cut at silences at least this long
 SEGMENT_MIN_SPEECH_S = 0.25     # ignore shorter blips (same as the live VAD)
-SEGMENT_PAD_S = 0.15            # give each piece a little air on both sides
+SEGMENT_PAD_S = 0.35            # real context kept on both sides of a piece
 SEGMENT_FALLBACK_CHUNK_S = 8.0  # no silero_vad.onnx: coarse fixed-length chunks
 SEGMENT_FALLBACK_OVERLAP_S = 0.25
 SEGMENT_SAMPLE_RATE = 16000     # silero_vad.onnx is a 16k model
+
+# Output density (alphanumeric characters per second of SPEECH) below which a
+# decode is suspected of having dropped its leading content. Calibrated on
+# FLEURS ja test through the production path with the ReazonSpeech tier: 60
+# random clips scored between 3.46 and 14.22 chars/s (median 6.54), while the
+# known head-dropout clip 15 scored 1.70. 2.4 is the log-midpoint of that
+# gap: 41% above the defect, 31% below the lowest healthy clip seen.
+#
+# The denominator is SPEECH seconds, not buffer seconds, because how much
+# silence a buffer carries is an accident of how it was cut -- FLEURS clips
+# carry seconds of it, a live VAD segment carries almost none, and the same
+# defect has to look the same in both. Since speech <= buffer, the buffer
+# figure is always the smaller of the two, so it is safe to use as a free
+# pre-gate that decides whether running the VAD at all is worth it: it can
+# raise a false alarm but it can never miss one the speech figure would
+# catch.
+#
+# Latin-script output packs fewer phonemes per character, so the same speech
+# yields roughly 2.5x more characters; DENSITY_FLOOR_LATIN is that ratio
+# applied to the measured CJK floor. It is an extrapolation -- en/ko cannot
+# be measured on a --minimal install -- and wants confirming against a full
+# scorecard run.
+#
+# Density catches only the severe cases. FLEURS ja clip 324 also drops a
+# sentence but scores well inside the healthy range; it is out of reach here
+# (and out of reach of splitting anyway -- it says three sentences in one
+# 5.1s breath with no pause Silero can see).
+DENSITY_FLOOR_CJK = 2.4
+DENSITY_FLOOR_LATIN = 6.0
+
+# How much of the whole-buffer text must reappear in the retry text, and over
+# how long a tail, for the retry to count as "the same utterance plus more"
+# rather than a different reading of the audio.
+RETRY_TAIL_CHARS = 12
+RETRY_TAIL_MATCH = 0.6
 
 # Languages written without spaces between words: their pieces are joined
 # with nothing at all, everything else gets a single space.
@@ -782,23 +815,26 @@ class RoutedASR:
         return self._seg_vad
 
     def _speech_pieces(self, samples: np.ndarray, sample_rate: int):
-        """Split a long offline buffer into one piece per utterance.
+        """Split a long buffer into one piece per utterance, for the retry.
 
-        Returns None when the buffer must be decoded as-is: too short to hold
-        two utterances, an unsupported sample rate, or -- the important case
-        for live parity -- a buffer with no internal silence, which comes back
-        as a single piece and is therefore handed to the recognizer untouched.
+        Returns (pieces, speech_seconds). `pieces` is None when there is
+        nothing to split: too short to hold two utterances, an unsupported
+        sample rate, or a buffer with no internal silence -- in which case the
+        retry gives up and the whole-buffer text stands. `speech_seconds` is
+        how much of the buffer the VAD called speech, or the whole buffer's
+        length when no VAD ran (the pessimistic reading: it makes the density
+        measure smaller, never larger, so it cannot manufacture suspicion).
         """
         seconds = len(samples) / float(sample_rate)
         if seconds <= SEGMENT_MIN_S or sample_rate != SEGMENT_SAMPLE_RATE:
-            return None
+            return None, seconds
         if self._seg_vad_ok and not os.path.exists(VAD_MODEL_PATH):
             self._seg_vad_ok = False
             print(f"[hayamimi] {os.path.basename(VAD_MODEL_PATH)} not found under "
                   f"models/: long offline buffers fall back to fixed "
                   f"{SEGMENT_FALLBACK_CHUNK_S:.0f}s chunking", file=sys.stderr)
         if not self._seg_vad_ok:
-            return self._fixed_chunks(samples, sample_rate)
+            return self._fixed_chunks(samples, sample_rate), seconds
 
         try:
             with self._seg_lock:
@@ -822,12 +858,13 @@ class RoutedASR:
             self._seg_vad, self._seg_vad_ok = None, False
             print(f"[hayamimi] offline segmentation VAD failed ({exc}): long "
                   f"buffers fall back to fixed chunking", file=sys.stderr)
-            return self._fixed_chunks(samples, sample_rate)
+            return self._fixed_chunks(samples, sample_rate), seconds
 
+        speech_s = sum(count for _start, count in spans) / float(sample_rate)
         if len(spans) < 2:
-            # one utterance (or none): nothing to split, decode the original
-            # buffer verbatim so short/live segments behave exactly as before
-            return None
+            # one utterance (or none): nothing to split, so the whole-buffer
+            # decode stands however sparse it looked
+            return None, (speech_s or seconds)
         pad = int(SEGMENT_PAD_S * sample_rate)
         pieces = []
         for start, count in spans:
@@ -844,7 +881,7 @@ class RoutedASR:
             silence = np.zeros(pad, dtype=np.float32)
             pieces.append(np.concatenate(
                 [silence, np.asarray(samples[a:b], dtype=np.float32), silence]))
-        return pieces or None
+        return (pieces or None), (speech_s or seconds)
 
     @staticmethod
     def _fixed_chunks(samples: np.ndarray, sample_rate: int):
@@ -867,20 +904,90 @@ class RoutedASR:
         sep = "" if lang in NO_SPACE_LANGS else " "
         return sep.join(p.strip() for p in parts if p.strip())
 
-    def _decode_seg(self, rec, samples: np.ndarray, sample_rate: int,
-                    lang: str, pieces) -> str:
-        """Decode `samples` through `rec`, one utterance per decode.
+    @staticmethod
+    def _text_density(text: str, seconds: float) -> float:
+        """Alphanumeric characters per second.
 
-        `pieces` is whatever _speech_pieces() returned for this exact buffer
-        (None = decode it in one go, the pre-existing behavior). Language
-        routing already happened at the buffer level; every piece goes through
-        the same recognizer, and post-processing (ITN, punctuation, --replace) still
-        runs once on the joined text back in transcribe().
+        Punctuation is excluded so the measure does not move when the ja
+        punctuation restorer or the CJK ITN pass rewrites the text.
         """
-        if not pieces:
-            return self._decode(rec, samples, sample_rate)
-        return self._join_pieces(
+        if seconds <= 0:
+            return float("inf")
+        return sum(1 for c in text if c.isalnum()) / seconds
+
+    @staticmethod
+    def _looks_truncated(text: str, seconds: float, lang: str,
+                         buffer_s: float | None = None) -> bool:
+        """Does this whole-buffer decode look like it lost its leading content?
+
+        `seconds` is speech seconds; `buffer_s` defaults to it and only exists
+        so the cheap pre-gate can pass the buffer length before any VAD has
+        run. Empty text is deliberately NOT suspicious: that is the omni
+        fallback's business, and re-decoding silence in pieces would only
+        invent words.
+        """
+        if (buffer_s if buffer_s is not None else seconds) <= SEGMENT_MIN_S:
+            return False
+        if not text.strip():
+            return False
+        floor = DENSITY_FLOOR_CJK if lang in NO_SPACE_LANGS else DENSITY_FLOOR_LATIN
+        return RoutedASR._text_density(text, seconds) < floor
+
+    @staticmethod
+    def _retry_is_better(whole: str, retry: str, seconds: float, lang: str) -> bool:
+        """Is the split retry plausibly a recovery rather than a different read?
+
+        Two conditions, both required, and both biased towards keeping the
+        whole-buffer text when the answer is unclear:
+
+          * the retry is longer AND its density is back inside the healthy
+            range -- a retry that is merely a bit longer but still sparse has
+            not recovered anything;
+          * most of the whole decode's tail reappears in the retry. The whole
+            decode is the SURVIVING end of the utterance, so a genuine
+            recovery keeps it and prepends what was lost. Matching is fuzzy
+            (longest common substring) because the piece boundaries change
+            the acoustic context and the model re-renders a few characters.
+        """
+        whole, retry = whole.strip(), retry.strip()
+        if not retry or len(retry) <= len(whole):
+            return False
+        floor = DENSITY_FLOOR_CJK if lang in NO_SPACE_LANGS else DENSITY_FLOOR_LATIN
+        if RoutedASR._text_density(retry, seconds) < floor:
+            return False
+        tail = whole[-RETRY_TAIL_CHARS:]
+        if not tail:
+            return False
+        match = difflib.SequenceMatcher(None, tail, retry, autojunk=False)
+        longest = match.find_longest_match(0, len(tail), 0, len(retry))
+        return longest.size / len(tail) >= RETRY_TAIL_MATCH
+
+    def _split_retry(self, text: str, samples: np.ndarray, sample_rate: int,
+                     lang: str, model: str) -> str:
+        """Re-decode a suspicious buffer one utterance at a time.
+
+        Hard-pinned to `model`, the recognizer that produced `text`: no
+        per-piece LID, no per-piece script correction, no per-piece omni
+        fallback (an empty piece stays empty and simply drops out of the
+        join). The language decision was made once, at buffer level, and a
+        retry must not be able to move it -- fragments are short and a short
+        fragment is exactly what makes a language model guess wrong.
+
+        Returns `text` unchanged unless the retry clears _retry_is_better.
+        """
+        pieces, speech_s = self._speech_pieces(samples, sample_rate)
+        # second half of the two-stage gate: the caller's cheap check used the
+        # whole buffer's length, this one uses the speech the VAD actually
+        # found, which is what the floor was calibrated against
+        if not pieces or not self._looks_truncated(text, speech_s, lang):
+            return text
+        try:
+            rec = self._get(model)
+        except (ModelUnavailable, KeyError):
+            return text
+        retry = self._join_pieces(
             [self._decode(rec, piece, sample_rate) for piece in pieces], lang)
+        return retry if self._retry_is_better(text, retry, speech_s, lang) else text
 
     def _sv_probe(self, cached, samples: np.ndarray, sample_rate: int):
         """Run SenseVoice's confirmation-probe decode on `samples`, memoized
@@ -1121,30 +1228,17 @@ class RoutedASR:
                 )
 
         t0 = time.perf_counter()
-        # Language routing above is deliberately buffer-level (one LID, one
-        # switch resolution, one sticky-state update); only the DECODE below
-        # is split per utterance, because the offline recognizers collapse a
-        # multi-utterance buffer to a single utterance. None for anything the
-        # live path produces, which then decodes exactly as it did before.
-        pieces = self._speech_pieces(samples, sample_rate)
         sv_text, sv_lang2 = (sv_probe if sv_probe is not None else (None, None))
-
-        def sv_final(probe_text: str, tag: str) -> str:
-            """SenseVoice's probe text, re-decoded per utterance when the
-            buffer holds several (the probe itself stays whole-buffer: it is
-            a language decision, and LID wants all the audio)."""
-            if not pieces:
-                return probe_text
-            try:
-                return self._decode_seg(self._get("sv"), samples, sample_rate, tag, pieces)
-            except ModelUnavailable:
-                return probe_text
-
+        # `text_model` tracks WHICH recognizer produced the text that is
+        # currently standing, so the head-dropout retry at the bottom can pin
+        # itself to that same one. It is not always `tier`: the zh branch
+        # below can report tier "pz" while keeping SenseVoice's transcript.
+        text_model = "omni"
         if self.forced_lang is not None:
             # --mode single: route straight to the forced language, no
             # zh/yue arbitration and no script-based re-decode below.
             rec, tier = self._route(lang)
-            text = self._decode_seg(rec, samples, sample_rate, lang, pieces)
+            text, text_model = self._decode(rec, samples, sample_rate), tier
         elif lang == "zh":
             # whisper-tiny LID labels Cantonese as "zh" (measured 0/12 correct
             # on FLEURS yue), so let SenseVoice's internal LID arbitrate: keep
@@ -1155,31 +1249,30 @@ class RoutedASR:
                 sv_probe, _elapsed_ms = self._sv_probe(sv_probe, samples, sample_rate)
                 sv_text, sv_lang2 = sv_probe if sv_probe is not None else (None, None)
             if sv_text is not None:
+                text, text_model = sv_text, "sv"
                 if "yue" in sv_lang2:
                     lang, tier = "yue", "sv"
-                    text = sv_final(sv_text, lang)
                 else:
-                    text = sv_final(sv_text, lang)
                     rec, tier = self._get_with_fallback("pz")
-                    text2 = self._decode_seg(rec, samples, sample_rate, lang, pieces)
+                    text2 = self._decode(rec, samples, sample_rate)
                     if text2.strip():
-                        text = text2
+                        text, text_model = text2, tier
             else:
                 rec, tier = self._route(lang)
-                text = self._decode_seg(rec, samples, sample_rate, lang, pieces)
+                text, text_model = self._decode(rec, samples, sample_rate), tier
         elif lang in ("ko", "yue") and sv_text is not None and sv_lid_tag(sv_lang2) == lang:
             # the switch-confirmation probe already decoded this exact audio
             # through the tier "ko"/"yue" routes to anyway; reuse it instead
             # of a second SenseVoice pass over the same samples.
-            text, tier = sv_final(sv_text, lang), "sv"
+            text, tier, text_model = sv_text, "sv", "sv"
         else:
             rec, tier = self._route(lang)
-            text = self._decode_seg(rec, samples, sample_rate, lang, pieces)
+            text, text_model = self._decode(rec, samples, sample_rate), tier
         if not text.strip() and tier != "omni" and not suppress_fallback:
             # safety net: the specialist came back empty (likely LID mistake);
             # the 1600-language generalist gets the last word.
-            text = self._decode_seg(self._get("omni"), samples, sample_rate, lang, pieces)
-            tier = "omni"
+            text = self._decode(self._get("omni"), samples, sample_rate)
+            tier, text_model = "omni", "omni"
         corrected = script_corrected_lang(lang, text)
         if self.forced_lang is None and live and text.strip() and corrected != lang:
             # the decoded script contradicts the LID tag (romaji-mangled
@@ -1197,24 +1290,34 @@ class RoutedASR:
                                   if sv2 is not None else ("", ""))
                 if text2.strip():
                     if "yue" in sv_lang:
-                        lang, tier, text = "yue", "sv", sv_final(text2, "yue")
+                        lang, tier, text, text_model = "yue", "sv", text2, "sv"
                     elif "zh" in sv_lang:
-                        text3 = self._decode_seg(self._get_with_fallback("pz")[0],
-                                                 samples, sample_rate, "zh", pieces)
-                        lang, tier, text = "zh", "pz", (text3 if text3.strip()
-                                                        else sv_final(text2, "zh"))
+                        text3 = self._decode(self._get_with_fallback("pz")[0], samples, sample_rate)
+                        lang, tier = "zh", "pz"
+                        text, text_model = ((text3, "pz") if text3.strip()
+                                            else (text2, "sv"))
                     elif "ja" in sv_lang:
-                        text3 = self._decode_seg(self._get_with_fallback("rz")[0],
-                                                 samples, sample_rate, "ja", pieces)
-                        lang, tier, text = "ja", "rz", (text3 if text3.strip()
-                                                        else sv_final(text2, "ja"))
+                        text3 = self._decode(self._get_with_fallback("rz")[0], samples, sample_rate)
+                        lang, tier = "ja", "rz"
+                        text, text_model = ((text3, "rz") if text3.strip()
+                                            else (text2, "sv"))
                     elif "ko" in sv_lang:
-                        lang, tier, text = "ko", "sv", sv_final(text2, "ko")
+                        lang, tier, text, text_model = "ko", "sv", text2, "sv"
             else:
                 rec2, tier2 = self._route(corrected)
-                text2 = self._decode_seg(rec2, samples, sample_rate, corrected, pieces)
+                text2 = self._decode(rec2, samples, sample_rate)
                 if text2.strip():
-                    lang, tier, text = corrected, tier2, text2
+                    lang, tier, text, text_model = corrected, tier2, text2, tier2
+
+        # Everything above is byte-identical to the pre-retry engine, and the
+        # language decision is now FINAL. Only if that whole-buffer decode
+        # looks like it dropped its leading content (docs/BENCHMARKS.md, the
+        # FLEURS ja head-dropout) is the buffer re-decoded one utterance at a
+        # time, through the very recognizer that produced `text` -- and even
+        # then the result is kept only if it looks like a recovery.
+        buffer_s = len(samples) / float(sample_rate)
+        if self._looks_truncated(text, buffer_s, lang):
+            text = self._split_retry(text, samples, sample_rate, lang, text_model)
 
         # Fixed postprocessing order (see itn_cjk.py's module docstring):
         #   ITN -> punctuation restore -> user --replace, applied LAST so it
