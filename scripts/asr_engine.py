@@ -612,6 +612,7 @@ _KEY_FILES = {
     "sv": (SV_MODEL_DIR, "model*.onnx"),
     "v3": (V3_MODEL_DIR, "encoder*.onnx"),
     "omni": (OMNI_MODEL_DIR, "model*.onnx"),
+    "pja": (PJA_MODEL_DIR, "model*.onnx"),
 }
 
 
