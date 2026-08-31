@@ -50,7 +50,7 @@ second-opinion を transcribe に適用するオプション」を RoutedASR に
 
 ## 進捗ログ (イテレーションごとに追記)
 
-- [ ] 実装
-- [ ] ユニットテスト
+- [x] 実装
+- [x] ユニットテスト
 - [ ] FLEURS 検証
 - [ ] realset 検証
