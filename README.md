@@ -278,13 +278,15 @@ Headline numbers from that log:
   preserved in ja->zh/ko translation (see `docs/TRANSLATE.md` and
   `docs/TRANSLATE_M2M.md` for measured failure cases before you rely on this
   for anything numeric or financial).
-- **Multi-sentence speech with no breathing pause can still lose its leading
-  sentence(s).** The offline recognizers collapse a VAD segment with no
-  internal silence into one decode call; hayamimi splits on internal
-  silences of at least 0.35s to work around this, but a run of sentences
-  spoken back-to-back with shorter gaps than that still decodes as a single
-  utterance and can drop everything before the last one (the clip-324 class
-  from the head-dropout investigation).
+- **Multi-sentence speech can still lose its leading sentence(s).** The
+  offline recognizers sometimes collapse a buffer holding several utterances
+  into a single decode. hayamimi watches for the symptom -- a transcript far
+  shorter than the speech it is supposed to cover -- and retries that buffer
+  split at its internal silences (at least 0.35s), keeping the retry only
+  when it actually recovers text. Two classes escape this: sentences spoken
+  back-to-back with no pause to split on (the clip-324 class from the
+  head-dropout investigation), and milder dropouts whose transcript still
+  looks long enough to pass for normal.
 - **The end-to-end mic pipeline has not been independently verified beyond
   this project's own testing** -- see `docs/GOALS.md`'s remaining-work
   section. File an issue if your results differ from the numbers above.
