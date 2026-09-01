@@ -15,8 +15,6 @@ import threading
 import time
 import wave
 
-sys.stdout.reconfigure(encoding="utf-8")
-
 import numpy as np
 import sherpa_onnx
 
@@ -1007,6 +1005,7 @@ def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStat
 
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
     ap.add_argument("--wav", help="wav file to simulate streaming from (16kHz mono s16)")
     ap.add_argument("--no-realtime", action="store_true", help="don't sleep between chunks in --wav mode")
@@ -1133,9 +1132,11 @@ def main():
                          "docs/TRANSLATE_M2M.md")
     ap.add_argument("--input", choices=["mic", "wav", "ws"], default=None,
                     help="audio source; default is mic, or wav if --wav is given")
-    ap.add_argument("--ws-host", default="0.0.0.0", metavar="HOST",
-                    help="bind host for --input ws (default 0.0.0.0, so an ESP32/phone "
-                         "on the LAN can reach it; use 127.0.0.1 to restrict to localhost)")
+    ap.add_argument("--ws-host", default="127.0.0.1", metavar="HOST",
+                    help="bind host for --input ws (default 127.0.0.1, localhost-only; "
+                         "pass --ws-host 0.0.0.0 to also accept connections from other "
+                         "devices on the LAN, e.g. a phone or an ESP32 board -- do this "
+                         "only on a network you trust, the /ingest endpoint has no auth)")
     ap.add_argument("--ws-port", type=int, default=8766, metavar="PORT",
                     help="port for the --input ws /ingest endpoint (default 8766)")
     args = ap.parse_args()

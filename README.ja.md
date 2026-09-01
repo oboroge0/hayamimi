@@ -78,6 +78,22 @@ Whisper系・クラウドSTT API・他のローカルモデルとの比較（hay
 外部ライブラリ不要の参照クライアント（wavファイルを実時間ペースで送信）で、
 スマホ/ESP32クライアントを作るときのテンプレートにもなります。
 
+`--input ws`は既定で`127.0.0.1`にバインドするので、エンドポイントは何もしなければ
+localhostからしかアクセスできません。LAN上の他端末を受け付けたいときだけ
+`--ws-host 0.0.0.0`を明示してください（`/ingest`に認証はないので、信頼できる
+ネットワークでのみ使うこと）。バインドしたアドレスは起動時にstderrへ出力されます。
+
+## 他アプリへの組み込み
+
+`scripts/realtime_transcribe.py`の各部品（`RoutedASR`、`build_vad`、`run_stream`）は
+CLI専用ではなくimportして使えます。`RoutedASR(...)`と`build_vad(...)`は、
+モデルパスが見つからない場合にsherpa-onnxのC++層が呼ぶ`exit()`（catchできない）
+の代わりに、catchできる`asr_engine.ModelUnavailable`を送出します。また
+`run_stream(..., stop_event=threading.Eventのインスタンス)`で`threading.Event`型の
+停止トークンを受け付けるので、ホストアプリが自前のスレッドでパイプラインを回している
+場合でも、CLIのプロセスにしか効かない`KeyboardInterrupt`に頼らず
+`stop_event.set()`だけできれいに止められます。
+
 ## 動作環境
 
 Python 3.10以上と、PATHの通ったffmpegが必要です。開発と検証は**Windows 11**で行いました。
@@ -119,7 +135,7 @@ python -m venv .venv
 | `--wav PATH` | マイク入力 | マイクの代わりに16kHzモノラルWAVファイルからのストリーミングをシミュレート |
 | `--no-realtime` | オフ | `--wav`使用時、チャンク間でスリープしない（高速バッチ処理） |
 | `--input {mic,wav,ws}` | mic、`--wav`指定時はwav | 音声入力元。`ws`はネットワーク経由で音声を受け付ける（上記参照） |
-| `--ws-host HOST` | `0.0.0.0` | `--input ws`の`/ingest`エンドポイントのバインドホスト |
+| `--ws-host HOST` | `127.0.0.1` | `--input ws`の`/ingest`エンドポイントのバインドホスト。LANクライアントを受け付けるには`0.0.0.0`を指定 |
 | `--ws-port PORT` | 8766 | `--input ws`の`/ingest`エンドポイントのポート |
 | `--threads N` | 4 | モデルごとの推論スレッド数 |
 | `--no-partial` | オフ | 発話中の速報字幕を無効化 |
