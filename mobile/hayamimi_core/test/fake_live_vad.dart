@@ -26,16 +26,31 @@ class FakeLiveVad implements LiveVad {
 
   /// Handed over one per subsequent accepted frame, as if the speaker had
   /// just paused: the segment ends and [isSpeechDetected] goes false.
-  final Queue<Float32List> segmentsPerFrame = Queue<Float32List>();
+  ///
+  /// Each carries where it started, in samples from this VAD's first
+  /// frame, because that is what the session's pre-roll works from — see
+  /// `PrerollHistory`. Use [segment] to build one.
+  final Queue<LiveSpeechSegment> segmentsPerFrame = Queue<LiveSpeechSegment>();
 
   /// Handed over on [flush] instead — what a session stopping, or a debug
   /// wav file ending, produces.
-  Float32List? flushSegment;
+  LiveSpeechSegment? flushSegment;
 
   int flushCount = 0;
   bool freed = false;
 
-  final Queue<Float32List> _ready = Queue<Float32List>();
+  final Queue<LiveSpeechSegment> _ready = Queue<LiveSpeechSegment>();
+
+  /// A segment of [seconds] of silence claiming to start [startSample]
+  /// samples into the session.
+  static LiveSpeechSegment segment(
+    double seconds, {
+    int startSample = 0,
+    int sampleRate = 16000,
+  }) => LiveSpeechSegment(
+    samples: Float32List((seconds * sampleRate).round()),
+    startSample: startSample,
+  );
 
   @override
   void acceptWaveform(Float32List frame) {
@@ -53,7 +68,7 @@ class FakeLiveVad implements LiveVad {
   bool get hasSegment => _ready.isNotEmpty;
 
   @override
-  Float32List takeSegment() => _ready.removeFirst();
+  LiveSpeechSegment takeSegment() => _ready.removeFirst();
 
   @override
   void flush() {

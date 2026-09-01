@@ -21,6 +21,7 @@ import 'live_vad.dart';
 import 'model_load_event.dart';
 import 'native_model_loader.dart';
 import 'pcm_frame_buffer.dart';
+import 'preroll.dart';
 import 'refine_pass.dart';
 import 'speech_segment_filter.dart';
 import 'vad_sensitivity.dart';
@@ -65,8 +66,9 @@ class LiveTranscriberException implements Exception {
 /// This class owns the mic stream, the native VAD/recognizer handles, and
 /// the glue between them, so it isn't unit-testable on its own (it needs a
 /// real device/emulator mic and the sherpa-onnx native libs). The pure
-/// pieces it's built from — [pcm16BytesToFloat32], [PcmFrameBuffer], and
-/// [isSegmentWorthDecoding] — are unit tested separately.
+/// pieces it's built from — [pcm16BytesToFloat32], [PcmFrameBuffer],
+/// [isSegmentWorthDecoding] and [PrerollHistory] — are unit tested
+/// separately.
 ///
 /// Threading: neither model loading nor decoding runs on the caller's
 /// isolate. Loading happens on short-lived background isolates (see
@@ -87,6 +89,10 @@ class LiveTranscriber {
   /// unchanged. All six must be positive and finite; an out-of-range value
   /// throws [ArgumentError] here (and from the property setters) rather
   /// than silently misbehaving mid-session.
+  ///
+  /// [prerollSeconds] (see `preroll.dart`) is the seventh knob and the one
+  /// exception to that rule: it may be 0, which turns pre-roll off, and
+  /// only a negative or non-finite value throws.
   ///
   /// Validation runs before [recorder] is defaulted to a fresh
   /// `AudioRecorder()` (Dart evaluates an initializer list left to right):
@@ -112,7 +118,12 @@ class LiveTranscriber {
     double autoRefineSilenceSeconds = defaultAutoRefineSilenceSeconds,
     double autoRefineMaxBufferedSeconds = defaultAutoRefineMaxBufferedSeconds,
     double refineBufferMaxSeconds = defaultRefineBufferMaxSeconds,
-  }) : _draftIntervalSeconds = _requirePositive(
+    double prerollSeconds = defaultPrerollSeconds,
+  }) : _prerollSeconds = _requireNonNegative(
+         prerollSeconds,
+         'prerollSeconds',
+       ),
+       _draftIntervalSeconds = _requirePositive(
          draftIntervalSeconds,
          'draftIntervalSeconds',
        ),
@@ -154,6 +165,19 @@ class LiveTranscriber {
     return value;
   }
 
+  /// Same as [_requirePositive] but allows zero, for [prerollSeconds]: zero
+  /// is the meaningful "no pre-roll at all" setting, not a mistake.
+  static double _requireNonNegative(double value, String name) {
+    if (!value.isFinite || value < 0) {
+      throw ArgumentError.value(
+        value,
+        name,
+        'must be a non-negative, finite number',
+      );
+    }
+    return value;
+  }
+
   final AudioRecorder _recorder;
   final DecodeWorker Function() _decodeWorkerFactory;
   final LiveVadFactory _vadFactory;
@@ -168,6 +192,18 @@ class LiveTranscriber {
   final _sessionResetController = StreamController<void>.broadcast();
 
   LiveVad? _vad;
+  // The audio a segment's pre-roll is taken from: every frame fed to the
+  // VAD is also pushed here, so a segment can be extended backwards past
+  // the onset the VAD reported (see preroll.dart for why that is needed).
+  // Built alongside the VAD, dropped with it.
+  PrerollHistory? _prerollHistory;
+  // How much audio this session has fed its VAD(s) in total, and how much
+  // it had fed when the CURRENT VAD instance was installed. A VAD counts
+  // samples from its own first frame, so a mid-session sensitivity swap
+  // resets that count to zero; adding the origin back is what keeps
+  // segment positions on one continuous session clock.
+  int _samplesFedToVad = 0;
+  int _vadSampleOrigin = 0;
   // The worker isolate that owns this session's recognizer(s), and the
   // queue in front of it. Null between sessions; built by
   // _buildNativeState, shut down by _teardownNativeState.
@@ -229,6 +265,7 @@ class LiveTranscriber {
   double _minDraftAudioSeconds;
   double _autoRefineSilenceSeconds;
   double _autoRefineMaxBufferedSeconds;
+  double _prerollSeconds;
   bool _debugStreaming = false;
   bool _debugStreamCancelRequested = false;
   // Set synchronously by [start]/[startDebugWavStream] before their first
@@ -293,6 +330,26 @@ class LiveTranscriber {
         value,
         'autoRefineMaxBufferedSeconds',
       );
+
+  /// How much audio from before a segment's detected onset is prepended to
+  /// it before decoding, in seconds. Defaults to [defaultPrerollSeconds].
+  ///
+  /// Silero VAD reports a speech onset slightly late, so the samples it
+  /// hands over can start partway into the first word and the recognizer
+  /// then transcribes that word wrong (`資料は` came back as `昨日は` on the
+  /// Android emulator). Prepending the audio recorded just before the
+  /// onset gives the recognizer the run-up it needs. That audio counts as
+  /// part of the segment: it is what gets decoded, what
+  /// [LiveTranscriptEntry.audioSeconds] reports, and what the refine
+  /// ("清書") buffer stores.
+  ///
+  /// Runtime-settable, applying from the next segment onward, without
+  /// touching any native model. Unlike the other knobs, `0` is allowed and
+  /// means "no pre-roll", i.e. decode exactly what the VAD delimited;
+  /// negative or non-finite values throw [ArgumentError].
+  double get prerollSeconds => _prerollSeconds;
+  set prerollSeconds(double value) =>
+      _prerollSeconds = _requireNonNegative(value, 'prerollSeconds');
 
   /// Hard cap (seconds) on how much audio the refine buffer holds before it
   /// starts dropping the oldest segment. Defaults to
@@ -735,6 +792,9 @@ class LiveTranscriber {
       ms: vadStopwatch.elapsedMicroseconds / 1000,
     );
     _frameBuffer = PcmFrameBuffer(frameSize: vad.frameSize);
+    _prerollHistory = PrerollHistory(sampleRate: sampleRate);
+    _samplesFedToVad = 0;
+    _vadSampleOrigin = 0;
   }
 
   void _emitModelLoad({
@@ -803,6 +863,11 @@ class LiveTranscriber {
     if (vad == null) {
       return;
     }
+    // Recorded before the VAD sees it, on the same clock the VAD counts
+    // on, so a segment the VAD reports can be extended backwards into the
+    // audio that preceded it.
+    _prerollHistory?.push(frame);
+    _samplesFedToVad += frame.length;
     vad.acceptWaveform(frame);
 
     // Accumulate this VAD window for the draft pass while a segment is in
@@ -849,24 +914,53 @@ class LiveTranscriber {
       return;
     }
     while (vad.hasSegment) {
-      final samples = vad.takeSegment();
+      final segment = vad.takeSegment();
       // The segment just taken supersedes whatever the draft pass had
       // accumulated for it -- the real (properly routed/decoded) final is
       // about to replace any draft the UI was showing.
       _clearDraftFrames();
       _draftSegmentActive = false;
-      _decodeSegment(samples);
+      _decodeSegment(segment);
     }
   }
 
-  void _decodeSegment(Float32List samples) {
-    if (!isSegmentWorthDecoding(samples, sampleRate: sampleRate)) {
+  void _decodeSegment(LiveSpeechSegment segment) {
+    // Judged on what the VAD actually delimited, before any pre-roll is
+    // added: pre-roll is context, not speech, and letting a second of it
+    // pad a 0.1s blip past the minimum would send near-silence to the
+    // recognizer for no reason.
+    final worthDecoding = isSegmentWorthDecoding(
+      segment.samples,
+      sampleRate: sampleRate,
+    );
+    // Extended even when the segment is about to be dropped, because this
+    // call is also what moves the history's "do not reach back past here"
+    // marker: skipping it would let the NEXT segment's pre-roll cover this
+    // one's audio. Same order the desktop pipeline's drain_segments uses.
+    final samples = _withPreroll(segment);
+    if (!worthDecoding) {
       return;
     }
     // Queued at the worker, never dropped, and answered in the order the
     // segments closed -- so the transcript keeps the order the speaker
     // said things in even when several segments finish back to back.
     _decode?.submitFinal(samples);
+  }
+
+  /// Gives [segment] the audio recorded just before the VAD noticed it,
+  /// which is what stops an utterance-initial word being clipped (see
+  /// `preroll.dart`). Returns the segment's own samples unchanged when
+  /// [prerollSeconds] is 0, or when there is no history to draw on.
+  Float32List _withPreroll(LiveSpeechSegment segment) {
+    final history = _prerollHistory;
+    if (history == null) {
+      return segment.samples;
+    }
+    return history.withPreroll(
+      segmentStartSample: _vadSampleOrigin + segment.startSample,
+      samples: segment.samples,
+      prerollSeconds: _prerollSeconds,
+    );
   }
 
   /// Turns one finished segment's decode into a transcript line and files
@@ -1171,6 +1265,7 @@ class LiveTranscriber {
     // safe swap point.
     _pendingVadInstall?.free();
     _pendingVadInstall = null;
+    _prerollHistory = null;
     _vadModelPath = null;
     // The decode worker owns this session's recognizer handles and is the
     // only isolate allowed to free them, so ending the session means
@@ -1337,6 +1432,11 @@ class LiveTranscriber {
     _pendingVadInstall = null;
     final old = _vad;
     _vad = pending;
+    // The replacement has been fed nothing yet, so its own sample counter
+    // starts at zero here. Remembering where "here" falls on the session
+    // clock keeps segment positions -- and therefore pre-roll -- correct
+    // across the swap.
+    _vadSampleOrigin = _samplesFedToVad;
     old?.free();
   }
 

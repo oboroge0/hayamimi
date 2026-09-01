@@ -394,7 +394,7 @@ void main() {
 
   group('stop', () {
     test('emits the segment its VAD flush produces before returning', () async {
-      h.vads.setUp = (vad) => vad.flushSegment = _samples(1.0);
+      h.vads.setUp = (vad) => vad.flushSegment = FakeLiveVad.segment(1.0);
       await h.start();
 
       final stopping = h.transcriber.stop();
@@ -431,10 +431,87 @@ void main() {
     });
   });
 
+  group('pre-roll', () {
+    // Silero VAD reports a speech onset slightly late, so a session decodes
+    // the second before the onset along with the segment (see
+    // preroll.dart). What is checked here is the wiring: that the audio
+    // actually sent to the worker grew, that the reported duration grew
+    // with it, and that two segments in a row do not both claim the gap
+    // between them.
+
+    test('a final is decoded with the second of audio before its onset', () async {
+      await h.start();
+      // 1.28s of session audio before the segment the VAD reports at 1.28s.
+      await h.pushFrames(40);
+
+      await h.endSegment(seconds: 1.0, startSample: 40 * 512);
+      expect(h.worker.lastRequest.samples.length, 16000 + 16000);
+
+      h.worker.reply('one line');
+      await settle();
+
+      // The pre-roll is part of the segment, so it is part of what the
+      // entry says it covered.
+      expect(h.entries.single.audioSeconds, closeTo(2.0, 1e-9));
+      expect(h.transcriber.refineBufferedSeconds, closeTo(2.0, 1e-9));
+    });
+
+    test('two segments in a row do not both include the gap between them', () async {
+      await h.start();
+      await h.pushFrames(60);
+
+      // 0.5s of speech starting half a second in: nothing before it has
+      // been claimed, so it takes its full half second of run-up.
+      await h.endSegment(seconds: 0.5, startSample: 8000);
+      expect(h.worker.lastRequest.samples.length, 8000 + 8000);
+      h.worker.reply('first');
+      await settle();
+
+      // The next starts 0.25s after the first ended. A full second of
+      // pre-roll would reach back into it; it gets the 0.25s gap instead.
+      await h.endSegment(seconds: 0.5, startSample: 20000);
+      expect(h.worker.lastRequest.samples.length, 4000 + 8000);
+      h.worker.reply('second');
+      await settle();
+
+      // 1.75s of session audio, decoded as 1.75s across two lines.
+      expect(h.entries[0].audioSeconds, closeTo(1.0, 1e-9));
+      expect(h.entries[1].audioSeconds, closeTo(0.75, 1e-9));
+    });
+
+    test('prerollSeconds = 0 decodes exactly what the VAD delimited', () async {
+      h.transcriber.prerollSeconds = 0;
+      await h.start();
+      await h.pushFrames(40);
+
+      await h.endSegment(seconds: 1.0, startSample: 40 * 512);
+
+      expect(h.worker.lastRequest.samples.length, 16000);
+      h.worker.reply('one line');
+      await settle();
+      expect(h.entries.single.audioSeconds, closeTo(1.0, 1e-9));
+    });
+
+    test('a segment dropped as too short still blocks the next pre-roll', () async {
+      // A blip the app-level guard throws away never reaches the worker,
+      // but the audio it covered has still been accounted for -- the next
+      // segment must not pick it up as context.
+      await h.start();
+      await h.pushFrames(60);
+
+      await h.endSegment(seconds: 0.05, startSample: 16000);
+      expect(h.worker.decodeRequests, isEmpty);
+
+      await h.endSegment(seconds: 0.5, startSample: 20000);
+      // 16000 + 800 = 16800, so only 3200 samples of gap are available.
+      expect(h.worker.lastRequest.samples.length, 3200 + 8000);
+    });
+  });
+
   group('startDebugWavStream', () {
     test('feeds the whole file through and flushes its last segment', () async {
       h.workerSetUp = (worker) => worker.autoReplyText = 'flushed line';
-      h.vads.setUp = (vad) => vad.flushSegment = _samples(1.0);
+      h.vads.setUp = (vad) => vad.flushSegment = FakeLiveVad.segment(1.0);
       final wavPath = h.writeWav(sampleCount: 4096);
 
       await h.transcriber.startDebugWavStream(
@@ -562,8 +639,19 @@ class _Harness {
 
   /// Ends a speech segment carrying [seconds] of audio, the way a speaker
   /// pausing does.
-  Future<void> endSegment({required double seconds}) async {
-    vad.segmentsPerFrame.add(_samples(seconds));
+  ///
+  /// [startSample] is where the VAD claims the segment began, counted in
+  /// samples from the session's first frame — what the pre-roll is measured
+  /// back from. It defaults to 0, i.e. "at the very start of the session",
+  /// which leaves nothing in front of the segment to prepend and so keeps
+  /// the audio a test sees equal to what it queued.
+  Future<void> endSegment({
+    required double seconds,
+    int startSample = 0,
+  }) async {
+    vad.segmentsPerFrame.add(
+      FakeLiveVad.segment(seconds, startSample: startSample),
+    );
     await pushFrames(1);
   }
 
@@ -597,8 +685,6 @@ class _Harness {
   }
 }
 
-Float32List _samples(double seconds, {int sampleRate = 16000}) =>
-    Float32List((seconds * sampleRate).round());
 
 /// A canonical 44-byte-header, 16-bit PCM wav of silence.
 Uint8List _wavBytes({
