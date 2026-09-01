@@ -358,7 +358,7 @@ void main() {
 
       expect(
         h.refines.single.text,
-        '東京の天気は晴れです。 あしたの会議は十時からです。 資料は昨日送りました。',
+        '東京の天気は晴れです。あしたの会議は十時からです。資料は昨日送りました。',
       );
       expect(h.refines.single.text, contains('。'));
       expect(h.refines.single.punctuated, isTrue);
