@@ -13,8 +13,10 @@ class ModelLoadEvent {
 
   /// Which native model this phase is about: `"vad"` (both the initial
   /// build and any [LiveTranscriber.setVadSensitivity] rebuild),
-  /// `"recognizer"` (the plain, non-routed path's single model), or for
-  /// [RoutingProfile.jaSenseVoice]: `"ja"`, `"sensevoice"`, `"lid"`.
+  /// `"recognizer"` (the plain, non-routed path's single model), for
+  /// [RoutingProfile.jaSenseVoice]: `"ja"`, `"sensevoice"`, `"lid"`, and
+  /// `"punct"` (the Japanese punctuation model, when `start` was given a
+  /// `JaPunctuation` — it loads last, after the recognizers).
   final String model;
 
   /// `"start"` right before the background-isolate build call, `"done"`

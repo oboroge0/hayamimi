@@ -18,9 +18,27 @@
 /// to justify. The worker calls `sherpa_onnx.initBindings()` itself, as
 /// every isolate that touches the FFI bindings must.
 ///
+/// The Japanese punctuation model lives here for the same reason. Its
+/// `restore()` is another synchronous native call, tens of milliseconds per
+/// refine on the Windows x86 host the parity test runs on (see the README's
+/// punctuation section for the measurement and its conditions; no phone was
+/// measured), so running it on the caller's isolate would hand back the
+/// pause that moving decoding here removed.
+///
+/// Only refine ("清書") results are punctuated. That is where the desktop
+/// pipeline punctuates, and it is the pass with the context to do it well:
+/// a refine re-decodes a whole buffered group, while a final covers one
+/// speech segment and a draft covers part of one still being spoken, so
+/// sentence boundaries there fall wherever the speaker paused. Punctuating
+/// every final would also add a full model run to every utterance, on a
+/// phone, for a line the next refine replaces. Finals and drafts therefore
+/// come back exactly as the recognizer produced them, with
+/// [DecodeWorkerResult.punctuated] false.
+///
 /// Ownership, stated once: from `initBindings` to the [DecodeRequestKind.shutdown]
 /// ack, exactly one isolate — this one — creates, uses and frees the
-/// recognizer handles. The caller's isolate never holds a pointer to them.
+/// recognizer handles and the punctuation session. The caller's isolate
+/// never holds a pointer to them.
 library;
 
 import 'dart:async';
@@ -30,6 +48,7 @@ import 'dart:isolate';
 import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa_onnx;
 
 import '../bench/model_file_resolver.dart';
+import '../punct/punctuator_ja.dart';
 import '../routing/routed_recognizer.dart';
 import 'decode_protocol.dart';
 
@@ -307,6 +326,19 @@ Future<void> decodeWorkerMain(List<Object?> bootstrap) async {
 
   sherpa_onnx.OfflineRecognizer? recognizer;
   RoutedRecognizerSet? routed;
+  PunctuatorJa? punctuator;
+
+  // The punctuation model loads *after* the recognizers, so a build that
+  // gets that far has native handles to release before reporting the
+  // failure -- the caller is told the session did not start, and nothing
+  // may be left allocated in an isolate that is about to exit.
+  void reportBuildFailure(String message) {
+    recognizer?.free();
+    routed?.free();
+    toMain.send(DecodeWorkerBuildFailed(message).toMessage());
+    commands.close();
+  }
+
   try {
     if (config.routed) {
       final senseVoiceModelDir = config.senseVoiceModelDir;
@@ -340,17 +372,23 @@ Future<void> decodeWorkerMain(List<Object?> bootstrap) async {
     } else {
       recognizer = await _buildPlainRecognizer(config, toMain);
     }
+    punctuator = await loadWorkerPunctuator(
+      config,
+      onModelLoad: (event) => toMain.send(event.toMessage()),
+    );
   } on RoutedRecognizerException catch (e) {
-    toMain.send(DecodeWorkerBuildFailed(e.message).toMessage());
-    commands.close();
+    reportBuildFailure(e.message);
     return;
   } on ModelFileResolutionException catch (e) {
-    toMain.send(DecodeWorkerBuildFailed(e.message).toMessage());
-    commands.close();
+    reportBuildFailure(e.message);
+    return;
+  } on DecodeWorkerException catch (e) {
+    // What loadWorkerPunctuator throws: its message already names the
+    // punctuation model, so it travels as-is.
+    reportBuildFailure(e.message);
     return;
   } catch (e) {
-    toMain.send(DecodeWorkerBuildFailed('$e').toMessage());
-    commands.close();
+    reportBuildFailure('$e');
     return;
   }
   toMain.send(const DecodeWorkerReady().toMessage());
@@ -360,6 +398,7 @@ Future<void> decodeWorkerMain(List<Object?> bootstrap) async {
     if (command.kind == DecodeRequestKind.shutdown) {
       recognizer?.free();
       routed?.free();
+      punctuator?.dispose();
       toMain.send(
         DecodeWorkerAck(id: command.id, kind: command.kind).toMessage(),
       );
@@ -382,16 +421,30 @@ Future<void> decodeWorkerMain(List<Object?> bootstrap) async {
         recognizer: recognizer,
         routed: routed,
       );
+      // Punctuation is part of producing this result, so it is inside the
+      // timed section and inside the same try: a restore() that throws
+      // loses this one refine the way a decode that throws does, and leaves
+      // the session running.
+      final punct = punctuator;
+      var outText = text;
+      var punctuated = false;
+      if (punct != null &&
+          request.kind == DecodeRequestKind.refine &&
+          config.shouldPunctuateRefine(lang: lang)) {
+        outText = punct.restore(text);
+        punctuated = true;
+      }
       stopwatch.stop();
       toMain.send(
         DecodeWorkerResult(
           id: request.id,
           kind: request.kind,
           segmentId: request.segmentId,
-          text: text,
+          text: outText,
           lang: lang,
           switched: switched,
           latencyMs: stopwatch.elapsedMicroseconds / 1000,
+          punctuated: punctuated,
         ).toMessage(),
       );
     } catch (e) {
@@ -497,4 +550,74 @@ Future<sherpa_onnx.OfflineRecognizer> _buildPlainRecognizer(
     ).toMessage(),
   );
   return recognizer;
+}
+
+/// Builds the Japanese punctuation model [config] asks for, or returns
+/// `null` when it asks for none.
+///
+/// Loading it last is deliberate: the recognizers are what the session
+/// cannot run without, and the punctuation model is 181.8 MB on top of
+/// them, so a device that is going to run out of memory does so after the
+/// part that matters has had its chance. Progress is reported as
+/// `model: 'punct'` on the same `model_load` `start`/`done` events every
+/// other model uses, with the measured elapsed milliseconds on `done`.
+///
+/// A failure here throws [DecodeWorkerException] with a message naming the
+/// files, which the worker turns into a build failure and
+/// `LiveTranscriber.start` rethrows: a missing 182 MB file on a phone is a
+/// configuration mistake, and starting a session that silently produces
+/// unpunctuated text would hide it.
+///
+/// Called by the worker isolate. It is public, and takes a callback rather
+/// than the worker's `SendPort`, so a test can build exactly what a given
+/// config would build without spawning an isolate — which is as close to
+/// the real worker as a `flutter test` run can get, since the recognizers
+/// beside it need native libraries no test VM can load.
+Future<PunctuatorJa?> loadWorkerPunctuator(
+  DecodeWorkerConfig config, {
+  void Function(DecodeWorkerModelLoad event)? onModelLoad,
+}) async {
+  final modelPath = config.punctModelPath;
+  final vocabPath = config.punctVocabPath;
+  if (modelPath == null && vocabPath == null) {
+    return null;
+  }
+  if (modelPath == null || vocabPath == null) {
+    // Unreachable through JaPunctuation, which requires both, and caught by
+    // an assert in DecodeWorkerConfig in debug builds. Said out loud for
+    // anyone driving the worker directly in a release build.
+    throw DecodeWorkerException(
+      'The Japanese punctuation model needs both punctModelPath and '
+      'punctVocabPath; only '
+      '${modelPath == null ? 'the vocabulary' : 'the model'} was given.',
+    );
+  }
+
+  onModelLoad?.call(
+    const DecodeWorkerModelLoad(model: 'punct', phase: 'start'),
+  );
+  final stopwatch = Stopwatch()..start();
+  final PunctuatorJa punctuator;
+  try {
+    punctuator = await PunctuatorJa.load(
+      modelPath: modelPath,
+      vocabPath: vocabPath,
+      libraryPath: config.punctLibraryPath,
+      intraOpNumThreads: config.punctNumThreads,
+    );
+  } catch (e) {
+    throw DecodeWorkerException(
+      'Could not load the Japanese punctuation model "$modelPath" '
+      '(vocabulary "$vocabPath"): $e',
+    );
+  }
+  stopwatch.stop();
+  onModelLoad?.call(
+    DecodeWorkerModelLoad(
+      model: 'punct',
+      phase: 'done',
+      ms: stopwatch.elapsedMicroseconds / 1000,
+    ),
+  );
+  return punctuator;
 }
