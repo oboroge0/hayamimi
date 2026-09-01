@@ -33,3 +33,27 @@
 * `SubtitleBroadcastServer` gained `bindAddress` (still defaults to
   `InternetAddress.anyIPv4` — the point of this server is LAN reachability)
   and `allowOrigin` (still defaults to `'*'`) constructor parameters.
+* `RemoteFinalEvent`/`FinalSubtitleEvent` (via `HayamimiRemote`) now carry
+  `audioSeconds`/`switched` from a remote server the same way the on-device
+  path does; `RemoteRefineEvent`/`RefineSubtitleEvent` gained
+  `audioSeconds`, and `RemoteRefineEvent` also gained `latencyMs` (it was
+  parsed for `final` but never for `refine`). Added `RemoteModelLoadEvent`/
+  `RemoteSessionResetEvent`, mapped onto `ModelLoadSubtitleEvent`/
+  `SessionResetSubtitleEvent` on `HayamimiRemote.events` the same way the
+  on-device versions are. `model_fallback`/`warning`/`session_summary`/
+  `recluster` frames from the desktop pipeline still fall back to
+  `RemoteUnknownEvent` — this package doesn't have typed events for them
+  yet.
+* Fixed a native-handle leak: `LiveTranscriber.start()`/
+  `startDebugWavStream()` now free whatever `_buildNativeState` managed to
+  build (e.g. a good recognizer load followed by a bad VAD model file)
+  before rethrowing, instead of leaking it with `isRunning` still `false`.
+* Fixed `setVadSensitivity()` losing its effect when called while `start()`
+  was still loading: it's now queued and applied once loading finishes,
+  instead of being silently overwritten by the in-progress `start()` call's
+  own sensitivity.
+* Fixed a race where a `setVadSensitivity()` rebuild still in flight when a
+  session was stopped and immediately restarted could land on, and
+  silently replace, the *new* session's freshly built VAD. A monotonically
+  increasing generation counter (`isVadBuildStale`) now detects this and
+  discards the stale build instead of installing it.

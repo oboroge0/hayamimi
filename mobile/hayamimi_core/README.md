@@ -471,6 +471,16 @@ reason.
 | `model_load` | `{"type":"model_load","model":...,"phase":"start"\|"done","ms":...}` | Right before and right after each native model finishes loading (`model` is `"vad"`, `"recognizer"`, or for `RoutingProfile.jaSenseVoice`: `"ja"`/`"sensevoice"`/`"lid"`), including a `setVadSensitivity` rebuild. `ms` is the elapsed build time, only set on `"done"`. |
 | `session_reset` | `{"type":"session_reset"}` | `resetSession()` finished clearing the current conversation's state. |
 
+`HayamimiRemote` speaks the same table — its underlying `RemoteEvent` parser
+(`lib/remote/remote_event.dart`) understands all seven types above (with the
+same field names) coming back from a desktop `--input ws --serve` server,
+in addition to its own connection-lifecycle frames (`ready`,
+`session_start`). The desktop pipeline also emits a few event types this
+package doesn't have a typed `RemoteEvent` for yet — `model_fallback`,
+`warning`, `session_summary`, `recluster` — which arrive as
+`RemoteUnknownEvent` on `HayamimiRemote.rawEvents` and are silently dropped
+from `HayamimiRemote.events` rather than raising an error.
+
 ## Package layout
 
 - `lib/hayamimi_core.dart` — the public export surface; start here.
