@@ -293,10 +293,22 @@ Future<void> decodeWorkerMain(List<Object?> bootstrap) async {
   RoutedRecognizerSet? routed;
   try {
     if (config.routed) {
+      final senseVoiceModelDir = config.senseVoiceModelDir;
+      final lidModelDir = config.lidModelDir;
+      if (senseVoiceModelDir == null || lidModelDir == null) {
+        // Unreachable from LiveTranscriber, which checks this before
+        // spawning anything. Said out loud anyway, because the alternative
+        // for someone driving this worker directly is a build failure that
+        // reads "Null check operator used on a null value".
+        throw RoutedRecognizerException(
+          'A routed decode worker needs both senseVoiceModelDir and '
+          'lidModelDir.',
+        );
+      }
       routed = await RoutedRecognizerSet.build(
         reazonModelDir: config.modelDir,
-        senseVoiceModelDir: config.senseVoiceModelDir!,
-        lidModelDir: config.lidModelDir!,
+        senseVoiceModelDir: senseVoiceModelDir,
+        lidModelDir: lidModelDir,
         numThreads: config.numThreads,
         sampleRate: config.sampleRate,
         decodingMethod: config.decodingMethod ?? 'modified_beam_search',
