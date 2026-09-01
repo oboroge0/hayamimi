@@ -86,6 +86,22 @@ Only one audio-producing client is accepted at a time; `scripts/ws_mic_client.py
 is a dependency-free reference client (streams a wav file at real-time pace)
 that doubles as a template for a phone/ESP32 implementation.
 
+`--input ws` binds `127.0.0.1` by default, so the endpoint is localhost-only
+until you opt in with `--ws-host 0.0.0.0` -- do that only on a network you
+trust, since `/ingest` has no authentication. The bound address is printed
+to stderr on startup either way.
+
+## Embedding in another app
+
+`scripts/realtime_transcribe.py`'s pieces (`RoutedASR`, `build_vad`,
+`run_stream`) are importable, not just CLI-only: `RoutedASR(...)` and
+`build_vad(...)` raise a catchable `asr_engine.ModelUnavailable` instead of
+letting sherpa-onnx's C++ layer call `exit()` on a missing model path, and
+`run_stream(..., stop_event=some_threading_Event)` accepts a
+`threading.Event` cancellation token so a host app running the pipeline on
+its own thread can stop it cleanly (`stop_event.set()`) without relying on
+`KeyboardInterrupt`, which only works for the CLI's own process.
+
 ## Requirements
 
 Python 3.10+ and ffmpeg on PATH. Developed and tested on **Windows 11**;
@@ -128,7 +144,7 @@ All flags are on `scripts/realtime_transcribe.py`:
 | `--wav PATH` | mic input | simulate streaming from a 16kHz mono WAV file instead of the microphone |
 | `--no-realtime` | off | with `--wav`, don't sleep between chunks (fast batch processing) |
 | `--input {mic,wav,ws}` | mic, or wav if `--wav` is given | audio source; `ws` accepts audio over the network (see below) |
-| `--ws-host HOST` | `0.0.0.0` | bind host for `--input ws`'s `/ingest` endpoint |
+| `--ws-host HOST` | `127.0.0.1` | bind host for `--input ws`'s `/ingest` endpoint; pass `0.0.0.0` to accept LAN clients |
 | `--ws-port PORT` | 8766 | port for `--input ws`'s `/ingest` endpoint |
 | `--threads N` | 4 | inference threads per model |
 | `--no-partial` | off | disable in-progress draft subtitles |
