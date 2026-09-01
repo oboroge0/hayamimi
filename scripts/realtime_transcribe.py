@@ -399,7 +399,9 @@ class Refiner:
                  speaker_labeler=None, diarizer=None, min_remap_update_s: float = 0.0,
                  joint_remap: bool = False, exclude_provisional_remap: bool = False,
                  global_recluster: bool = False,
-                 global_recluster_threshold: float = 0.65):
+                 global_recluster_threshold: float = 0.65,
+                 num_clusters_hint: str = "off",
+                 num_clusters_hint_min_s: float = 0.0):
         self.asr = asr
         self.history = history
         self.sr = sample_rate
@@ -447,6 +449,12 @@ class Refiner:
         # round.
         self.global_recluster = global_recluster
         self.global_recluster_threshold = global_recluster_threshold
+        # Round 9 (docs/DIARIZATION_PLAN.md section 19) Experiment A: see
+        # eval_diar.generate_diarize_hypothesis()'s num_clusters_hint
+        # docstring -- same "off"/"confirmed"/"confirmed-capped" modes,
+        # same min-speech-duration gate. "off" (default) is a no-op.
+        self.num_clusters_hint = num_clusters_hint
+        self.num_clusters_hint_min_s = num_clusters_hint_min_s
         self._recluster_entries: list[dict] = []
         self._recluster_group_idx = 0
         self.spans: list[tuple[int, int, str, str, str]] = []
@@ -506,7 +514,8 @@ class Refiner:
     MIN_TURN_S = 0.3  # shorter diarization turns aren't worth a separate ASR call
 
     def _emit_turns(self, buf: np.ndarray, refine_lang: str, fast_joined: str,
-                    majority_speaker: str = "") -> bool:
+                    majority_speaker: str = "", num_clusters_hint_value: int | None = None
+                    ) -> bool:
         """Multi-speaker refine path (docs/DIARIZATION_PLAN.md iterations 3-4).
 
         Re-diarizes this group's audio and, if it finds a genuine speaker
@@ -522,6 +531,16 @@ class Refiner:
         fallback for a too-short local cluster when self.min_remap_update_s
         gates it (see that attribute's comment); ignored otherwise.
 
+        num_clusters_hint_value (Round 9, docs/DIARIZATION_PLAN.md section
+        19): maybe_refine() precomputes this per self.num_clusters_hint/
+        self.num_clusters_hint_min_s (see their docstrings) using this
+        group's fast-path span count/duration and self.speaker_labeler's
+        confirmed-speaker count as of just before this call, then passes
+        the result straight to self.diarizer.process(num_clusters=). None
+        (self.num_clusters_hint == "off", or the group didn't qualify) is
+        a no-op -- FastClustering picks the count itself, unchanged from
+        every earlier round.
+
         Returns True if it printed turn-level output (caller should stop
         and skip the single-line fallback), False if it declined: no
         diarizer/labeler configured, diarization found only one speaker
@@ -533,7 +552,7 @@ class Refiner:
         if self.diarizer is None or self.speaker_labeler is None:
             return False
         try:
-            raw = self.diarizer.process(buf, self.sr)
+            raw = self.diarizer.process(buf, self.sr, num_clusters=num_clusters_hint_value)
         except Exception as exc:
             print(f"[refine] diarization failed, falling back to single-speaker line: {exc}",
                   file=sys.stderr)
@@ -773,6 +792,22 @@ class Refiner:
         speakers = [sp for _, _, _, _, sp in self.spans if sp]
         speaker = max(set(speakers), key=speakers.count) if speakers else ""
         fast_joined = " ".join(t for _, _, _, t, _ in self.spans if t.strip())
+        # Round 9 (docs/DIARIZATION_PLAN.md section 19) Experiment A: same
+        # hint computation as eval_diar.generate_diarize_hypothesis(), done
+        # here (before self.spans is cleared below) because this is the
+        # only place both the group's own fast-path span list and
+        # self.speaker_labeler's live confirmed-count are available
+        # together. n_local_segments mirrors eval_diar.py's len(group)
+        # cap for "confirmed-capped".
+        num_clusters_hint_value = None
+        if self.num_clusters_hint != "off" and self.speaker_labeler is not None:
+            group_speech_s = sum(e - s for s, e, _, _, _ in self.spans) / self.sr
+            if group_speech_s >= self.num_clusters_hint_min_s:
+                confirmed = self.speaker_labeler.num_confirmed_speakers()
+                if confirmed >= 1:
+                    num_clusters_hint_value = confirmed
+                    if self.num_clusters_hint == "confirmed-capped":
+                        num_clusters_hint_value = min(confirmed, len(self.spans))
         self.spans = []
         if len(buf) < self.sr // 2:
             return
@@ -865,7 +900,8 @@ class Refiner:
             # coherent re-decode a turn-level re-split would make sense
             # against) and so does the fallback branch below when the
             # diarizer isn't available or found only one speaker.
-            if not mixed and self._emit_turns(buf, refine_lang, fast_joined, speaker):
+            if not mixed and self._emit_turns(buf, refine_lang, fast_joined, speaker,
+                                              num_clusters_hint_value):
                 return
 
             # speaker is the majority vote over the group's canonical
@@ -1091,6 +1127,20 @@ def main():
                     metavar="T",
                     help="cosine-distance threshold for --speaker-global-recluster's "
                          "agglomerative merge stage (default 0.65).")
+    ap.add_argument("--speaker-num-clusters-hint",
+                    choices=["off", "confirmed", "confirmed-capped"], default="off",
+                    help="Round 9 (docs/DIARIZATION_PLAN.md section 19) Experiment A: pass a "
+                         "num_clusters hint to diarize.GroupDiarizer's FastClustering, derived "
+                         "from speaker_id.SpeakerLabeler.num_confirmed_speakers() at the moment "
+                         "each refine group closes. 'off' (default) is a no-op. 'confirmed' uses "
+                         "the confirmed count directly; 'confirmed-capped' additionally clamps it "
+                         "to min(confirmed, this group's fast-path span count). See "
+                         "Refiner._emit_turns()'s num_clusters_hint_value docstring.")
+    ap.add_argument("--speaker-num-clusters-hint-min-s", type=float, default=0.0, metavar="S",
+                    help="Only apply --speaker-num-clusters-hint when this refine group's total "
+                         "VAD-detected speech duration (seconds) is >= this value; below it, the "
+                         "group falls back to no hint. 0.0 (default) applies the hint to every "
+                         "group.")
     ap.add_argument("--translate", nargs="?", const="en", default=None, metavar="LANGS",
                     help="translate Japanese lines to these languages, comma-separated "
                          "(default en). en=FuguMT; any other M2M-100 target code "
@@ -1203,7 +1253,9 @@ def main():
                                                   joint_remap=args.speaker_joint_remap,
                                                   exclude_provisional_remap=args.speaker_exclude_provisional_remap,
                                                   global_recluster=args.speaker_global_recluster,
-                                                  global_recluster_threshold=args.speaker_global_recluster_threshold)
+                                                  global_recluster_threshold=args.speaker_global_recluster_threshold,
+                                                  num_clusters_hint=args.speaker_num_clusters_hint,
+                                                  num_clusters_hint_min_s=args.speaker_num_clusters_hint_min_s)
 
     def finish(sr):
         vad.flush()
