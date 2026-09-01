@@ -1,5 +1,24 @@
 ## 0.1.0
 
+* Added `PunctuatorJa`: Japanese punctuation restoration for the mobile
+  pipeline. The desktop pipeline punctuates its refine ("清書") output with
+  `scripts/punct_ja.py`, so desktop captions read as sentences while this
+  package's refine output arrived with no 、 and no 。 at all. `restore()`
+  is a Dart port of that script — the same character-level BERT model, the
+  same thresholds, the same rule-based ？ pass — pinned to the reference
+  implementation by `test/punct/punct_ja_parity_test.dart`, which replays
+  40 FLEURS ja sentences plus 11 edge cases and asserts the two produce
+  identical text. It runs the model through ONNX Runtime's C API over
+  `dart:ffi`, borrowing the runtime `sherpa_onnx` already loads rather than
+  adding a second `libonnxruntime.so` to the app (two in one Android
+  process is a known crash, k2-fsa/sherpa-onnx#3261). New dependencies:
+  `unorm_dart` (NFKC, which `dart:core` has no equivalent of) and `ffi`.
+  This is phase 1 of
+  [#15](https://github.com/oboroge0/hayamimi/issues/15): it is **not yet
+  wired into `HayamimiLive`**, and the float16 model file it needs
+  (181.8 MB) is not downloadable yet — see "Japanese punctuation
+  restoration" in the README for the platform status and what is still
+  unverified.
 * Initial extraction from `mobile/`'s app-only codebase: on-device live
   transcription (`HayamimiLive`/`LiveTranscriber`), a remote-server client
   (`HayamimiRemote`/`RemoteTranscriber`), a LAN subtitle broadcast server

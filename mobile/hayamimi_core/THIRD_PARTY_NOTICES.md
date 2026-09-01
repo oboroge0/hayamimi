@@ -78,6 +78,39 @@ evaluation -- `asr_engine.py`'s routing does not use them.
 | [pytest](https://github.com/pytest-dev/pytest) | MIT |
 | [OpenCC](https://github.com/BYVoid/OpenCC) | Apache-2.0 |
 
+## Vendored source (`hayamimi_core`)
+
+`lib/punct/ort_bindings.dart` is not original work. It is derived from the
+ffigen-generated ONNX Runtime bindings in
+[gtbluesky/onnxruntime_flutter](https://github.com/gtbluesky/onnxruntime_flutter)
+(**MIT**, Copyright (c) 2023 gtbluesky), file
+`lib/src/bindings/onnxruntime_bindings_generated.dart`, which were in turn
+generated from ONNX Runtime's `onnxruntime_c_api.h`
+([microsoft/onnxruntime](https://github.com/microsoft/onnxruntime), **MIT**,
+Copyright (c) Microsoft Corporation).
+
+Only the Dart binding declarations were taken; none of that package's native
+code, build files, or higher-level API was copied, and the package is not a
+dependency. The copy was trimmed to the ~27 C API members hayamimi calls
+and one parameter's type was corrected for Windows — both changes are
+documented in the file's own header.
+
+## Dart dependencies added for punctuation restoration
+
+| Package | License | Notes |
+|---|---|---|
+| [unorm_dart](https://pub.dev/packages/unorm_dart) | MIT (Copyright (c) 2018 Yasuhiro Shimizu) | NFKC Unicode normalization, which `dart:core` has no equivalent of and which the punctuation tokenizer needs to match the Python reference |
+| [ffi](https://pub.dev/packages/ffi) | BSD-3-Clause (Copyright 2019, the Dart project authors) | native memory allocation and C string conversion for the ONNX Runtime C API calls |
+
+## Test fixture data
+
+`test/fixtures/punct_ja_parity.json` contains 40 Japanese sentences from the
+**FLEURS** corpus ([google/fleurs](https://huggingface.co/datasets/google/fleurs),
+`ja_jp`), Copyright Google, licensed
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), with their
+punctuation removed to make unpunctuated test input. The attribution is
+repeated inside the file itself.
+
 ## Design inspiration
 
 Several integration choices in this project (the FuguMT/M2M-100 CTranslate2
