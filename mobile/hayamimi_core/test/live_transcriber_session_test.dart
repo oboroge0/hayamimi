@@ -210,8 +210,8 @@ void main() {
   group('Japanese punctuation', () {
     // The punctuation model runs inside the worker, so what a session can be
     // checked for here is what it does with a punctuated reply: it is passed
-    // through untouched, it is reported, and it does not quietly excuse a
-    // refine that lost content.
+    // through untouched, it is reported, it reaches the refine buffer, and
+    // it does not quietly excuse a refine that lost content.
 
     test('a ja refine is emitted as the worker punctuated it', () async {
       await h.start(punctuation: h.writePunctuationFiles());
@@ -232,10 +232,25 @@ void main() {
 
       expect(h.refines.single.text, '今日めっちゃ疲れたわ。もう寝る。');
       expect(h.refines.single.punctuated, isTrue);
-      // Only the refine. The final that came before it is the recognizer's
-      // own text, and says so.
+      // The final the worker sent unpunctuated stays unpunctuated and says
+      // so -- the flag reports what the worker did, it is not inferred from
+      // the session's configuration.
       expect(h.entries.single.text, '今日めっちゃ疲れたわ');
       expect(h.entries.single.punctuated, isFalse);
+    });
+
+    test('a ja final is emitted as the worker punctuated it', () async {
+      // The default now: a session with a punctuation model gets its fast
+      // line punctuated too, not only its refines.
+      await h.start(punctuation: h.writePunctuationFiles());
+      expect(h.worker.config!.punctuateFinals, isTrue);
+
+      await h.endSegment(seconds: 1.0);
+      h.worker.reply('東京の天気は晴れです。', lang: 'ja', punctuated: true);
+      await settle();
+
+      expect(h.entries.single.text, '東京の天気は晴れです。');
+      expect(h.entries.single.punctuated, isTrue);
     });
 
     test('an unpunctuated refine still reports itself as such', () async {
@@ -315,6 +330,99 @@ void main() {
 
       expect(h.refines.single.text, 'あいうえおかきくけこ、さしすせそたちつてと。');
       expect(h.refines.single.punctuated, isTrue);
+    });
+
+    test('a refine that lost content falls back to the punctuated finals', () async {
+      // The case the Android emulator hit: three sentences, each finalized
+      // fine, and a merged re-decode that comes back holding only the last
+      // of them, because this ja transducer keeps the last utterance of
+      // multi-utterance audio. The guard rejects that re-decode -- and the
+      // text it falls back to is punctuated, because the finals were.
+      await h.start(punctuation: h.writePunctuationFiles());
+
+      for (final sentence in <String>[
+        '東京の天気は晴れです。',
+        'あしたの会議は十時からです。',
+        '資料は昨日送りました。',
+      ]) {
+        await h.endSegment(seconds: 1.0);
+        h.worker.reply(sentence, lang: 'ja', punctuated: true);
+        await settle();
+      }
+
+      final refine = h.transcriber.refineNow();
+      await settle();
+      h.worker.reply('資料は昨日送りました。', lang: 'ja', punctuated: true);
+      await settle();
+      await refine;
+
+      expect(
+        h.refines.single.text,
+        '東京の天気は晴れです。 あしたの会議は十時からです。 資料は昨日送りました。',
+      );
+      expect(h.refines.single.text, contains('。'));
+      expect(h.refines.single.punctuated, isTrue);
+    });
+
+    test('the shrink comparison strips the marks off the fast text too', () async {
+      // Both sides can be punctuated now, so both are measured without
+      // their marks. Here the fast finals are mark-heavy: counted raw they
+      // are 21 characters and the 12-character re-decode looks like a loss;
+      // counted as words -- 11 against 12 -- it lost nothing.
+      await h.start(punctuation: h.writePunctuationFiles());
+
+      for (final sentence in <String>[
+        'あ、い、う、え、お。',
+        'か、き、く、け、こ。',
+      ]) {
+        await h.endSegment(seconds: 1.0);
+        h.worker.reply(sentence, lang: 'ja', punctuated: true);
+        await settle();
+      }
+      expect('あ、い、う、え、お。 か、き、く、け、こ。'.length, 21);
+
+      final refine = h.transcriber.refineNow();
+      await settle();
+      h.worker.reply('あいうえお、かきくけこ。', lang: 'ja', punctuated: true);
+      await settle();
+      await refine;
+
+      expect(h.refines.single.text, 'あいうえお、かきくけこ。');
+      expect(h.refines.single.punctuated, isTrue);
+    });
+
+    test('applyToFinals: false leaves the finals -- and the fallback -- unpunctuated', () async {
+      // The switch is honoured in the worker, which this test stands in
+      // for, so it is checked in two places: the config the session sent,
+      // and what the session does with the unpunctuated finals that follow.
+      await h.start(
+        punctuation: h.writePunctuationFiles(applyToFinals: false),
+      );
+      expect(h.worker.config!.punctuateFinals, isFalse);
+
+      for (final sentence in <String>[
+        '東京の天気は晴れです',
+        'あしたの会議は十時からです',
+        '資料は昨日送りました',
+      ]) {
+        await h.endSegment(seconds: 1.0);
+        h.worker.reply(sentence, lang: 'ja');
+        await settle();
+      }
+      expect(h.entries.every((e) => !e.punctuated), isTrue);
+
+      final refine = h.transcriber.refineNow();
+      await settle();
+      h.worker.reply('資料は昨日送りました。', lang: 'ja', punctuated: true);
+      await settle();
+      await refine;
+
+      expect(
+        h.refines.single.text,
+        '東京の天気は晴れです あしたの会議は十時からです 資料は昨日送りました',
+      );
+      expect(h.refines.single.text, isNot(contains('。')));
+      expect(h.refines.single.punctuated, isFalse);
     });
   });
 
@@ -733,13 +841,17 @@ class _Harness {
   /// Stand-ins for the punctuation model and its vocabulary. `start()`
   /// checks both files exist before it spawns anything; the fake worker
   /// never loads them, so their contents do not matter.
-  JaPunctuation writePunctuationFiles() {
+  JaPunctuation writePunctuationFiles({bool applyToFinals = true}) {
     final sep = Platform.pathSeparator;
     final model = '${modelDir.path}${sep}punct.onnx';
     final vocab = '${modelDir.path}${sep}vocab.txt';
     File(model).writeAsBytesSync(<int>[0]);
     File(vocab).writeAsStringSync('[PAD]\n');
-    return JaPunctuation(modelPath: model, vocabPath: vocab);
+    return JaPunctuation(
+      modelPath: model,
+      vocabPath: vocab,
+      applyToFinals: applyToFinals,
+    );
   }
 
   /// Delivers [count] frames' worth of microphone audio.

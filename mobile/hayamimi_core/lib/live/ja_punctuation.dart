@@ -44,6 +44,7 @@ class JaPunctuation {
     required this.vocabPath,
     this.libraryPath,
     this.numThreads = defaultPunctNumThreads,
+    this.applyToFinals = true,
   });
 
   /// The punctuation model file, e.g. `punct_bert.fp16.onnx` (181.8 MB).
@@ -63,4 +64,34 @@ class JaPunctuation {
   /// How many threads ONNX Runtime may use inside a single operator.
   /// Defaults to [defaultPunctNumThreads].
   final int numThreads;
+
+  /// Whether finalized per-segment lines are punctuated too, and not only
+  /// refine ("清書") passes. Defaults to `true`.
+  ///
+  /// Refines were punctuated first, because that is where the desktop
+  /// pipeline punctuates. But a refine does not always emit its own text: a
+  /// merged re-decode that comes back much shorter than the fast finals it
+  /// is replacing is discarded in favour of those finals joined together
+  /// (see `isRefineTextTooShort`), and if nothing punctuated them, the
+  /// refine goes out unpunctuated — losing the marks in exactly the case
+  /// the guard exists to protect. The Japanese recognizer in this repo
+  /// collapses multi-sentence audio to its last sentence, so on a group of
+  /// two or more segments that guard is the normal outcome, not the rare
+  /// one. Punctuating the finals is what gives the fallback something
+  /// punctuated to fall back to — the same thing the desktop relies on,
+  /// where the fast finals have already been through `punct_ja.py`.
+  ///
+  /// The cost is one extra run of the punctuation model per utterance
+  /// (~25-35 ms per ~11-14 characters on the Android emulator the README
+  /// measured; no phone was measured), inside the decode worker, on text
+  /// the next refine may replace anyway. Set `false` to buy that back and
+  /// keep the fast line exactly as the recognizer produced it; refines are
+  /// still punctuated, and a refine that falls back to the finals then
+  /// reports `punctuated: false` as it did before this flag existed.
+  ///
+  /// Drafts ("発話中の暫定字幕") are never punctuated either way: a draft
+  /// covers part of a segment still being spoken and is re-decoded about
+  /// once a second, so any mark placed in one is a guess about a sentence
+  /// that has not finished.
+  final bool applyToFinals;
 }

@@ -367,6 +367,12 @@ class LiveTranscriber {
       _requirePositive(value, 'refineBufferMaxSeconds');
 
   /// Finalized transcript lines, one per detected speech segment.
+  ///
+  /// When [start] was given a `punctuation` model, a line here can carry
+  /// 、 。 ？ the recognizer never produced, and says so through
+  /// [LiveTranscriptEntry.punctuated] — see `JaPunctuation.applyToFinals`,
+  /// which turns that off for this stream while leaving [refineEntries]
+  /// punctuated.
   Stream<LiveTranscriptEntry> get entries => _entriesController.stream;
 
   /// Emits `true` when the decode worker has work outstanding and `false`
@@ -382,10 +388,11 @@ class LiveTranscriber {
   /// pass, each covering everything buffered since the previous refine (or
   /// since the session started).
   ///
-  /// This is the only stream Japanese punctuation restoration touches: when
-  /// [start] was given a `punctuation` model, an entry here can carry 、 。
-  /// ？ that the recognizer never produced, and says so through
-  /// [LiveTranscriptEntry.punctuated].
+  /// When [start] was given a `punctuation` model, an entry here carries
+  /// 、 。 ？ that the recognizer never produced, and says so through
+  /// [LiveTranscriptEntry.punctuated] — including when the pass falls back
+  /// to the finals' own text, since those are punctuated too unless
+  /// `JaPunctuation.applyToFinals` said not to.
   Stream<LiveTranscriptEntry> get refineEntries => _refineEntriesController.stream;
 
   /// In-progress ("draft") decodes: one per draft re-decode while a VAD
@@ -501,18 +508,19 @@ class LiveTranscriber {
   /// fresh [start] (or [stop] + [start]).
   ///
   /// [punctuation] turns on Japanese punctuation restoration for this
-  /// session's refine ("清書") results: the recognizer emits a bare run of
-  /// characters, and the model named here puts 、 and 。 (and ？ after a
-  /// question ending) back into it, the way the desktop pipeline's
-  /// `scripts/punct_ja.py` does. `null` (the
-  /// default) leaves it off, which is what this method did before the
+  /// session: the recognizer emits a bare run of characters, and the model
+  /// named here puts 、 and 。 (and ？ after a question ending) back into
+  /// it, the way the desktop pipeline's `scripts/punct_ja.py` does. `null`
+  /// (the default) leaves it off, which is what this method did before the
   /// parameter existed. What changes when it is set:
   ///
-  ///  * only [refineEntries] is affected — [entries] and [drafts] carry the
-  ///    recognizer's text unchanged (see `decode_worker.dart` for why);
-  ///  * a routed session punctuates the refines that came back as Japanese
-  ///    and leaves the rest alone; a plain session punctuates every refine,
-  ///    so **only pass this to a plain session whose model is Japanese**;
+  ///  * [refineEntries] and [entries] are affected; [drafts] carry the
+  ///    recognizer's text unchanged (see `decode_worker.dart` for why).
+  ///    `JaPunctuation.applyToFinals: false` narrows this back to
+  ///    [refineEntries] alone;
+  ///  * a routed session punctuates what came back as Japanese and leaves
+  ///    the rest alone; a plain session punctuates everything, so **only
+  ///    pass this to a plain session whose model is Japanese**;
   ///  * each affected entry carries [LiveTranscriptEntry.punctuated];
   ///  * the model is loaded in the decode worker, after the recognizers,
   ///    and reported on [modelLoads] as `model: 'punct'`. It is another
@@ -735,10 +743,11 @@ class LiveTranscriber {
           punctVocabPath: punctuation?.vocabPath,
           punctLibraryPath: punctuation?.libraryPath,
           punctNumThreads: punctuation?.numThreads ?? defaultPunctNumThreads,
-          // Left at the default (true): for a plain single-model session
-          // there is no language tag to test, and passing a Japanese
-          // punctuation model to one is itself the statement that its model
-          // transcribes Japanese. See
+          punctuateFinals: punctuation?.applyToFinals ?? true,
+          // punctuatePlainSession is left at the default (true): for a plain
+          // single-model session there is no language tag to test, and
+          // passing a Japanese punctuation model to one is itself the
+          // statement that its model transcribes Japanese. See
           // DecodeWorkerConfig.punctuatePlainSession.
         ),
         buildRefinePayload: () => _buildRefinePayload(generation),
@@ -992,12 +1001,21 @@ class LiveTranscriber {
           lang: result.lang,
           audioSeconds: samples.length / sampleRate,
           switched: result.switched,
+          punctuated: result.punctuated,
         ),
       );
     }
     _lastSegmentAt = now;
+    // The buffered text is the punctuated one when the worker punctuated it,
+    // because this is what a refine falls back to when its merged re-decode
+    // is rejected -- see _onRefineDecoded.
     _refineBuffer.add(
-      RefineSegment(samples: samples, text: text, capturedAt: now),
+      RefineSegment(
+        samples: samples,
+        text: text,
+        capturedAt: now,
+        punctuated: result.punctuated,
+      ),
     );
   }
 
@@ -1028,19 +1046,22 @@ class LiveTranscriber {
     // shorter than the fast finals combined, trust those instead (mirrors
     // scripts/realtime_transcribe.py's Refiner).
     //
-    // The length compared is the text WITHOUT the marks the punctuation
-    // model wrote: it runs in the worker, before this, so by here a
-    // punctuated refine is several characters longer than what was actually
-    // said, and crediting it for those would let a truncated re-decode pass
-    // a check it should fail. The fast text it is compared against is never
-    // punctuated (only refines are), so only this side is stripped.
+    // The lengths compared are WITHOUT the marks the punctuation model
+    // wrote: it runs in the worker, before this, so by here a punctuated
+    // text is several characters longer than what was actually said, and
+    // crediting either side for those would tilt a comparison that is meant
+    // to be about words. Both sides can be punctuated now that finals are
+    // too, so each is stripped when it says it is.
     if (isRefineTextTooShort(
       punctuated ? withoutRestoredMarks(text) : text,
-      payload.fastText,
+      payload.fastTextPunctuated
+          ? withoutRestoredMarks(payload.fastText)
+          : payload.fastText,
     )) {
       text = payload.fastText;
-      // The fallback is the finals' own text, which no model punctuated.
-      punctuated = false;
+      // The fallback is the finals' own text, so it is punctuated exactly
+      // when they were.
+      punctuated = payload.fastTextPunctuated;
     }
     if (text.isEmpty) {
       return;
@@ -1082,6 +1103,7 @@ class LiveTranscriber {
     return RefineRequestPayload(
       samples: combined,
       fastText: combineSegmentFastText(segments),
+      fastTextPunctuated: isCombinedFastTextPunctuated(segments),
     );
   }
 

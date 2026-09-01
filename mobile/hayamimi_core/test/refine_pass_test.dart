@@ -9,6 +9,7 @@ RefineSegment _segment({
   int sampleRate = 16000,
   DateTime? capturedAt,
   double fill = 0,
+  bool punctuated = false,
 }) {
   final samples = Float32List((seconds * sampleRate).round());
   if (fill != 0) {
@@ -20,6 +21,7 @@ RefineSegment _segment({
     samples: samples,
     text: text,
     capturedAt: capturedAt ?? DateTime(2026),
+    punctuated: punctuated,
   );
 }
 
@@ -106,6 +108,43 @@ void main() {
     test('returns empty string for no usable text', () {
       final segments = [_segment(seconds: 0.1, text: ''), _segment(seconds: 0.1, text: '   ')];
       expect(combineSegmentFastText(segments), '');
+    });
+  });
+
+  group('isCombinedFastTextPunctuated', () {
+    test('true when every segment contributing text was punctuated', () {
+      final segments = [
+        _segment(seconds: 0.1, text: '東京の天気は晴れです。', punctuated: true),
+        _segment(seconds: 0.1, text: '資料は昨日送りました。', punctuated: true),
+      ];
+      expect(isCombinedFastTextPunctuated(segments), isTrue);
+    });
+
+    test('false when any contributing segment was not', () {
+      // A group half of whose finals went through the punctuation model
+      // joins into a line that is partly punctuated, which is not a line a
+      // consumer can treat as punctuated.
+      final segments = [
+        _segment(seconds: 0.1, text: '東京の天気は晴れです。', punctuated: true),
+        _segment(seconds: 0.1, text: '資料は昨日送りました'),
+      ];
+      expect(isCombinedFastTextPunctuated(segments), isFalse);
+    });
+
+    test('ignores blank segments, which contribute nothing to the join', () {
+      final segments = [
+        _segment(seconds: 0.1, text: '   '),
+        _segment(seconds: 0.1, text: '東京の天気は晴れです。', punctuated: true),
+      ];
+      expect(isCombinedFastTextPunctuated(segments), isTrue);
+    });
+
+    test('false for a group with no text at all', () {
+      expect(isCombinedFastTextPunctuated(const []), isFalse);
+      expect(
+        isCombinedFastTextPunctuated([_segment(seconds: 0.1, text: '')]),
+        isFalse,
+      );
     });
   });
 

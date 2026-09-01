@@ -84,6 +84,7 @@ class DecodeWorkerConfig {
     this.punctLibraryPath,
     this.punctNumThreads = defaultPunctNumThreads,
     this.punctuatePlainSession = true,
+    this.punctuateFinals = true,
   }) : assert(
          (punctModelPath == null) == (punctVocabPath == null),
          'Japanese punctuation needs both punctModelPath and punctVocabPath, '
@@ -147,23 +148,45 @@ class DecodeWorkerConfig {
   /// Ignored when [punctModelPath] is `null` or when [routed] is true.
   final bool punctuatePlainSession;
 
+  /// Whether [DecodeRequestKind.finalSegment] results are punctuated too,
+  /// and not only [DecodeRequestKind.refine] ones. Defaults to `true`; see
+  /// `JaPunctuation.applyToFinals`, the caller-facing switch this carries,
+  /// for why a punctuated fast line is what keeps a refine's fallback
+  /// punctuated.
+  ///
+  /// Ignored when [punctModelPath] is `null`.
+  final bool punctuateFinals;
+
   /// Whether this session loads a punctuation model at all.
   bool get hasPunctuation => punctModelPath != null && punctVocabPath != null;
 
-  /// Whether a refine result that came back as [lang] should have Japanese
+  /// Whether a [kind] result that came back as [lang] should have Japanese
   /// punctuation restored into it.
   ///
-  /// Kept here, as a pure function of the config and one result's language,
-  /// so the rule can be read and tested on its own rather than inferred
-  /// from the worker's decode loop. `lang` is `null` for a plain session,
-  /// which is why [punctuatePlainSession] exists.
+  /// Kept here, as a pure function of the config, one request's kind and one
+  /// result's language, so the rule can be read and tested on its own rather
+  /// than inferred from the worker's decode loop. `lang` is `null` for a
+  /// plain session, which is why [punctuatePlainSession] exists.
   ///
-  /// Only refine results are punctuated, so the worker checks the request
-  /// kind before calling this — see `decode_worker.dart` for why finals and
-  /// drafts are left alone.
-  bool shouldPunctuateRefine({String? lang}) {
+  /// Refines always qualify; finals do when [punctuateFinals] is set; drafts
+  /// never do — see `decode_worker.dart` for why a line that is re-decoded
+  /// every second is left alone. The two control kinds carry no text and
+  /// never reach this.
+  bool shouldPunctuate({required DecodeRequestKind kind, String? lang}) {
     if (!hasPunctuation) {
       return false;
+    }
+    switch (kind) {
+      case DecodeRequestKind.refine:
+        break;
+      case DecodeRequestKind.finalSegment:
+        if (!punctuateFinals) {
+          return false;
+        }
+      case DecodeRequestKind.draft:
+      case DecodeRequestKind.resetSession:
+      case DecodeRequestKind.shutdown:
+        return false;
     }
     return routed ? lang == 'ja' : punctuatePlainSession;
   }
@@ -183,6 +206,7 @@ class DecodeWorkerConfig {
     punctLibraryPath,
     punctNumThreads,
     punctuatePlainSession,
+    punctuateFinals,
   ];
 
   static DecodeWorkerConfig fromMessage(Object? message) {
@@ -202,6 +226,7 @@ class DecodeWorkerConfig {
       punctLibraryPath: m[11] as String?,
       punctNumThreads: m[12]! as int,
       punctuatePlainSession: m[13]! as bool,
+      punctuateFinals: m[14]! as bool,
     );
   }
 }
@@ -409,10 +434,10 @@ class DecodeWorkerResult extends DecodeWorkerMessage {
   final double latencyMs;
 
   /// Whether Japanese punctuation was restored into [text] — i.e. the
-  /// punctuation model ran on this result. Only refine results are ever
-  /// punctuated, and only when the session was started with a punctuation
-  /// model that applies to this result's language (see
-  /// [DecodeWorkerConfig.shouldPunctuateRefine]).
+  /// punctuation model ran on this result. Refines and finals can be
+  /// punctuated, drafts never are, and only when the session was started
+  /// with a punctuation model that applies to this result's language (see
+  /// [DecodeWorkerConfig.shouldPunctuate]).
   final bool punctuated;
 
   @override
