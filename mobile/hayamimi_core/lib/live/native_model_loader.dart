@@ -25,11 +25,19 @@
 ///    "You **must** call initBindings ... in every isolate"), so the
 ///    background isolate initializes its own. The calling isolate must
 ///    already have called `sherpa_onnx.initBindings()` too — it is the one
-///    that later decodes and frees — which host apps do in `main()`.
+///    that later uses and frees the handle — which host apps do in
+///    `main()`.
 ///
-/// Only *loading* moves off the caller's isolate. Decoding still runs where
-/// it is called from; see the "Threading / known limitations" section of
-/// this package's README.
+/// What still comes through here, and what does not: the Silero VAD does,
+/// because it lives on the caller's isolate afterwards — it is fed one
+/// 32 ms frame at a time, and a message round trip per frame would cost
+/// more than the `acceptWaveform` call it replaced. The recognizers do
+/// not. They are built, used and freed inside the decode worker isolate
+/// (`decode_worker.dart`), which hands no pointer to anyone, so there is no
+/// handoff there to justify. `RoutedRecognizerSet.build` still calls the
+/// helpers below when its `loadOffIsolate` argument is left at its default,
+/// which is what the debug-only `LiveTranscriber.runDebugWavRefineTest`
+/// path does; the worker passes false and builds in place.
 library;
 
 import 'dart:ffi';

@@ -34,13 +34,14 @@ const double defaultMinDraftAudioSeconds = 0.25;
 
 /// Whether it's time to fire another draft decode.
 ///
-/// [isDecoding] is the "skip, don't queue" guard: [LiveTranscriber] has
-/// exactly one recognizer thread, shared by the fast-final, refine, and
-/// draft passes. If a decode of any kind is already in flight, this returns
-/// `false` rather than letting drafts pile up behind it -- a queued draft
-/// would only delay whichever decode actually matters (the next final).
-/// The caller is expected to just try again on the next timer tick, which
-/// naturally catches up once the in-flight decode finishes.
+/// [isDecoding] is the "skip, don't queue" guard: [LiveTranscriber] sends
+/// every decode -- fast-final, refine and draft alike -- to a single
+/// worker isolate that serves them one at a time. If anything is already
+/// outstanding there, this returns `false` rather than letting drafts pile
+/// up behind it: a queued draft would only delay whichever decode actually
+/// matters (the next final), and would be superseded by that final anyway.
+/// The caller is expected to just try again on the next frame, which
+/// naturally catches up once the worker is free.
 /// Drops whole frames off the front of [frames] until their total sample
 /// count is within [maxSeconds] of [sampleRate] audio (or exactly one frame
 /// remains, even if that single frame alone exceeds the budget).

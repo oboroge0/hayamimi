@@ -156,10 +156,16 @@ class HayamimiLive {
   /// ([ModelLoadSubtitleEvent], around each [start]/[startDebugWavStream]
   /// build and each [setVadSensitivity] rebuild), and [resetSession]
   /// completions ([SessionResetSubtitleEvent]), in arrival order.
+  ///
+  /// [ErrorSubtitleEvent] also covers the decode worker isolate dying
+  /// mid-session (which stops the session, same as a revoked microphone)
+  /// and a single decode failing inside it (which loses that utterance and
+  /// leaves the session running) — see [LiveTranscriber.errors].
   Stream<SubtitleEvent> get events => _eventsController.stream;
 
-  /// Emits `true` right before a segment starts decoding and `false` right
-  /// after — useful for a busy indicator.
+  /// Emits `true` when the decode worker has work outstanding and `false`
+  /// when it runs out — useful for a busy indicator. One event per
+  /// transition, not one per decode; see [LiveTranscriber.decoding].
   Stream<bool> get decoding => _decodingController.stream;
 
   bool get isRunning => _transcriber.isRunning;
@@ -253,7 +259,9 @@ class HayamimiLive {
   /// Runs a refine ("清書") pass over everything buffered since the last
   /// refine (or session start): re-decodes it as one utterance and emits a
   /// [RefineSubtitleEvent] on [events]. Safe to call at any time; emits
-  /// nothing if there's too little buffered audio.
+  /// nothing if there's too little buffered audio. The returned future
+  /// completes once that pass's event has been emitted — see
+  /// [LiveTranscriber.refineNow] for what a second call during one does.
   Future<void> refineNow() => _transcriber.refineNow();
 
   /// Rebuilds Silero VAD off-isolate with [sensitivity] and swaps it in at
