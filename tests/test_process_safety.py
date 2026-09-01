@@ -1,19 +1,31 @@
 """Process-safety regression tests (GitHub issue #30).
 
-sherpa-onnx's C++ layer calls the process's exit() -- not a catchable Python
-exception -- when handed an empty/invalid model path. Every native
-construction in this codebase must be preceded by a file-presence check
-that raises asr_engine.ModelUnavailable instead. These tests prove the
-guard fires (and the native builder is never reached) rather than actually
-letting a bad path hit sherpa-onnx, which would crash the test process
-itself if the guard regressed.
+Two independent landmines an app embedding scripts/asr_engine.py or
+scripts/realtime_transcribe.py could hit:
 
-No ASR/VAD models are loaded here; everything is guard functions and
-monkeypatched builders, so this file is cheap to run.
+  1. sherpa-onnx's C++ layer calls the process's exit() -- not a catchable
+     Python exception -- when handed an empty/invalid model path. Every
+     native construction in this codebase must be preceded by a
+     file-presence check that raises asr_engine.ModelUnavailable instead.
+     These tests prove the guard fires (and the native builder is never
+     reached) rather than actually letting a bad path hit sherpa-onnx,
+     which would crash the test process itself if the guard regressed.
+
+  2. The live capture loop (realtime_transcribe.run_stream / mic_chunks /
+     wav_chunks) had no cancellation mechanism besides KeyboardInterrupt, so
+     an app embedding it on its own thread had no way to stop it cleanly.
+     These tests exercise the threading.Event stop token end to end.
+
+No ASR/VAD models are loaded here; everything is guard functions and stubs,
+so this file is cheap to run.
 """
 import os
 import sys
+import threading
+import time
+import types
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
@@ -96,3 +108,112 @@ def test_build_vad_raises_not_exits_when_model_missing(tmp_path, monkeypatch):
     with pytest.raises(ModelUnavailable) as exc_info:
         rt.build_vad()
     assert exc_info.value.name == "vad"
+
+
+# --- stop token: run_stream honors a threading.Event ------------------------
+
+class _StubVad:
+    """Just enough of sherpa_onnx.VoiceActivityDetector for run_stream to
+    drive without ever producing a segment -- this test is only about
+    whether the chunk loop notices stop_event, not about VAD/ASR behavior."""
+
+    def accept_waveform(self, chunk):
+        pass
+
+    def empty(self):
+        return True
+
+    def is_speech_detected(self):
+        return False
+
+    def flush(self):
+        pass
+
+
+def test_run_stream_stops_mid_wav_when_stop_event_is_set():
+    """The wav path: stop_event set from another thread must interrupt
+    run_stream before the whole (paced) file has been consumed."""
+    import realtime_transcribe as rt
+
+    sr = 16000
+    samples = np.zeros(int(5.0 * sr), dtype=np.float32)  # 5s, paced playback
+    vad = _StubVad()
+    stats = rt.SessionStats()
+    printer = rt.PartialPrinter(enabled=False)
+    stop_event = threading.Event()
+
+    def run():
+        rt.run_stream(rt.wav_chunks(samples, sr, realtime=True), vad, sr, None,
+                      stats, printer, stop_event=stop_event)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    time.sleep(0.15)
+    stop_event.set()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive(), "run_stream did not return after stop_event was set"
+    # stopped partway through 5s of paced audio -- nowhere near the full file
+    assert 0.0 < stats.total_audio_s < 5.0
+
+
+def test_run_stream_without_stop_event_runs_to_completion():
+    """Regression guard: omitting stop_event (the CLI's own KeyboardInterrupt
+    path, and every pre-existing caller) must behave exactly as before --
+    the whole chunk source is consumed."""
+    import realtime_transcribe as rt
+
+    sr = 16000
+    samples = np.zeros(int(0.2 * sr), dtype=np.float32)
+    vad = _StubVad()
+    stats = rt.SessionStats()
+    printer = rt.PartialPrinter(enabled=False)
+
+    rt.run_stream(rt.wav_chunks(samples, sr, realtime=False), vad, sr, None, stats, printer)
+
+    # wav_chunks pads its final chunk up to a full WINDOW_SIZE window, so the
+    # consumed total can exceed the raw sample count by less than one window
+    assert stats.total_audio_s >= 0.2
+    assert stats.total_audio_s < 0.2 + rt.WINDOW_SIZE / sr
+
+
+# --- stop token: mic_chunks polls instead of blocking forever ---------------
+
+class _FakeInputStream:
+    """Stand-in for sounddevice.InputStream: never actually calls back with
+    audio, just tracks that it was opened and closed like a context manager
+    should. mic_chunks() must still notice stop_event via its bounded queue
+    timeout instead of blocking on q.get() forever."""
+
+    def __init__(self, *args, callback=None, **kwargs):
+        self.callback = callback
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def test_mic_chunks_notices_stop_event_without_audio(monkeypatch):
+    import realtime_transcribe as rt
+
+    fake_sd = types.SimpleNamespace(InputStream=_FakeInputStream)
+    monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
+
+    stop_event = threading.Event()
+    gen = rt.mic_chunks(stop_event=stop_event)
+
+    def stopper():
+        time.sleep(0.05)
+        stop_event.set()
+
+    threading.Thread(target=stopper, daemon=True).start()
+
+    start = time.perf_counter()
+    with pytest.raises(StopIteration):
+        while True:
+            next(gen)
+    elapsed = time.perf_counter() - start
+    # bounded by MIC_QUEUE_TIMEOUT_S polling, not an indefinite block
+    assert elapsed < 1.0
