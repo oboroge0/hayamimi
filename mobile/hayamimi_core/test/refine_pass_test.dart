@@ -96,13 +96,40 @@ void main() {
   });
 
   group('combineSegmentFastText', () {
-    test('joins non-blank segment text with spaces', () {
+    test('joins non-blank, unpunctuated segment text with spaces', () {
       final segments = [
         _segment(seconds: 0.1, text: 'こんにちは'),
         _segment(seconds: 0.1, text: '  '),
         _segment(seconds: 0.1, text: '世界'),
       ];
       expect(combineSegmentFastText(segments), 'こんにちは 世界');
+    });
+
+    test('joins a fully punctuated group with no separator', () {
+      // Every sentence already ends in 。, so a following space would be a
+      // second, redundant separator -- not how Japanese is set.
+      final segments = [
+        _segment(seconds: 0.1, text: '東京の天気は晴れです。', punctuated: true),
+        _segment(seconds: 0.1, text: '資料は昨日送りました。', punctuated: true),
+      ];
+      expect(
+        combineSegmentFastText(segments),
+        '東京の天気は晴れです。資料は昨日送りました。',
+      );
+    });
+
+    test('falls back to spaces for a mixed group, which is not punctuated', () {
+      // isCombinedFastTextPunctuated is all-or-nothing; a group where only
+      // some finals were punctuated is not treated as punctuated, so the
+      // join keeps the space separator it needs for the unpunctuated part.
+      final segments = [
+        _segment(seconds: 0.1, text: '東京の天気は晴れです。', punctuated: true),
+        _segment(seconds: 0.1, text: '資料は昨日送りました'),
+      ];
+      expect(
+        combineSegmentFastText(segments),
+        '東京の天気は晴れです。 資料は昨日送りました',
+      );
     });
 
     test('returns empty string for no usable text', () {

@@ -114,15 +114,24 @@ Float32List combineSegmentSamples(List<RefineSegment> segments) {
   return combined;
 }
 
-/// Joins segments' fast (per-segment) text with single spaces, skipping any
-/// blank ones. Used both as the refine's fallback text (see
-/// [isRefineTextTooShort]) and to show what fell out of the fast path for
-/// comparison.
+/// Joins segments' fast (per-segment) text, skipping any blank ones. Used
+/// both as the refine's fallback text (see [isRefineTextTooShort]) and to
+/// show what fell out of the fast path for comparison.
+///
+/// When every contributing segment was punctuated
+/// ([isCombinedFastTextPunctuated]), the join uses `''`: each sentence
+/// already ends in a mark like 。, and a following space is not how Japanese
+/// is set (the desktop's own refine output for the same text has none).
+/// Otherwise the join falls back to a single space, mirroring the desktop
+/// joiner for unpunctuated text (`scripts/realtime_transcribe.py`'s
+/// `" ".join(...)`), which is still the only separator available when there
+/// is no punctuation to lean on.
 String combineSegmentFastText(List<RefineSegment> segments) {
+  final separator = isCombinedFastTextPunctuated(segments) ? '' : ' ';
   return segments
       .map((s) => s.text.trim())
       .where((t) => t.isNotEmpty)
-      .join(' ');
+      .join(separator);
 }
 
 /// Whether [combineSegmentFastText]'s output over [segments] is punctuated
