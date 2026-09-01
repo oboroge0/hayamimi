@@ -4,6 +4,7 @@ import 'bench/model_kind.dart';
 import 'live/draft_pass.dart';
 import 'live/ja_punctuation.dart';
 import 'live/live_transcriber.dart';
+import 'live/preroll.dart';
 import 'live/refine_pass.dart';
 import 'live/vad_sensitivity.dart';
 import 'routing/routing_profile.dart';
@@ -30,8 +31,8 @@ import 'server/subtitle_event.dart';
 /// await live.dispose();
 /// ```
 class HayamimiLive {
-  /// If [transcriber] is omitted, the six pacing-knob parameters
-  /// ([draftIntervalSeconds] through [refineBufferMaxSeconds]) seed the
+  /// If [transcriber] is omitted, the seven pacing-knob parameters
+  /// ([draftIntervalSeconds] through [prerollSeconds]) seed the
   /// [LiveTranscriber] this facade creates for itself -- see that class's
   /// constructor for what each one does and its `default*` constant
   /// (`draft_pass.dart`/`refine_pass.dart`) for the value a caller who
@@ -47,6 +48,7 @@ class HayamimiLive {
     double autoRefineSilenceSeconds = defaultAutoRefineSilenceSeconds,
     double autoRefineMaxBufferedSeconds = defaultAutoRefineMaxBufferedSeconds,
     double refineBufferMaxSeconds = defaultRefineBufferMaxSeconds,
+    double prerollSeconds = defaultPrerollSeconds,
   }) : _transcriber =
            transcriber ??
            LiveTranscriber(
@@ -56,6 +58,7 @@ class HayamimiLive {
              autoRefineSilenceSeconds: autoRefineSilenceSeconds,
              autoRefineMaxBufferedSeconds: autoRefineMaxBufferedSeconds,
              refineBufferMaxSeconds: refineBufferMaxSeconds,
+             prerollSeconds: prerollSeconds,
            ) {
     _entriesSubscription = _transcriber.entries.listen((entry) {
       final entryLang = entry.lang ?? lang;
@@ -223,6 +226,15 @@ class HayamimiLive {
   double get refineBufferMaxSeconds => _transcriber.refineBufferMaxSeconds;
   set refineBufferMaxSeconds(double value) =>
       _transcriber.refineBufferMaxSeconds = value;
+
+  /// How much audio from before a speech segment's detected onset is
+  /// prepended to it before decoding, in seconds. Silero VAD notices speech
+  /// slightly late, so without this the first word of an utterance can be
+  /// clipped and transcribed wrong. See [LiveTranscriber.prerollSeconds] --
+  /// same default, same runtime-settable behavior, and `0` (unlike the
+  /// other knobs) is a valid value meaning "no pre-roll".
+  double get prerollSeconds => _transcriber.prerollSeconds;
+  set prerollSeconds(double value) => _transcriber.prerollSeconds = value;
 
   /// Starts capturing mic audio and transcribing it.
   ///

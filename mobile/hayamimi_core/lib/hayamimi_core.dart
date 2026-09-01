@@ -32,6 +32,7 @@ export 'live/live_transcriber.dart';
 export 'live/live_vad.dart';
 export 'live/model_load_event.dart';
 export 'live/pcm_frame_buffer.dart' show pcm16BytesToFloat32, PcmFrameBuffer;
+export 'live/preroll.dart';
 export 'live/refine_pass.dart';
 export 'live/speech_segment_filter.dart' show isSegmentWorthDecoding;
 export 'live/vad_sensitivity.dart';
