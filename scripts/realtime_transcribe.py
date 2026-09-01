@@ -20,7 +20,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 import numpy as np
 import sherpa_onnx
 
-from asr_engine import RoutedASR
+from asr_engine import ModelUnavailable, RoutedASR
 from audio_utils import resample_linear
 
 SAMPLE_RATE = 16000
@@ -61,6 +61,13 @@ def build_vad(min_silence: float = 0.35,
     # The installed sherpa_onnx (1.13.6) SileroVadModelConfig exposes no
     # speech-padding knob (no speech_pad_ms field) alongside threshold, so
     # there is nothing to plumb through for that half of T1.
+    if not os.path.exists(VAD_MODEL):
+        # sherpa-onnx's C++ layer calls the process's exit() -- not a
+        # catchable Python exception -- when handed a missing model path
+        # (see asr_engine._KEY_FILES' comment for the same landmine on the
+        # recognizer side). Check first so an embedding app gets a
+        # catchable ModelUnavailable instead of the whole process dying.
+        raise ModelUnavailable("vad")
     cfg = sherpa_onnx.VadModelConfig(
         silero_vad=sherpa_onnx.SileroVadModelConfig(
             model=VAD_MODEL,
@@ -377,9 +384,9 @@ class TranslationWorker:
 
 
 from asr_engine import (  # shared with the engine's live correction / refine dual-LID confirm
-    ModelUnavailable, REFINE_MIN_REGROUP_S, SV_LANGS, resolve_refine_lang, script_corrected_lang,
+    REFINE_MIN_REGROUP_S, SV_LANGS, resolve_refine_lang, script_corrected_lang,
     sv_lid_tag,
-)
+)  # ModelUnavailable is imported at module top, alongside RoutedASR
 
 GROUP_GAP_S = 2.0   # this much true silence closes an utterance group
 GROUP_MAX_S = 25.0  # refine early rather than outgrow the audio history
@@ -1130,21 +1137,30 @@ def main():
               file=sys.stderr)
 
     print("loading models...", file=sys.stderr)
-    asr = RoutedASR(threads=args.threads,
-                    max_resident=args.max_resident if args.max_resident > 0 else None,
-                    hotwords_file=args.hotwords, replace_file=args.replace,
-                    lid_switch_confirm=max(args.lid_switch_confirm, 1),
-                    dual_confirm=(args.mode != "fast"),
-                    forced_lang=args.lang if args.mode == "single" else None,
-                    ja_second_opinion=args.refine_ja_second_opinion,
-                    **({"agree_threshold": args.refine_agree_threshold}
-                       if args.refine_agree_threshold is not None else {}))
+    try:
+        asr = RoutedASR(threads=args.threads,
+                        max_resident=args.max_resident if args.max_resident > 0 else None,
+                        hotwords_file=args.hotwords, replace_file=args.replace,
+                        lid_switch_confirm=max(args.lid_switch_confirm, 1),
+                        dual_confirm=(args.mode != "fast"),
+                        forced_lang=args.lang if args.mode == "single" else None,
+                        ja_second_opinion=args.refine_ja_second_opinion,
+                        **({"agree_threshold": args.refine_agree_threshold}
+                           if args.refine_agree_threshold is not None else {}))
+        vad = build_vad(args.min_silence, args.max_speech)
+    except ModelUnavailable as exc:
+        # A required model is missing under models/ -- asr_engine and
+        # build_vad() both guard sherpa-onnx's native constructors so this
+        # is a catchable exception, not the process silently exit()ing out
+        # from inside the C++ layer. Fail with a clear message instead.
+        ap.error(f"required model '{exc.name}' not found under models/ -- "
+                 f"run scripts/download_models.py")
+        return
     asr.min_switch_s = max(args.lang_switch_guard, 0.0)
     if server is not None:
         # lets /replacements and /itn_overrides on the subtitle server read
         # and update this engine's live postprocessing dictionaries
         server.asr = asr
-    vad = build_vad(args.min_silence, args.max_speech)
     stats = SessionStats()
     printer = PartialPrinter(enabled=not args.no_partial, server=server)
 
