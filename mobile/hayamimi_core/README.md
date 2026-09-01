@@ -390,10 +390,12 @@ runs, on this Windows x86 host, ONNX Runtime 1.27.1 from
 nothing about a phone.** ONNX Runtime's CPU provider has no float16 compute
 path on x86, so float16 tensors are cast to float32 and back on every
 operator; an ARM chip with a float16 vector unit is a different machine
-entirely. For scale, the same 51 inputs through the Python reference on the
-same model average 366.3 ms — that gap is between two ONNX Runtime builds
-(1.27.1 vs 1.29.0), not between the two implementations, and it was not
-investigated further.
+entirely. For scale only: the Python reference (`scripts/punct_ja.py`,
+ONNX Runtime 1.29.0, four intra-op threads, MeCab tokenization inside the
+timed call) averaged 366.3 ms on the same 51 inputs and the same model on
+this host. The two measurements differ in runtime build, thread count and
+what the timed call includes, so the gap has not been attributed to
+anything — it is recorded here, not explained.
 
 ## Runtime configuration and session control
 
