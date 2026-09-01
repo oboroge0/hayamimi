@@ -216,4 +216,25 @@ void main() {
       expect(applyQuestionMarks(''), '');
     });
   });
+
+  group('withoutRestoredMarks', () {
+    test('removes exactly the marks the restorer writes', () {
+      expect(
+        withoutRestoredMarks('今日は疲れた、もう寝る。元気ですか？'),
+        '今日は疲れたもう寝る元気ですか',
+      );
+      expect(restoredMarkCharacters, <String>{'、', '。', '？'});
+    });
+
+    test('leaves marks the restorer never writes alone', () {
+      // It recognizes these in its input but never produces one, so
+      // stripping them would change text the recognizer actually emitted.
+      expect(withoutRestoredMarks('「あい」・うえ！'), '「あい」・うえ！');
+    });
+
+    test('returns text with no marks, and empty text, unchanged', () {
+      expect(withoutRestoredMarks('あいうえお'), 'あいうえお');
+      expect(withoutRestoredMarks(''), '');
+    });
+  });
 }

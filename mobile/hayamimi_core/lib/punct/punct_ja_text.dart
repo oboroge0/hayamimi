@@ -54,6 +54,28 @@ const List<String> jaQuestionSuffixes = <String>[
   'ましたか',
 ];
 
+/// The only marks the restorer ever writes: [insertMarks] writes 、 and 。,
+/// and [applyQuestionMarks] rewrites some of those 。 as ？. Everything else
+/// in [jaPunctuationCharacters] is a mark it merely recognizes in its input.
+const Set<String> restoredMarkCharacters = <String>{'、', '。', '？'};
+
+final RegExp _restoredMarks = RegExp('[${restoredMarkCharacters.join()}]');
+
+/// Removes the marks the restorer writes, giving back a string that can be
+/// compared, by length, against text that was never punctuated.
+///
+/// Restoring punctuation makes text longer, and `isRefineTextTooShort`
+/// (`live/refine_pass.dart`) decides whether a refine pass lost content by
+/// comparing its length against the unpunctuated fast finals it replaces.
+/// Comparing a punctuated refine directly would credit it for characters
+/// nobody said — one mark per sentence or clause is enough to push a
+/// genuinely truncated result back over the threshold — so the caller
+/// strips them first. NFKC normalization, which the restorer also applies,
+/// is not undone here: it folds character *forms*, so it leaves the count
+/// alone except where it composes a two-character half-width katakana into
+/// one, which no recognizer in this package emits.
+String withoutRestoredMarks(String text) => text.replaceAll(_restoredMarks, '');
+
 /// Converts a logit to a probability, the same way the reference
 /// implementation's `1 / (1 + exp(-x))` does.
 double sigmoid(double logit) => 1.0 / (1.0 + math.exp(-logit));

@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'bench/model_kind.dart';
 import 'live/draft_pass.dart';
+import 'live/ja_punctuation.dart';
 import 'live/live_transcriber.dart';
 import 'live/refine_pass.dart';
 import 'live/vad_sensitivity.dart';
@@ -76,6 +77,7 @@ class HayamimiLive {
           lang: entryLang,
           latencyMs: entry.latencyMs,
           audioSeconds: entry.audioSeconds,
+          punctuated: entry.punctuated,
         ),
       );
     });
@@ -122,7 +124,9 @@ class HayamimiLive {
   /// the text to actually publish.
   ///
   /// Settable at any time, including mid-session: the next entry to arrive
-  /// picks up the new transform. `null` (the default) is a no-op. This is
+  /// picks up the new transform. It runs last, after Japanese punctuation
+  /// restoration if the session has it on, so a refine's text reaches it
+  /// with 、 and 。 already in place. `null` (the default) is a no-op. This is
   /// deliberately just an insertion point -- e.g. for CJK ITN
   /// (`scripts/itn_cjk.py` on the desktop side) or a user find/replace
   /// dictionary -- and does not itself implement any postprocessing.
@@ -227,6 +231,16 @@ class HayamimiLive {
   /// See [LiveTranscriber.start] for what [decodingMethod]/
   /// [vadSensitivity]/[hotwordsFile]/[hotwordsScore] do and their defaults
   /// -- forwarded through unchanged.
+  ///
+  /// [punctuation] turns on Japanese punctuation restoration: refine
+  /// ("清書") results then arrive with 、 and 。 in them instead of as an
+  /// unbroken run of characters, and their [RefineSubtitleEvent] says so
+  /// through `punctuated` (also `"punctuated"` in `toJson`, so a LAN
+  /// consumer can see it too). Nothing else changes -- [FinalSubtitleEvent]
+  /// and [PartialSubtitleEvent] carry the recognizer's text as before. The
+  /// model is loaded in the decode worker and costs 181.8 MB of memory for
+  /// the session; failing to load it fails this call. [textTransform], if
+  /// set, still runs last, on the punctuated text.
   Future<void> start({
     required String modelDir,
     required String vadModelPath,
@@ -238,6 +252,7 @@ class HayamimiLive {
     VadSensitivity? vadSensitivity,
     String? hotwordsFile,
     double hotwordsScore = 1.5,
+    JaPunctuation? punctuation,
   }) {
     return _transcriber.start(
       modelKind: modelKind,
@@ -250,6 +265,7 @@ class HayamimiLive {
       vadSensitivity: vadSensitivity,
       hotwordsFile: hotwordsFile,
       hotwordsScore: hotwordsScore,
+      punctuation: punctuation,
     );
   }
 
@@ -291,7 +307,7 @@ class HayamimiLive {
   /// microphone -- e.g. on an Android emulator, which has none. Awaits
   /// until the whole file has been fed through and any in-progress segment
   /// has been flushed and decoded. See [start] for [decodingMethod]/
-  /// [vadSensitivity]/[hotwordsFile]/[hotwordsScore].
+  /// [vadSensitivity]/[hotwordsFile]/[hotwordsScore]/[punctuation].
   Future<void> startDebugWavStream({
     required String modelDir,
     required String vadModelPath,
@@ -305,6 +321,7 @@ class HayamimiLive {
     VadSensitivity? vadSensitivity,
     String? hotwordsFile,
     double hotwordsScore = 1.5,
+    JaPunctuation? punctuation,
   }) {
     return _transcriber.startDebugWavStream(
       modelKind: modelKind,
@@ -319,6 +336,7 @@ class HayamimiLive {
       vadSensitivity: vadSensitivity,
       hotwordsFile: hotwordsFile,
       hotwordsScore: hotwordsScore,
+      punctuation: punctuation,
     );
   }
 
