@@ -1,6 +1,7 @@
 import React from "react";
 import { Composition } from "remotion";
 import { Main } from "./Main";
+import { DiarMain, DIAR_TOTAL_S } from "./DiarMain";
 import {
   FPS,
   INTRO_SECONDS,
@@ -19,13 +20,23 @@ const TOTAL_SECONDS =
 
 export const RemotionRoot: React.FC = () => {
   return (
-    <Composition
-      id="Main"
-      component={Main}
-      durationInFrames={Math.round(TOTAL_SECONDS * FPS)}
-      fps={FPS}
-      width={1920}
-      height={1080}
-    />
+    <>
+      <Composition
+        id="Main"
+        component={Main}
+        durationInFrames={Math.round(TOTAL_SECONDS * FPS)}
+        fps={FPS}
+        width={1920}
+        height={1080}
+      />
+      <Composition
+        id="DiarMain"
+        component={DiarMain}
+        durationInFrames={Math.round(DIAR_TOTAL_S * FPS)}
+        fps={FPS}
+        width={1920}
+        height={1080}
+      />
+    </>
   );
 };
