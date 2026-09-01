@@ -11,10 +11,12 @@ import '../routing/routed_recognizer.dart';
 import '../routing/routing_profile.dart';
 import 'draft_pass.dart';
 import 'live_transcript_entry.dart';
+import 'model_load_event.dart';
 import 'native_model_loader.dart';
 import 'pcm_frame_buffer.dart';
 import 'refine_pass.dart';
 import 'speech_segment_filter.dart';
+import 'vad_sensitivity.dart';
 
 /// How often the auto-refine due check ([isAutoRefineDue]) runs while a
 /// session is live and auto mode is on. Cheap (a few comparisons), so a 1s
@@ -44,10 +46,67 @@ class LiveTranscriberException implements Exception {
 /// *decoding* still runs synchronously on whichever isolate drives the mic
 /// stream — see the README's "Threading / known limitations".
 class LiveTranscriber {
-  LiveTranscriber({AudioRecorder? recorder})
-    : _recorder = recorder ?? AudioRecorder();
+  /// [draftIntervalSeconds]/[draftWindowSeconds]/[minDraftAudioSeconds]
+  /// (see `draft_pass.dart`) and [autoRefineSilenceSeconds]/
+  /// [autoRefineMaxBufferedSeconds]/[refineBufferMaxSeconds] (see
+  /// `refine_pass.dart`) seed the identically-named runtime-settable
+  /// properties below, each defaulting to that file's `default*` constant
+  /// so a caller who doesn't pass any of them gets today's pacing
+  /// unchanged. All six must be positive and finite; an out-of-range value
+  /// throws [ArgumentError] here (and from the property setters) rather
+  /// than silently misbehaving mid-session.
+  ///
+  /// Validation runs before [recorder] is defaulted to a fresh
+  /// `AudioRecorder()` (Dart evaluates an initializer list left to right):
+  /// `AudioRecorder()`'s constructor kicks off a real, asynchronous
+  /// platform-channel call under the hood, so a caller passing an invalid
+  /// knob value gets a clean, synchronous [ArgumentError] instead of also
+  /// leaking that half-started platform call.
+  LiveTranscriber({
+    AudioRecorder? recorder,
+    double draftIntervalSeconds = defaultDraftIntervalSeconds,
+    double draftWindowSeconds = defaultDraftWindowSeconds,
+    double minDraftAudioSeconds = defaultMinDraftAudioSeconds,
+    double autoRefineSilenceSeconds = defaultAutoRefineSilenceSeconds,
+    double autoRefineMaxBufferedSeconds = defaultAutoRefineMaxBufferedSeconds,
+    double refineBufferMaxSeconds = defaultRefineBufferMaxSeconds,
+  }) : _draftIntervalSeconds = _requirePositive(
+         draftIntervalSeconds,
+         'draftIntervalSeconds',
+       ),
+       _draftWindowSeconds = _requirePositive(
+         draftWindowSeconds,
+         'draftWindowSeconds',
+       ),
+       _minDraftAudioSeconds = _requirePositive(
+         minDraftAudioSeconds,
+         'minDraftAudioSeconds',
+       ),
+       _autoRefineSilenceSeconds = _requirePositive(
+         autoRefineSilenceSeconds,
+         'autoRefineSilenceSeconds',
+       ),
+       _autoRefineMaxBufferedSeconds = _requirePositive(
+         autoRefineMaxBufferedSeconds,
+         'autoRefineMaxBufferedSeconds',
+       ),
+       _refineBuffer = RefineBuffer(
+         sampleRate: sampleRate,
+         maxDurationSeconds: _requirePositive(
+           refineBufferMaxSeconds,
+           'refineBufferMaxSeconds',
+         ),
+       ),
+       _recorder = recorder ?? AudioRecorder();
 
   static const int sampleRate = 16000;
+
+  static double _requirePositive(double value, String name) {
+    if (!value.isFinite || value <= 0) {
+      throw ArgumentError.value(value, name, 'must be a positive, finite number');
+    }
+    return value;
+  }
 
   final AudioRecorder _recorder;
   final _entriesController = StreamController<LiveTranscriptEntry>.broadcast();
@@ -57,6 +116,8 @@ class LiveTranscriber {
   final _draftController = StreamController<LiveTranscriptEntry>.broadcast();
   final _errorsController =
       StreamController<LiveTranscriberException>.broadcast();
+  final _modelLoadController = StreamController<ModelLoadEvent>.broadcast();
+  final _sessionResetController = StreamController<void>.broadcast();
 
   sherpa_onnx.VoiceActivityDetector? _vad;
   sherpa_onnx.OfflineRecognizer? _recognizer;
@@ -64,6 +125,21 @@ class LiveTranscriber {
   StreamSubscription<Uint8List>? _micSubscription;
   StreamSubscription<RecordState>? _recorderStateSubscription;
   PcmFrameBuffer? _frameBuffer;
+  // Remembered from the last _buildNativeState call so setVadSensitivity
+  // can rebuild just the VAD later without the caller having to repeat the
+  // model path.
+  String? _vadModelPath;
+  VadSensitivity _vadSensitivity = VadSensitivity();
+  // The sensitivity setVadSensitivity should (re)build for once it's safe
+  // to; always the latest call wins (see setVadSensitivity's doc for the
+  // "overlapping calls" guard this implements).
+  VadSensitivity? _pendingVadSensitivity;
+  bool _vadRebuildInFlight = false;
+  // A freshly built replacement VAD, waiting for shouldSwapVadNow to allow
+  // installing it -- checked once per processed frame (_maybeSwapPendingVad,
+  // called from _processFrame) so the swap happens as soon as it's safe
+  // without polling on a timer.
+  sherpa_onnx.VoiceActivityDetector? _pendingVadInstall;
 
   // --- Draft ("発話中の暫定字幕"): while a VAD segment is still in progress,
   // periodically re-decode what's been captured of it so far and emit a
@@ -80,6 +156,15 @@ class LiveTranscriber {
   List<Float32List> _draftFrames = [];
   bool _draftSegmentActive = false;
   DateTime? _lastDraftAt;
+  // Pacing knobs, set from the constructor and re-validated on every
+  // runtime assignment through their public setters below -- see those
+  // setters' doc comments and `draft_pass.dart`/`refine_pass.dart` for what
+  // each one controls.
+  double _draftIntervalSeconds;
+  double _draftWindowSeconds;
+  double _minDraftAudioSeconds;
+  double _autoRefineSilenceSeconds;
+  double _autoRefineMaxBufferedSeconds;
   bool _debugStreaming = false;
   bool _debugStreamCancelRequested = false;
   // Set synchronously by [start]/[startDebugWavStream] before their first
@@ -95,11 +180,62 @@ class LiveTranscriber {
   // any single segment got on its own (same effect the desktop pipeline's
   // `Refiner` gets from re-decoding across segment boundaries — see
   // `scripts/realtime_transcribe.py`). No punctuation-restoration model is
-  // layered on top of this; it's re-decode only.
-  final RefineBuffer _refineBuffer = RefineBuffer(sampleRate: sampleRate);
+  // layered on top of this; it's re-decode only. Built in the constructor
+  // initializer list above (its cap comes from the refineBufferMaxSeconds
+  // constructor parameter).
+  final RefineBuffer _refineBuffer;
   DateTime? _lastSegmentAt;
   Timer? _autoRefineTimer;
   bool _autoRefineEnabled = false;
+
+  /// How often (wall-clock seconds) a draft re-decode fires while a VAD
+  /// segment is in progress. Defaults to [defaultDraftIntervalSeconds].
+  /// Runtime-settable: a new value applies from the next due-check
+  /// ([isDraftDue]) onward, without touching any native model. Throws
+  /// [ArgumentError] for a non-positive or non-finite value.
+  double get draftIntervalSeconds => _draftIntervalSeconds;
+  set draftIntervalSeconds(double value) =>
+      _draftIntervalSeconds = _requirePositive(value, 'draftIntervalSeconds');
+
+  /// Trailing-audio cap (seconds) a draft decode re-processes. Defaults to
+  /// [defaultDraftWindowSeconds]. Runtime-settable, same caveats as
+  /// [draftIntervalSeconds].
+  double get draftWindowSeconds => _draftWindowSeconds;
+  set draftWindowSeconds(double value) =>
+      _draftWindowSeconds = _requirePositive(value, 'draftWindowSeconds');
+
+  /// Minimum accumulated audio (seconds) before a draft decode runs at all.
+  /// Defaults to [defaultMinDraftAudioSeconds]. Runtime-settable, same
+  /// caveats as [draftIntervalSeconds].
+  double get minDraftAudioSeconds => _minDraftAudioSeconds;
+  set minDraftAudioSeconds(double value) =>
+      _minDraftAudioSeconds = _requirePositive(value, 'minDraftAudioSeconds');
+
+  /// Silence gap (seconds) that fires an auto-refine when [autoRefineEnabled]
+  /// is on. Defaults to [defaultAutoRefineSilenceSeconds]. Runtime-settable:
+  /// a new value applies from the next per-second due-check onward (see
+  /// [_startAutoRefineTimer]).
+  double get autoRefineSilenceSeconds => _autoRefineSilenceSeconds;
+  set autoRefineSilenceSeconds(double value) => _autoRefineSilenceSeconds =
+      _requirePositive(value, 'autoRefineSilenceSeconds');
+
+  /// Buffered-duration ceiling (seconds) that fires an auto-refine even
+  /// without a silence gap. Defaults to [defaultAutoRefineMaxBufferedSeconds].
+  /// Runtime-settable, same caveats as [autoRefineSilenceSeconds].
+  double get autoRefineMaxBufferedSeconds => _autoRefineMaxBufferedSeconds;
+  set autoRefineMaxBufferedSeconds(double value) =>
+      _autoRefineMaxBufferedSeconds = _requirePositive(
+        value,
+        'autoRefineMaxBufferedSeconds',
+      );
+
+  /// Hard cap (seconds) on how much audio the refine buffer holds before it
+  /// starts dropping the oldest segment. Defaults to
+  /// [defaultRefineBufferMaxSeconds]. Runtime-settable: applies from the
+  /// next [RefineBuffer.add] onward, without touching any native model.
+  double get refineBufferMaxSeconds => _refineBuffer.maxDurationSeconds;
+  set refineBufferMaxSeconds(double value) => _refineBuffer.maxDurationSeconds =
+      _requirePositive(value, 'refineBufferMaxSeconds');
 
   /// Finalized transcript lines, one per detected speech segment.
   Stream<LiveTranscriptEntry> get entries => _entriesController.stream;
@@ -128,6 +264,21 @@ class LiveTranscriber {
   /// reflects reality; errors raised *by* [start] itself are thrown, not
   /// emitted here.
   Stream<LiveTranscriberException> get errors => _errorsController.stream;
+
+  /// One event right before and one right after each native model finishes
+  /// loading -- see [ModelLoadEvent] for the exact model names/phases. Lets
+  /// a host UI show which model is loading instead of treating [start] as
+  /// one opaque `Future`, which matters most for
+  /// [RoutingProfile.jaSenseVoice]'s three-model, multi-second load.
+  Stream<ModelLoadEvent> get modelLoads => _modelLoadController.stream;
+
+  /// Fires once per completed [resetSession] call that actually did
+  /// something (i.e. the session was running). Carries no data -- the
+  /// session state [resetSession] clears isn't otherwise observable on this
+  /// class, so this is purely a "something changed" signal for a listener
+  /// (`HayamimiLive` turns it into a `SessionResetSubtitleEvent` on its
+  /// `events` stream).
+  Stream<void> get sessionResets => _sessionResetController.stream;
 
   bool get isRunning => _micSubscription != null;
 
@@ -180,6 +331,29 @@ class LiveTranscriber {
   /// `native_model_loader.dart`), so awaiting this does not block the UI.
   /// A call made while a session is already running — or while an earlier
   /// [start]/[startDebugWavStream] is still loading — is a no-op.
+  ///
+  /// [decodingMethod] picks the sherpa-onnx offline-recognizer search
+  /// algorithm (e.g. `'greedy_search'`, `'modified_beam_search'`). Leaving
+  /// it `null` (the default) reproduces this method's behavior before this
+  /// parameter existed: the plain (non-routed) path used sherpa-onnx's own
+  /// `'greedy_search'` default, and the [RoutingProfile.jaSenseVoice] ja
+  /// tier used `'modified_beam_search'` (matching desktop production, see
+  /// `bench_runner.dart`) — passing a value here overrides whichever of
+  /// those applies. SenseVoice's own decode doesn't use this parameter.
+  ///
+  /// [vadSensitivity] configures Silero VAD's speech/silence detection
+  /// (threshold, minimum silence/speech durations, max segment duration —
+  /// see [VadSensitivity]); `null` (the default) uses sherpa-onnx's own
+  /// defaults, same as before this parameter existed. Change it after
+  /// [start] via [setVadSensitivity] instead of stopping and restarting the
+  /// session.
+  ///
+  /// [hotwordsFile]/[hotwordsScore] bias the recognizer toward a wordlist
+  /// (sherpa-onnx's own hotwords feature) on the plain path and the routed
+  /// ja tier; `null` (the default) leaves hotwords off. Unlike the pacing
+  /// knobs and [vadSensitivity], hotwords have no runtime setter — they're
+  /// baked into the recognizer at build time, so changing them requires a
+  /// fresh [start] (or [stop] + [start]).
   Future<void> start({
     required ModelKind modelKind,
     required String modelDir,
@@ -187,6 +361,10 @@ class LiveTranscriber {
     RoutingProfile routingProfile = RoutingProfile.jaOnly,
     String? senseVoiceModelDir,
     String? lidModelDir,
+    String? decodingMethod,
+    VadSensitivity? vadSensitivity,
+    String? hotwordsFile,
+    double hotwordsScore = 1.5,
   }) async {
     if (isRunning || _debugStreaming || _starting) {
       return;
@@ -207,6 +385,10 @@ class LiveTranscriber {
         routingProfile: routingProfile,
         senseVoiceModelDir: senseVoiceModelDir,
         lidModelDir: lidModelDir,
+        decodingMethod: decodingMethod,
+        vadSensitivity: vadSensitivity ?? _vadSensitivity,
+        hotwordsFile: hotwordsFile,
+        hotwordsScore: hotwordsScore,
       );
 
       try {
@@ -290,6 +472,10 @@ class LiveTranscriber {
     required RoutingProfile routingProfile,
     String? senseVoiceModelDir,
     String? lidModelDir,
+    String? decodingMethod,
+    required VadSensitivity vadSensitivity,
+    String? hotwordsFile,
+    double hotwordsScore = 1.5,
   }) async {
     if (!modelKind.isImplemented) {
       throw LiveTranscriberException(
@@ -320,6 +506,11 @@ class LiveTranscriber {
           reazonModelDir: modelDir,
           senseVoiceModelDir: senseVoiceModelDir,
           lidModelDir: lidModelDir,
+          decodingMethod: decodingMethod ?? 'modified_beam_search',
+          hotwordsFile: hotwordsFile,
+          hotwordsScore: hotwordsScore,
+          onModelLoad: (model, phase, ms) =>
+              _emitModelLoad(model: model, phase: phase, ms: ms),
         );
       } on RoutedRecognizerException catch (e) {
         throw LiveTranscriberException(e.message);
@@ -339,6 +530,8 @@ class LiveTranscriber {
       }
 
       final sep = Platform.pathSeparator;
+      _emitModelLoad(model: 'recognizer', phase: 'start');
+      final recognizerStopwatch = Stopwatch()..start();
       _recognizer = await buildOfflineRecognizerOffIsolate(
         sherpa_onnx.OfflineRecognizerConfig(
           model: sherpa_onnx.OfflineModelConfig(
@@ -352,19 +545,63 @@ class LiveTranscriber {
             debug: false,
             provider: 'cpu',
           ),
+          decodingMethod: decodingMethod ?? 'greedy_search',
+          hotwordsFile: hotwordsFile ?? '',
+          hotwordsScore: hotwordsScore,
         ),
+      );
+      recognizerStopwatch.stop();
+      _emitModelLoad(
+        model: 'recognizer',
+        phase: 'done',
+        ms: recognizerStopwatch.elapsedMicroseconds / 1000,
       );
     }
 
-    final vadConfig = sherpa_onnx.VadModelConfig(
-      sileroVad: sherpa_onnx.SileroVadModelConfig(model: vadModelPath),
-      sampleRate: sampleRate,
-    );
+    _vadModelPath = vadModelPath;
+    _vadSensitivity = vadSensitivity;
+    final vadConfig = _vadConfigFor(vadSensitivity, vadModelPath);
+    _emitModelLoad(model: 'vad', phase: 'start');
+    final vadStopwatch = Stopwatch()..start();
     _vad = await buildVadOffIsolate(
       config: vadConfig,
       bufferSizeInSeconds: 30,
     );
+    vadStopwatch.stop();
+    _emitModelLoad(
+      model: 'vad',
+      phase: 'done',
+      ms: vadStopwatch.elapsedMicroseconds / 1000,
+    );
     _frameBuffer = PcmFrameBuffer(frameSize: vadConfig.sileroVad.windowSize);
+  }
+
+  sherpa_onnx.VadModelConfig _vadConfigFor(
+    VadSensitivity sensitivity,
+    String vadModelPath,
+  ) {
+    return sherpa_onnx.VadModelConfig(
+      sileroVad: sherpa_onnx.SileroVadModelConfig(
+        model: vadModelPath,
+        threshold: sensitivity.threshold,
+        minSilenceDuration: sensitivity.minSilenceSeconds,
+        minSpeechDuration: sensitivity.minSpeechSeconds,
+        maxSpeechDuration: sensitivity.maxSpeechSeconds,
+      ),
+      sampleRate: sampleRate,
+    );
+  }
+
+  void _emitModelLoad({
+    required String model,
+    required String phase,
+    double? ms,
+  }) {
+    if (!_modelLoadController.isClosed) {
+      _modelLoadController.add(
+        ModelLoadEvent(model: model, phase: phase, ms: ms),
+      );
+    }
   }
 
   /// Resets per-session bookkeeping (refine buffer, draft state, auto-refine
@@ -391,6 +628,8 @@ class LiveTranscriber {
       final due = isAutoRefineDue(
         sinceLastSegment: DateTime.now().difference(lastSegmentAt),
         bufferedDurationSeconds: _refineBuffer.totalDurationSeconds,
+        silenceSeconds: _autoRefineSilenceSeconds,
+        maxBufferedSeconds: _autoRefineMaxBufferedSeconds,
       );
       if (due) {
         unawaited(refineNow());
@@ -435,12 +674,17 @@ class LiveTranscriber {
     }
     if (detected) {
       _draftFrames.add(frame);
-      _draftFrames = slideDraftFrames(_draftFrames, sampleRate: sampleRate);
+      _draftFrames = slideDraftFrames(
+        _draftFrames,
+        sampleRate: sampleRate,
+        maxSeconds: _draftWindowSeconds,
+      );
     }
     _draftSegmentActive = detected;
 
     _drainReadySegments();
     _maybeEmitDraft();
+    _maybeSwapPendingVad();
   }
 
   void _clearDraftFrames() {
@@ -500,6 +744,7 @@ class LiveTranscriber {
             text: result.text,
             timestamp: now,
             latencyMs: stopwatch.elapsedMicroseconds / 1000,
+            audioSeconds: segment.samples.length / sampleRate,
           ),
         );
         _lastSegmentAt = now;
@@ -531,6 +776,8 @@ class LiveTranscriber {
             timestamp: now,
             latencyMs: stopwatch.elapsedMicroseconds / 1000,
             lang: result.lang,
+            audioSeconds: segment.samples.length / sampleRate,
+            switched: result.switched,
           ),
         );
         _lastSegmentAt = now;
@@ -555,7 +802,11 @@ class LiveTranscriber {
     final sinceLastDraft = _lastDraftAt == null
         ? const Duration(days: 1)
         : now.difference(_lastDraftAt!);
-    if (!isDraftDue(isDecoding: _busy, sinceLastDraft: sinceLastDraft)) {
+    if (!isDraftDue(
+      isDecoding: _busy,
+      sinceLastDraft: sinceLastDraft,
+      intervalSeconds: _draftIntervalSeconds,
+    )) {
       return;
     }
     _lastDraftAt = now;
@@ -574,9 +825,9 @@ class LiveTranscriber {
     final windowed = capDraftWindow(
       combined,
       sampleRate: sampleRate,
-      maxSeconds: defaultDraftWindowSeconds,
+      maxSeconds: _draftWindowSeconds,
     );
-    if (windowed.length < sampleRate * defaultMinDraftAudioSeconds) {
+    if (windowed.length < sampleRate * _minDraftAudioSeconds) {
       return;
     }
 
@@ -689,6 +940,7 @@ class LiveTranscriber {
             timestamp: DateTime.now(),
             latencyMs: stopwatch.elapsedMicroseconds / 1000,
             lang: lang,
+            audioSeconds: combined.length / sampleRate,
           ),
         );
       }
@@ -734,6 +986,14 @@ class LiveTranscriber {
   Future<void> _teardownNativeState() async {
     _vad?.free();
     _vad = null;
+    // A rebuild that finished (or is still in flight) around the same time
+    // as this teardown has nothing left to install into -- free it rather
+    // than leaking the native handle. setVadSensitivity's own in-flight
+    // loop checks _vadModelPath (cleared below) and isRunning/_debugStreaming
+    // before trying to install anything further.
+    _pendingVadInstall?.free();
+    _pendingVadInstall = null;
+    _vadModelPath = null;
     _recognizer?.free();
     _recognizer = null;
     _routed?.free();
@@ -756,7 +1016,138 @@ class LiveTranscriber {
     await _refineEntriesController.close();
     await _draftController.close();
     await _errorsController.close();
+    await _modelLoadController.close();
+    await _sessionResetController.close();
     await _recorder.dispose();
+  }
+
+  /// Rebuilds Silero VAD off-isolate with [sensitivity] and swaps it into a
+  /// running session the moment it's safe to (see [shouldSwapVadNow]:
+  /// never mid-segment, never while another decode is in flight) --
+  /// [_maybeSwapPendingVad], called once per processed frame, is what
+  /// actually performs the swap once that moment arrives.
+  ///
+  /// If no session is running (and no debug wav stream is), [sensitivity]
+  /// is just remembered for the next [start]/[startDebugWavStream] -- there
+  /// is nothing native to rebuild against yet.
+  ///
+  /// Calling this again before an earlier call has finished replaces the
+  /// pending target rather than queueing both: only the most recently
+  /// requested [sensitivity] ever gets installed, and a build already in
+  /// flight for a now-superseded target is discarded (freed) once it
+  /// completes instead of being installed.
+  Future<void> setVadSensitivity(VadSensitivity sensitivity) async {
+    _pendingVadSensitivity = sensitivity;
+    if (!isRunning && !_debugStreaming) {
+      _vadSensitivity = sensitivity;
+      _pendingVadSensitivity = null;
+      return;
+    }
+    if (_vadRebuildInFlight) {
+      // The in-flight rebuild loop below re-reads _pendingVadSensitivity
+      // once it finishes its current build, so it will pick this newer
+      // target up on its own -- nothing more to do here.
+      return;
+    }
+    await _rebuildVadUntilCaughtUp();
+  }
+
+  Future<void> _rebuildVadUntilCaughtUp() async {
+    _vadRebuildInFlight = true;
+    try {
+      while (_pendingVadSensitivity != null) {
+        final target = _pendingVadSensitivity!;
+        _pendingVadSensitivity = null;
+
+        final vadModelPath = _vadModelPath;
+        if (vadModelPath == null) {
+          // No native state to rebuild against right now (e.g. stop() ran
+          // concurrently) -- just remember the target for next time.
+          _vadSensitivity = target;
+          continue;
+        }
+
+        _emitModelLoad(model: 'vad', phase: 'start');
+        final stopwatch = Stopwatch()..start();
+        final built = await buildVadOffIsolate(
+          config: _vadConfigFor(target, vadModelPath),
+          bufferSizeInSeconds: 30,
+        );
+        stopwatch.stop();
+        _emitModelLoad(
+          model: 'vad',
+          phase: 'done',
+          ms: stopwatch.elapsedMicroseconds / 1000,
+        );
+
+        if (_pendingVadSensitivity != null || (!isRunning && !_debugStreaming)) {
+          // Superseded by a newer call while this was building, or the
+          // session ended in the meantime -- this build is stale, free it
+          // instead of installing it.
+          built.free();
+          if (!isRunning && !_debugStreaming) {
+            _vadSensitivity = target;
+          }
+          continue;
+        }
+
+        _vadSensitivity = target;
+        _pendingVadInstall = built;
+        _maybeSwapPendingVad();
+      }
+    } finally {
+      _vadRebuildInFlight = false;
+    }
+  }
+
+  /// Installs [_pendingVadInstall] in place of [_vad] the moment
+  /// [shouldSwapVadNow] says it's safe to -- called once per processed
+  /// frame ([_processFrame]) so the swap happens as soon as possible
+  /// without polling on a timer.
+  void _maybeSwapPendingVad() {
+    final pending = _pendingVadInstall;
+    if (pending == null) {
+      return;
+    }
+    if (!shouldSwapVadNow(speechActive: _draftSegmentActive, busy: _busy)) {
+      return;
+    }
+    _pendingVadInstall = null;
+    final old = _vad;
+    _vad = pending;
+    old?.free();
+  }
+
+  /// Clears everything about the current "conversation" without touching
+  /// any loaded native model: the refine buffer, in-progress draft state,
+  /// silence timing, and (for a [RoutingProfile.jaSenseVoice] session)
+  /// which language it's currently locked to (via
+  /// [RoutedRecognizerSet.reset]). Lets a host app start a fresh
+  /// conversation -- e.g. the user tapped "new session" -- without paying
+  /// to reload up to 396 MB of model weights.
+  ///
+  /// If a decode is in flight, waits for it to finish first (so the reset
+  /// can't race a final/refine/draft write into the buffers it's about to
+  /// clear) before actually clearing anything.
+  ///
+  /// A no-op when no session ([isRunning]) or debug wav stream is active --
+  /// there is nothing to reset, and [sessionResets] does not fire.
+  Future<void> resetSession() async {
+    if (!isRunning && !_debugStreaming) {
+      return;
+    }
+    while (_busy) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+    _refineBuffer.clear();
+    _lastSegmentAt = null;
+    _clearDraftFrames();
+    _draftSegmentActive = false;
+    _lastDraftAt = null;
+    _routed?.reset();
+    if (!_sessionResetController.isClosed) {
+      _sessionResetController.add(null);
+    }
   }
 
   /// Debug-only (see `kDebugMode` at the call site in `live_page.dart`):
@@ -774,6 +1165,8 @@ class LiveTranscriber {
   /// Awaits until the whole file has been fed through and any in-progress
   /// segment has been flushed and decoded -- same shutdown behavior [stop]
   /// gives a live session.
+  /// See [start] for what [decodingMethod]/[vadSensitivity]/[hotwordsFile]/
+  /// [hotwordsScore] do -- identical meaning and defaults here.
   Future<void> startDebugWavStream({
     required ModelKind modelKind,
     required String modelDir,
@@ -783,6 +1176,10 @@ class LiveTranscriber {
     String? senseVoiceModelDir,
     String? lidModelDir,
     bool realtime = true,
+    String? decodingMethod,
+    VadSensitivity? vadSensitivity,
+    String? hotwordsFile,
+    double hotwordsScore = 1.5,
   }) async {
     if (isRunning || _debugStreaming || _starting) {
       return;
@@ -798,6 +1195,10 @@ class LiveTranscriber {
         senseVoiceModelDir: senseVoiceModelDir,
         lidModelDir: lidModelDir,
         realtime: realtime,
+        decodingMethod: decodingMethod,
+        vadSensitivity: vadSensitivity ?? _vadSensitivity,
+        hotwordsFile: hotwordsFile,
+        hotwordsScore: hotwordsScore,
       );
     } finally {
       _starting = false;
@@ -813,6 +1214,10 @@ class LiveTranscriber {
     String? senseVoiceModelDir,
     String? lidModelDir,
     required bool realtime,
+    String? decodingMethod,
+    required VadSensitivity vadSensitivity,
+    String? hotwordsFile,
+    double hotwordsScore = 1.5,
   }) async {
     final wavFile = File(wavPath);
     if (!await wavFile.exists()) {
@@ -826,6 +1231,10 @@ class LiveTranscriber {
       routingProfile: routingProfile,
       senseVoiceModelDir: senseVoiceModelDir,
       lidModelDir: lidModelDir,
+      decodingMethod: decodingMethod,
+      vadSensitivity: vadSensitivity,
+      hotwordsFile: hotwordsFile,
+      hotwordsScore: hotwordsScore,
     );
     _resetSessionState();
 
