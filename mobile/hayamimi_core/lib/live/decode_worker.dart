@@ -25,14 +25,22 @@
 /// measured), so running it on the caller's isolate would hand back the
 /// pause that moving decoding here removed.
 ///
-/// Only refine ("清書") results are punctuated. That is where the desktop
-/// pipeline punctuates, and it is the pass with the context to do it well:
-/// a refine re-decodes a whole buffered group, while a final covers one
-/// speech segment and a draft covers part of one still being spoken, so
-/// sentence boundaries there fall wherever the speaker paused. Punctuating
-/// every final would also add a full model run to every utterance, on a
-/// phone, for a line the next refine replaces. Finals and drafts therefore
-/// come back exactly as the recognizer produced them, with
+/// Refines ("清書") and finals are punctuated; drafts are not. Refines were
+/// punctuated first, because that is where the desktop pipeline punctuates
+/// and it is the pass with the most context. Finals were added because a
+/// refine does not always emit its own text: when the merged re-decode
+/// comes back much shorter than the fast finals it is replacing, the caller
+/// discards it and emits those finals joined instead, so unpunctuated
+/// finals meant an unpunctuated refine in exactly the case the guard exists
+/// for. The desktop has no such hole because its fast finals are already
+/// punctuated. That costs one model run per utterance, which is the
+/// trade-off `JaPunctuation.applyToFinals` exists to decline.
+///
+/// Drafts stay unpunctuated: a draft covers part of a segment still being
+/// spoken and is re-decoded about once a second, so a mark placed in one is
+/// a guess about a sentence that has not finished, paid for on a phone, on
+/// a line the segment's own final replaces a moment later. They come back
+/// exactly as the recognizer produced them, with
 /// [DecodeWorkerResult.punctuated] false.
 ///
 /// Ownership, stated once: from `initBindings` to the [DecodeRequestKind.shutdown]
@@ -423,14 +431,13 @@ Future<void> decodeWorkerMain(List<Object?> bootstrap) async {
       );
       // Punctuation is part of producing this result, so it is inside the
       // timed section and inside the same try: a restore() that throws
-      // loses this one refine the way a decode that throws does, and leaves
+      // loses this one result the way a decode that throws does, and leaves
       // the session running.
       final punct = punctuator;
       var outText = text;
       var punctuated = false;
       if (punct != null &&
-          request.kind == DecodeRequestKind.refine &&
-          config.shouldPunctuateRefine(lang: lang)) {
+          config.shouldPunctuate(kind: request.kind, lang: lang)) {
         outText = punct.restore(text);
         punctuated = true;
       }

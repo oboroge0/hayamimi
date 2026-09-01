@@ -41,6 +41,7 @@ void main() {
       expect(decoded.punctLibraryPath, '/lib/onnxruntime.dll');
       expect(decoded.punctNumThreads, 3);
       expect(decoded.punctuatePlainSession, isTrue);
+      expect(decoded.punctuateFinals, isTrue);
     });
 
     test('round-trips a plain session, nulls included', () {
@@ -59,6 +60,7 @@ void main() {
       expect(decoded.punctLibraryPath, isNull);
       expect(decoded.punctNumThreads, defaultPunctNumThreads);
       expect(decoded.hasPunctuation, isFalse);
+      expect(decoded.punctuateFinals, isTrue);
     });
 
     test('a plain session can say its own language is not Japanese', () {
@@ -74,12 +76,34 @@ void main() {
 
       expect(decoded.punctuatePlainSession, isFalse);
     });
+
+    test('a session can ask for refines to be punctuated but not finals', () {
+      const config = DecodeWorkerConfig(
+        routed: false,
+        modelDir: '/models/ja',
+        punctModelPath: '/models/punct/punct_bert.fp16.onnx',
+        punctVocabPath: '/models/punct/vocab.txt',
+        punctuateFinals: false,
+      );
+
+      final decoded = DecodeWorkerConfig.fromMessage(config.toMessage());
+
+      expect(decoded.punctuateFinals, isFalse);
+      expect(
+        decoded.shouldPunctuate(kind: DecodeRequestKind.refine),
+        isTrue,
+      );
+      expect(
+        decoded.shouldPunctuate(kind: DecodeRequestKind.finalSegment),
+        isFalse,
+      );
+    });
   });
 
-  group('DecodeWorkerConfig.shouldPunctuateRefine', () {
-    // The rule the worker applies to every refine result it produces, read
-    // on its own: punctuating text the model was not trained for produces
-    // nonsense rather than nothing, so each case is spelled out.
+  group('DecodeWorkerConfig.shouldPunctuate', () {
+    // The rule the worker applies to every result it produces, read on its
+    // own: punctuating text the model was not trained for produces nonsense
+    // rather than nothing, so each case is spelled out.
     const routed = DecodeWorkerConfig(
       routed: true,
       modelDir: '/models/ja',
@@ -90,12 +114,34 @@ void main() {
     );
 
     test('a routed session punctuates only what came back as Japanese', () {
-      expect(routed.shouldPunctuateRefine(lang: 'ja'), isTrue);
-      expect(routed.shouldPunctuateRefine(lang: 'en'), isFalse);
-      expect(routed.shouldPunctuateRefine(lang: 'zh'), isFalse);
-      // Before the first segment resolves a language there is nothing to
-      // punctuate for.
-      expect(routed.shouldPunctuateRefine(), isFalse);
+      for (final kind in <DecodeRequestKind>[
+        DecodeRequestKind.refine,
+        DecodeRequestKind.finalSegment,
+      ]) {
+        expect(routed.shouldPunctuate(kind: kind, lang: 'ja'), isTrue);
+        expect(routed.shouldPunctuate(kind: kind, lang: 'en'), isFalse);
+        expect(routed.shouldPunctuate(kind: kind, lang: 'zh'), isFalse);
+        // Before the first segment resolves a language there is nothing to
+        // punctuate for.
+        expect(routed.shouldPunctuate(kind: kind), isFalse);
+      }
+    });
+
+    test('finals are punctuated by default, drafts never are', () {
+      // A draft covers part of a segment still being spoken and is
+      // re-decoded about once a second, so a mark in one is a guess about a
+      // sentence that has not finished.
+      expect(
+        routed.shouldPunctuate(
+          kind: DecodeRequestKind.finalSegment,
+          lang: 'ja',
+        ),
+        isTrue,
+      );
+      expect(
+        routed.shouldPunctuate(kind: DecodeRequestKind.draft, lang: 'ja'),
+        isFalse,
+      );
     });
 
     test('a plain session goes by the flag, having no language tag', () {
@@ -113,8 +159,22 @@ void main() {
         punctuatePlainSession: false,
       );
 
-      expect(japanese.shouldPunctuateRefine(), isTrue);
-      expect(notJapanese.shouldPunctuateRefine(), isFalse);
+      expect(
+        japanese.shouldPunctuate(kind: DecodeRequestKind.refine),
+        isTrue,
+      );
+      expect(
+        japanese.shouldPunctuate(kind: DecodeRequestKind.finalSegment),
+        isTrue,
+      );
+      expect(
+        notJapanese.shouldPunctuate(kind: DecodeRequestKind.refine),
+        isFalse,
+      );
+      expect(
+        notJapanese.shouldPunctuate(kind: DecodeRequestKind.finalSegment),
+        isFalse,
+      );
     });
 
     test('a session with no punctuation model never punctuates', () {
@@ -126,7 +186,17 @@ void main() {
       );
 
       expect(noPunct.hasPunctuation, isFalse);
-      expect(noPunct.shouldPunctuateRefine(lang: 'ja'), isFalse);
+      expect(
+        noPunct.shouldPunctuate(kind: DecodeRequestKind.refine, lang: 'ja'),
+        isFalse,
+      );
+      expect(
+        noPunct.shouldPunctuate(
+          kind: DecodeRequestKind.finalSegment,
+          lang: 'ja',
+        ),
+        isFalse,
+      );
     });
   });
 

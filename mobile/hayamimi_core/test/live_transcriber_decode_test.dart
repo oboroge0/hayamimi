@@ -132,13 +132,17 @@ void main() {
         ..writeAsStringSync('[PAD]\n');
     });
 
-    JaPunctuation punctuation({String? libraryPath, int numThreads = 2}) =>
-        JaPunctuation(
-          modelPath: punctModelFile.path,
-          vocabPath: punctVocabFile.path,
-          libraryPath: libraryPath,
-          numThreads: numThreads,
-        );
+    JaPunctuation punctuation({
+      String? libraryPath,
+      int numThreads = 2,
+      bool applyToFinals = true,
+    }) => JaPunctuation(
+      modelPath: punctModelFile.path,
+      vocabPath: punctVocabFile.path,
+      libraryPath: libraryPath,
+      numThreads: numThreads,
+      applyToFinals: applyToFinals,
+    );
 
     test('reaches the worker as part of its config', () async {
       worker.buildFailure = 'stop here';
@@ -166,7 +170,38 @@ void main() {
       // A plain session says its own language is Japanese by being given a
       // Japanese punctuation model at all.
       expect(config.punctuatePlainSession, isTrue);
-      expect(config.shouldPunctuateRefine(), isTrue);
+      expect(config.punctuateFinals, isTrue);
+      expect(config.shouldPunctuate(kind: DecodeRequestKind.refine), isTrue);
+      expect(
+        config.shouldPunctuate(kind: DecodeRequestKind.finalSegment),
+        isTrue,
+      );
+    });
+
+    test('applyToFinals: false reaches the worker as punctuateFinals', () async {
+      worker.buildFailure = 'stop here';
+      final transcriber = newTranscriber();
+      addTearDown(transcriber.dispose);
+
+      await expectLater(
+        transcriber.start(
+          modelKind: ModelKind.zipformerTransducer,
+          modelDir: modelDir.path,
+          vadModelPath: vadModelFile.path,
+          punctuation: punctuation(applyToFinals: false),
+        ),
+        throwsA(isA<LiveTranscriberException>()),
+      );
+
+      final config = worker.config!;
+      expect(config.punctuateFinals, isFalse);
+      // The refine pass is untouched by the switch: it is the fast line the
+      // caller asked to leave alone.
+      expect(config.shouldPunctuate(kind: DecodeRequestKind.refine), isTrue);
+      expect(
+        config.shouldPunctuate(kind: DecodeRequestKind.finalSegment),
+        isFalse,
+      );
     });
 
     test('a session started without it asks the worker for none', () async {
