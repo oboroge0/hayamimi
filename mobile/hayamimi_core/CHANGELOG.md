@@ -13,12 +13,39 @@
   adding a second `libonnxruntime.so` to the app (two in one Android
   process is a known crash, k2-fsa/sherpa-onnx#3261). New dependencies:
   `unorm_dart` (NFKC, which `dart:core` has no equivalent of) and `ffi`.
-  This is phase 1 of
-  [#15](https://github.com/oboroge0/hayamimi/issues/15): it is **not yet
-  wired into `HayamimiLive`**, and the float16 model file it needs
-  (181.8 MB) is not downloadable yet — see "Japanese punctuation
-  restoration" in the README for the platform status and what is still
-  unverified.
+  See "Japanese punctuation restoration" in the README for the platform
+  status and what is still unverified.
+* `LiveTranscriber.start`/`startDebugWavStream` and `HayamimiLive.start`/
+  `startDebugWavStream` take an optional `JaPunctuation`, which turns the
+  punctuation model above on for that session's refine ("清書") output —
+  the second half of
+  [#15](https://github.com/oboroge0/hayamimi/issues/15). Passing nothing
+  keeps the previous behaviour exactly. Only refine results are
+  punctuated: that is where the desktop pipeline punctuates, and a final
+  covers one speech segment while a draft covers part of one still being
+  spoken, so sentence boundaries there would fall wherever the speaker
+  paused. A `RoutingProfile.jaSenseVoice` session punctuates the refines
+  that came back as Japanese and leaves the rest alone; a plain
+  single-model session has no language tag to test, so passing this to one
+  is itself the statement that its model transcribes Japanese (do not pass
+  it to a plain session with a non-Japanese model). The model loads in the
+  decode worker isolate, after the recognizers, and is reported on
+  `modelLoads`/`ModelLoadSubtitleEvent` as `model: "punct"`: `restore()` is
+  a synchronous native call, and running it on the caller's isolate would
+  hand back the pause that moving decoding off it removed. Failing to load
+  it fails `start()` with a message naming the file, rather than starting a
+  session that quietly produces unpunctuated text. `LiveTranscriptEntry`
+  and `RefineSubtitleEvent` gained `punctuated` (and `"punctuated"` in that
+  event's JSON, beside every key that was already there) so a consumer can
+  tell text the punctuation model wrote from text the recognizer produced.
+  The refine pass's "too short, fall back to the fast finals" guard now
+  compares lengths with the restored marks stripped, since they are
+  characters nobody said and would otherwise excuse a truncated re-decode.
+  The float16 model file (181.8 MB) is still not downloadable —
+  `ModelDownloader` has no entry for it — so a host app has to place it and
+  its `vocab.txt` on the device itself. No device or emulator run happened
+  in this change: what a phone's ONNX Runtime does, and what `restore()`
+  costs on an ARM CPU, is still unverified.
 * Initial extraction from `mobile/`'s app-only codebase: on-device live
   transcription (`HayamimiLive`/`LiveTranscriber`), a remote-server client
   (`HayamimiRemote`/`RemoteTranscriber`), a LAN subtitle broadcast server

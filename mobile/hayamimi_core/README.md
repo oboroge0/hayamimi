@@ -197,9 +197,11 @@ Notes on the choice:
   (plus the draft pass's own three) is both a constructor parameter and a
   mid-session-settable property now.
 - Punctuation restoration for ja (the desktop pipeline's BERT-char model,
-  ~182 MB as fp16) is **not** part of either profile yet — mobile
-  integration is tracked in
-  [#15](https://github.com/oboroge0/hayamimi/issues/15).
+  181.8 MB as fp16) is wired into the refine pass now — pass a
+  `JaPunctuation` to `start`, see "Japanese punctuation restoration" below
+  — but it is **not** part of either download profile: the model file is
+  still a local build artifact, so a host app has to put it on the device
+  itself.
 
 ## Threading / known limitations
 
@@ -221,6 +223,8 @@ re-decodes a whole buffered group at once (up to 60 s of audio by default).
 | Building the recognizers | the decode worker isolate, which loads them itself |
 | Building the VAD | a short-lived background isolate, which hands the handle back ([`lib/live/native_model_loader.dart`](lib/live/native_model_loader.dart)) |
 | Every decode — per-segment finals, drafts, refine passes, and the whisper-tiny language identification a routed session runs | the decode worker isolate ([`lib/live/decode_worker.dart`](lib/live/decode_worker.dart)) |
+| Building the Japanese punctuation model, when the session asked for one | the decode worker isolate, after the recognizers |
+| Restoring Japanese punctuation into a refine result | the decode worker isolate, right after the decode that produced it |
 | Emitting `entries`/`drafts`/`refineEntries`/`decoding`/`errors`/`modelLoads`/`sessionResets` | the caller's isolate |
 
 Each session owns one decode worker. It is created by `start`, it owns that
@@ -340,18 +344,81 @@ insertion point, not an implementation: CJK inverse-text-normalization
 and user find/replace dictionaries are not ported to Dart yet, so a host app
 that wants them today supplies its own `textTransform`.
 
-## Japanese punctuation restoration (phase 1 of #15)
+## Japanese punctuation restoration
 
 On the desktop pipeline, the refine ("清書") pass hands its text through
 `scripts/punct_ja.py` before anything sees it, so desktop captions read as
 sentences. This package had no equivalent, so its refine output arrived as
 an unbroken run of characters — the same words, no 、 and no 。. Issue
 [#15](https://github.com/oboroge0/hayamimi/issues/15) is about closing that
-gap; this is its first half.
+gap; it is closed now, for a session that asks for it.
 
-**What this adds:** `PunctuatorJa`, a Dart port of that script.
-`restore(String) -> String` inserts 、 and 。 into unpunctuated Japanese, and
-turns a sentence-final 。 into ？ after a recognised question ending.
+**Turning it on.** Pass a `JaPunctuation` to `start` (or
+`startDebugWavStream`, which is how you see it on an emulator):
+
+```dart
+await live.start(
+  modelDir: modelDir,
+  vadModelPath: vadModelPath,
+  punctuation: JaPunctuation(
+    modelPath: '$punctDir/punct_bert.fp16.onnx',
+    vocabPath: '$punctDir/vocab.txt',
+    // On a desktop host, also: libraryPath: '<...>/onnxruntime.dll'.
+    // See "Platform status" below for why Android needs no path here.
+  ),
+);
+```
+
+`null` — the default — leaves it off, which is exactly what a session did
+before the parameter existed.
+
+**What changes when it is on.**
+
+* **Refine events only.** `RefineSubtitleEvent` (and
+  `LiveTranscriber.refineEntries`) come back with 、 and 。 in them, and ？
+  after a recognised question ending. `FinalSubtitleEvent`,
+  `PartialSubtitleEvent` and the `entries`/`drafts` streams carry the
+  recognizer's text unchanged. That is where the desktop pipeline
+  punctuates, and it is the pass with the context for it: a final covers one
+  speech segment and a draft part of one still being spoken, so sentence
+  boundaries there would fall wherever the speaker happened to pause.
+  Punctuating every final would also cost a full model run per utterance, on
+  a phone, for a line the next refine replaces.
+* **Each affected line says so.** `punctuated` on `LiveTranscriptEntry` and
+  on `RefineSubtitleEvent`, and `"punctuated"` in that event's JSON (every
+  key that was already there still is), so a consumer — including one across
+  the LAN — can tell text the punctuation model wrote from text the
+  recognizer produced.
+* **Which refines get it.** A `RoutingProfile.jaSenseVoice` session
+  punctuates the refines that came back as Japanese and leaves the rest
+  alone. A plain single-model session has no language tag to test, so giving
+  it a Japanese punctuation model is itself the statement that its model
+  transcribes Japanese: **do not pass this to a plain session with a
+  non-Japanese model**, which would run a Japanese model over, say, English
+  and produce nonsense rather than nothing.
+* **Where it runs.** In the decode worker isolate, beside the recognizers —
+  loaded after them, and reported on `modelLoads` /
+  `ModelLoadSubtitleEvent` as `model: "punct"` with its measured load time.
+  `restore()` is another synchronous native call, so running it on the
+  caller's isolate would hand back the pause that moving decoding off it
+  removed (see "Threading" above).
+* **Memory, and what a failure does.** The model is 181.8 MB for the life of
+  the session, on top of up to 396 MB of recognizer weights. Failing to load
+  it fails `start()` with a message naming the file, rather than starting a
+  session that quietly produces unpunctuated text: on a phone a missing
+  model file is a configuration mistake, not something to degrade around.
+* **`textTransform` still runs last**, on the punctuated text.
+
+One interaction is worth knowing about. A refine falls back to the fast
+finals' text when the merged re-decode comes back much shorter than they
+were, and that length comparison is made on the text *without* the restored
+marks. They are characters nobody said, and one per clause is enough to lift
+a genuinely truncated re-decode back over the threshold. When that fallback
+does fire, the entry reports `punctuated: false`, because the text that
+survived is the finals', which nothing punctuated.
+
+**Using `PunctuatorJa` directly.** The class stays public, for a caller who
+wants to punctuate something the live pipeline did not produce:
 
 ```dart
 final punctuator = await PunctuatorJa.load(
@@ -363,17 +430,27 @@ punctuator.restore('明日の会議は午後三時から始まります資料の
 punctuator.dispose();   // the session is native; nothing frees it for you
 ```
 
-**What it does not do yet.** It is not wired into `HayamimiLive` or the
-refine pass — that is phase 2, and until then a host app has to call
-`PunctuatorJa` itself (the `textTransform` hook above is one place to do
-it). And the model is not downloadable: `ModelDownloader` has no entry for
-it, because the file this port runs, `punct_bert.fp16.onnx` (181.8 MB), is
-still only a local artifact of `python scripts/quantize_punct.py --variant
-fp16`. Where to host a 182 MB file, and whether to ship the float16 build
-or something smaller, is undecided — see `docs/MOBILE.md`, which records
-that float16 was the only size reduction that did not cost accuracy
-(identical predictions to the full-size model on a 250-sentence FLEURS ja
-check; dynamic and static INT8 both lost recall).
+One instance is one ONNX Runtime session and is not safe to use from more
+than one isolate — which is why the live pipeline keeps its own inside the
+decode worker rather than sharing this one.
+
+**The model is still not downloadable.** `ModelDownloader` has no entry for
+it: `punct_bert.fp16.onnx` (181.8 MB) is a local artifact of `python
+scripts/quantize_punct.py --variant fp16`, and `vocab.txt` comes from the
+model directory `docs/PUNCT_JA.md` describes. Where to host a 182 MB file,
+and whether to ship the float16 build or something smaller, is undecided —
+`docs/MOBILE.md` records that float16 was the only size reduction that did
+not cost accuracy (identical predictions to the full-size model on a
+250-sentence FLEURS ja check; dynamic and static INT8 both lost recall).
+Until that is settled, a host app has to place both files on the device
+itself.
+
+**No device run happened in this change.** The wiring was verified on a
+Windows host with `flutter analyze` and `flutter test`: the session behaviour
+against a stand-in worker, the protocol encoding, and one test that builds
+the punctuator from a real session config and runs it. What that leaves
+unverified is the phone — whether ONNX Runtime resolves as the next section
+expects on Android, and what `restore()` costs on an ARM CPU.
 
 ### How it reaches ONNX Runtime, and why that way
 
@@ -441,8 +518,8 @@ test, `punct_ja_fixture_tokens_test.dart`, checks the token ids from the
 same fixture and needs only the 28 KB `vocab.txt`, so tokenizer drift is
 caught even without the model.
 
-The test prints what it measured while running: **66–71 ms mean
-`restore()`** over the 51 cases (55 characters on average) across three
+The test prints what it measured while running: **66–90 ms mean
+`restore()`** over the 51 cases (55 characters on average) across six
 runs, on this Windows x86 host, ONNX Runtime 1.27.1 from
 `sherpa_onnx_windows`, two intra-op threads. **This says
 nothing about a phone.** ONNX Runtime's CPU provider has no float16 compute
@@ -641,9 +718,9 @@ reason.
 | `partial` | `{"type":"partial","text":...}` | A draft ("発話中の暫定字幕") re-decode fires while a VAD segment is still in progress. |
 | `final` | `{"type":"final","text":...,"lang":...,"speaker":...,"latency_ms":...,"audio_s":...,"switched":...}` | A VAD segment finalized. `audio_s` is the segment's duration in seconds; `switched` is `true` only when this segment is the reason a `RoutingProfile.jaSenseVoice` session's language changed. `speaker` is always empty (no diarization yet). |
 | `translation` | `{"type":"translation","lang":...,"text":...}` | Reserved for wire compatibility with the desktop pipeline's machine translation — not emitted by this package today. |
-| `refine` | `{"type":"refine","text":...,"lang":...,"speaker":...,"latency_ms":...,"audio_s":...}` | A refine ("清書") pass completed. `audio_s` is the total duration of the buffered group that was re-decoded. |
+| `refine` | `{"type":"refine","text":...,"lang":...,"speaker":...,"latency_ms":...,"audio_s":...,"punctuated":...}` | A refine ("清書") pass completed. `audio_s` is the total duration of the buffered group that was re-decoded; `punctuated` is `true` when Japanese punctuation was restored into `text` (see "Japanese punctuation restoration"), and `false` from every producer that does not punctuate, remote sessions included. |
 | `error` | `{"type":"error","message":...}` | A session failure not attributable to a call the caller made — e.g. the OS revoking mic access mid-session. |
-| `model_load` | `{"type":"model_load","model":...,"phase":"start"\|"done","ms":...}` | Right before and right after each native model finishes loading (`model` is `"vad"`, `"recognizer"`, or for `RoutingProfile.jaSenseVoice`: `"ja"`/`"sensevoice"`/`"lid"`), including a `setVadSensitivity` rebuild. `ms` is the elapsed build time, only set on `"done"`. |
+| `model_load` | `{"type":"model_load","model":...,"phase":"start"\|"done","ms":...}` | Right before and right after each native model finishes loading (`model` is `"vad"`, `"recognizer"`, for `RoutingProfile.jaSenseVoice`: `"ja"`/`"sensevoice"`/`"lid"`, or `"punct"` for the Japanese punctuation model), including a `setVadSensitivity` rebuild. `ms` is the elapsed build time, only set on `"done"`. |
 | `session_reset` | `{"type":"session_reset"}` | `resetSession()` finished clearing the current conversation's state. |
 
 `HayamimiRemote` speaks the same table — its underlying `RemoteEvent` parser
@@ -680,9 +757,10 @@ from `HayamimiRemote.events` rather than raising an error.
   `draft_pass.dart` (the "発話中の暫定字幕" pacing logic), `vad_sensitivity.dart`
   (`VadSensitivity` and the VAD-swap-timing pure function
   `shouldSwapVadNow`), `model_load_event.dart` (`ModelLoadEvent`, what
-  `LiveTranscriber.modelLoads` emits), and `live_transcript_entry.dart` (one
-  finalized/refine/draft line, including its `audioSeconds`/`switched`
-  fields).
+  `LiveTranscriber.modelLoads` emits), `ja_punctuation.dart`
+  (`JaPunctuation`, the value object `start` takes to turn Japanese
+  punctuation on), and `live_transcript_entry.dart` (one finalized/refine/
+  draft line, including its `audioSeconds`/`switched`/`punctuated` fields).
 - `lib/remote/` — `RemoteTranscriber` (mic → `/ingest` WebSocket
   orchestration, auto-reconnect, debug wav sender) and its pure pieces:
   `remote_event.dart` (JSON→typed event parsing), `remote_handshake.dart`
@@ -694,10 +772,13 @@ from `HayamimiRemote.events` rather than raising an error.
   wire-compatible JSON encoding — see "Events" above), and
   `overlay_html.dart` (the OBS-ready transparent overlay page).
 - `lib/punct/` — Japanese punctuation restoration (see the section above).
-  `punctuator_ja.dart` is the whole public surface (`PunctuatorJa.restore`);
+  A live session runs this inside its decode worker; `PunctuatorJa` is also
+  usable on its own. `punctuator_ja.dart` is the whole public surface
+  (`PunctuatorJa.restore`);
   `punct_ja_tokenizer.dart` (NFKC + character split + vocabulary) and
-  `punct_ja_text.dart` (where a mark goes, and the ？ heuristic) are pure
-  Dart and unit tested without a model; `punct_ort_session.dart` and
+  `punct_ja_text.dart` (where a mark goes, the ？ heuristic, and
+  `withoutRestoredMarks`, which the refine pass's length check strips with)
+  are pure Dart and unit tested without a model; `punct_ort_session.dart` and
   `ort_library.dart` are the only FFI in the package, and
   `ort_bindings.dart` is a trimmed copy of ONNX Runtime's C API bindings
   (see `THIRD_PARTY_NOTICES.md`).
