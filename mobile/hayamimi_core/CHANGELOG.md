@@ -156,6 +156,63 @@ into a standalone package a third-party Flutter app can embed.
   has to place it and its `vocab.txt` on the device itself; see "Japanese
   punctuation restoration" in the README for the model-placement and
   platform-status details, and "Known limitations" below.
+* **Segmentation and segment audio, after the first Android emulator run.**
+  Running the live pipeline on an Android x86_64 emulator turned up two
+  ways the mobile port produced worse text than the desktop pipeline on the
+  same recording, neither of them an Android or an FFI problem. Both are
+  fixed here, and both change what a caller who passes no configuration
+  gets.
+
+  `VadSensitivity`'s defaults were sherpa-onnx's stock values
+  (`minSilenceSeconds` 0.5, `maxSpeechSeconds` 5.0); they are now the
+  desktop pipeline's tuned ones (**0.35** and **12.0**,
+  `scripts/realtime_transcribe.py`). On a three-sentence Japanese recording
+  whose pauses fall just under half a second, the stock silence default
+  merged all three sentences into one 6.13 s segment and the ja recognizer,
+  handed that segment, returned only the last sentence — two sentences gone,
+  with nothing in the output to say so. At 0.35 s the same audio split into
+  three segments and all three came out. The desktop records 0.35 s as
+  measured no worse for accuracy than 0.5 s while finalizing 150 ms sooner.
+  Segments now finalize on shorter pauses, so a transcript has more lines,
+  each shorter. `maxSpeechSeconds`'s doc also stops calling itself a hard
+  cap that force-closes a segment "even mid-speech": the same run emitted a
+  6.134 s segment from a session configured with 5.0 s.
+  `VadSensitivity(minSilenceSeconds: 0.5, maxSpeechSeconds: 5.0)` restores
+  the previous behaviour.
+
+  Every segment is now decoded together with up to a second of the audio
+  recorded *before* the VAD's detected onset. Silero VAD notices speech
+  slightly late, so its samples can begin partway into the first word:
+  `資料は昨日送りました` came back as `昨日は昨日送りました`, and another
+  sentence lost its `あしたの`. The desktop has prepended pre-onset context
+  since long before this package existed (`AudioHistory` / `PREROLL_S`); the
+  Dart equivalent is `PrerollHistory` (`lib/live/preroll.dart`), a bounded
+  rolling buffer on the caller's isolate, clamped so two consecutive
+  segments never both contain the gap between them. The prepended audio is
+  part of the segment from then on: it is decoded, counted in
+  `LiveTranscriptEntry.audioSeconds` (wire: `audio_s`), and stored in the
+  refine buffer, so a final's reported duration grows by up to a second.
+  New `prerollSeconds` knob on `LiveTranscriber`/`HayamimiLive`
+  (constructor plus runtime setter, default 1.0 s) — the one pacing knob
+  where `0` is valid, meaning "decode exactly what the VAD delimited".
+  `LiveVad.takeSegment` now returns a `LiveSpeechSegment` (samples plus the
+  segment's start position) instead of bare samples, since the samples alone
+  do not say where the audio before them is.
+
+* **`startDebugWavStream` finishes with a refine.** The method exists so a
+  device with no usable microphone can still be shown what a live session
+  produces, and the README points at it as the way to see punctuated refine
+  output — but with default settings it could not produce a refine at all.
+  Auto-refine is off by default, and the method tears the session down in
+  its own `finally`, so a `refineNow()` after the returned future completes
+  found no worker and silently did nothing. It now runs one refine over
+  what its finals buffered (when that is at least half a second of audio)
+  and awaits it before teardown, so one awaited call is enough to see a
+  punctuated refine. `autoRefineEnabled`'s setter also starts its timer for
+  a debug stream rather than only for a microphone session, so turning auto
+  mode on mid-stream works; and the debug path now cancels that timer when
+  it ends, which it never did.
+
 * **Bench and eval utilities.** `BenchRunner` measures offline WAV→RTF for a
   single zipformer-transducer model; `ManifestEvalRunner` batch-decodes a
   manifest of labeled clips (plain or through `RoutingProfile.jaSenseVoice`
@@ -166,14 +223,31 @@ into a standalone package a third-party Flutter app can embed.
 
 ### Known limitations
 
-* The punctuation model has not been run on a device in this release: its
-  wiring was verified on a Windows host (`flutter analyze`/`flutter test`,
-  including the parity test above), but what a phone's ONNX Runtime does,
-  and what `restore()` costs on an ARM CPU, is unverified. It's also
+* The punctuation model has been run on an **Android x86_64 emulator**, not
+  on a phone. The emulator run confirmed the FFI path (`libonnxruntime.so`
+  resolved to the single copy `sherpa_onnx` ships, ONNX Runtime 1.27.1) and
+  that ja refines come back punctuated the way the Python reference
+  punctuates them, but an emulator's CPU is the host PC's under
+  virtualization, and ONNX Runtime has no float16 compute path on x86 —
+  so what `restore()` costs on an ARM CPU is still unverified. It is also
   refused by default on iOS — `sherpa_onnx` links ONNX Runtime as an
   xcframework and it hasn't been confirmed that `OrtGetApiBase` stays
   exported from the app binary, so `PunctuatorJa.load` throws rather than
   guess unless a caller passes `libraryPath: OrtLibrary.processSymbols`.
+* A refine over a long group can come back holding only its last sentence.
+  This is a property of the ReazonSpeech transducer rather than of this
+  package: given the whole 6.26 s multi-sentence test file with no VAD at
+  all, the same int8 model returns the same single sentence on a Windows
+  host under both search algorithms. The tuned VAD defaults above make long
+  groups much rarer, and a refine that comes back much shorter than the
+  finals it replaces falls back to their text — but the desktop pipeline's
+  further remedy, splitting a suspicious result in half and retrying each
+  half (`_looks_truncated`/`_split_retry` in `scripts/asr_engine.py`,
+  v0.3.1), is not ported here yet.
+* `RoutingProfile.jaSenseVoice` has not been run on Android: the emulator
+  verification above used `jaOnly`, so the routed decode worker (SenseVoice
+  plus the whisper-tiny language-ID probe in one isolate) is exercised only
+  by the iOS session and this repo's own tests.
 * This package does not observe the app lifecycle: a host app that wants
   `stop()` on background and `start()` on resume has to wire that up
   itself from its own `WidgetsBindingObserver`.
