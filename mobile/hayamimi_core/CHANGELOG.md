@@ -130,20 +130,19 @@ into a standalone package a third-party Flutter app can embed.
   sentences plus 11 edge cases and asserts the two produce identical text.
   Passing a `JaPunctuation` to `LiveTranscriber.start`/
   `HayamimiLive.start` (or their `startDebugWavStream` counterparts) turns
-  it on for that session's refine output only — that is where the desktop
-  pipeline punctuates, and the pass with the context for it, since a final
-  covers one speech segment and a draft part of one still being spoken, so
-  sentence boundaries there would fall wherever the speaker paused. A
-  `RoutingProfile.jaSenseVoice` session punctuates the refines that came
-  back as Japanese and leaves the rest alone; a plain single-model session
-  has no language tag to test, so passing this to one is itself the
-  statement that its model transcribes Japanese. `LiveTranscriptEntry` and
-  `RefineSubtitleEvent` gained `punctuated` (and `"punctuated"` in that
-  event's JSON) so a consumer can tell text the punctuation model wrote
-  from text the recognizer produced; the refine pass's "too short, fall
-  back to the fast finals" guard now compares lengths with the restored
-  marks stripped, since they are characters nobody said and would
-  otherwise excuse a truncated re-decode. It runs the model through ONNX
+  it on for that session's refine ("清書") output and its finalized lines;
+  drafts stay bare, since a draft covers part of a sentence still being
+  spoken and is re-decoded about once a second. A
+  `RoutingProfile.jaSenseVoice` session punctuates what came back as
+  Japanese and leaves the rest alone; a plain single-model session has no
+  language tag to test, so passing this to one is itself the statement that
+  its model transcribes Japanese. `LiveTranscriptEntry`,
+  `FinalSubtitleEvent` and `RefineSubtitleEvent` carry `punctuated` (and
+  `"punctuated"` in those events' JSON, alongside every key that was
+  already there), so a consumer — including one across the LAN — can tell
+  text the punctuation model wrote from text the recognizer produced;
+  `RemoteFinalEvent` parses the key if a server ever sends it. It runs the
+  model through ONNX
   Runtime's C API over `dart:ffi`, borrowing the runtime `sherpa_onnx`
   already loads rather than adding a second `libonnxruntime.so` to the app
   (two in one Android process is a known crash,
@@ -213,6 +212,34 @@ into a standalone package a third-party Flutter app can embed.
   mode on mid-stream works; and the debug path now cancels that timer when
   it ends, which it never did.
 
+* **The fast line is punctuated too, after the second Android emulator
+  run.** The re-run that confirmed the two segmentation fixes above turned
+  up a third defect, one the fixes had made visible: on package defaults
+  the closing refine came out **unpunctuated**, reading
+  `refine punctuated=false text=東京の天気は晴れです あしたの会議は十時からです
+  資料は昨日送りました` over three sentences the fast path had recognized
+  correctly. A refine re-decodes its whole buffered group as one utterance,
+  this repo's ja transducer keeps only the last utterance of multi-utterance
+  audio, and so `isRefineTextTooShort` correctly rejected the re-decode and
+  emitted the fast finals joined instead — which nothing had punctuated. At
+  `autoRefineSilenceSeconds`' 4.0 s default a microphone session groups
+  several sentences per refine, so that was the normal outcome rather than a
+  corner case, and the guard was losing the punctuation in exactly the case
+  it exists to protect. The desktop pipeline has no such hole because its
+  fast finals are already punctuated, so its identical fallback yields
+  punctuated text.
+
+  Finals are therefore punctuated in the decode worker under the same rule
+  refines are, so the fallback has punctuated text to fall back to; it
+  reports `punctuated: true` only when every final in the group was
+  punctuated, and the shrink comparison now strips the restored marks off
+  both sides rather than only the refine's. The cost is one run of the
+  punctuation model per utterance instead of per refine — about 25–35 ms
+  per 11–14 character line on the emulator, inside a final's `latency_ms`.
+  `JaPunctuation(applyToFinals: false)` declines it and restores the
+  refine-only behaviour, fallback included. Not yet seen on a device: both
+  emulator runs predate this.
+
 * **Bench and eval utilities.** `BenchRunner` measures offline WAV→RTF for a
   single zipformer-transducer model; `ManifestEvalRunner` batch-decodes a
   manifest of labeled clips (plain or through `RoutingProfile.jaSenseVoice`
@@ -229,21 +256,24 @@ into a standalone package a third-party Flutter app can embed.
   that ja refines come back punctuated the way the Python reference
   punctuates them, but an emulator's CPU is the host PC's under
   virtualization, and ONNX Runtime has no float16 compute path on x86 —
-  so what `restore()` costs on an ARM CPU is still unverified. It is also
-  refused by default on iOS — `sherpa_onnx` links ONNX Runtime as an
-  xcframework and it hasn't been confirmed that `OrtGetApiBase` stays
-  exported from the app binary, so `PunctuatorJa.load` throws rather than
-  guess unless a caller passes `libraryPath: OrtLibrary.processSymbols`.
+  so what `restore()` costs on an ARM CPU is still unverified. Both
+  emulator runs predate finals being punctuated, so the fast line's
+  punctuation — and the extra `restore()` per utterance it costs — has
+  been seen only in this package's own tests. It is also refused by default
+  on iOS — `sherpa_onnx` links ONNX Runtime as an xcframework and it hasn't
+  been confirmed that `OrtGetApiBase` stays exported from the app binary, so
+  `PunctuatorJa.load` throws rather than guess unless a caller passes
+  `libraryPath: OrtLibrary.processSymbols`.
 * A refine over a long group can come back holding only its last sentence.
   This is a property of the ReazonSpeech transducer rather than of this
   package: given the whole 6.26 s multi-sentence test file with no VAD at
   all, the same int8 model returns the same single sentence on a Windows
   host under both search algorithms. The tuned VAD defaults above make long
   groups much rarer, and a refine that comes back much shorter than the
-  finals it replaces falls back to their text — but the desktop pipeline's
-  further remedy, splitting a suspicious result in half and retrying each
-  half (`_looks_truncated`/`_split_retry` in `scripts/asr_engine.py`,
-  v0.3.1), is not ported here yet.
+  finals it replaces falls back to their text, punctuation included — but
+  the desktop pipeline's further remedy, splitting a suspicious result in
+  half and retrying each half (`_looks_truncated`/`_split_retry` in
+  `scripts/asr_engine.py`, v0.3.1), is not ported here yet.
 * `RoutingProfile.jaSenseVoice` has not been run on Android: the emulator
   verification above used `jaOnly`, so the routed decode worker (SenseVoice
   plus the whisper-tiny language-ID probe in one isolate) is exercised only
