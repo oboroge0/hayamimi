@@ -7,7 +7,9 @@ events over SSE at /events. Designed to be driven by realtime_transcribe.py.
 import http.server
 import json
 import queue
+import sys
 import threading
+from typing import Callable
 
 OVERLAY_HTML = """<!doctype html>
 <meta charset="utf-8">
@@ -87,46 +89,72 @@ DASHBOARD_HTML = '<!doctype html>\n<html lang="ja">\n<meta charset="utf-8">\n<me
 _MAX_DICT_BODY_BYTES = 1_000_000
 
 
-class SubtitleServer:
-    """Fan-out of subtitle events to any number of SSE clients.
+class EventHub:
+    """Pub/sub core for structured session events (GitHub issue #29).
 
-    Optionally fronts a RoutedASR instance (set via `.asr` after
-    construction, e.g. by realtime_transcribe.py once the engine is built)
-    to expose its live replacement dictionary and ITN overrides over two
-    tiny JSON endpoints, so an external UI can edit them mid-session:
+    Split out of SubtitleServer so every structured event realtime_
+    transcribe.py's pipeline produces (partial/final/translation/refine/
+    model_load/model_fallback/warning/session_summary/recluster/
+    session_reset) is available to an app embedding the engine whether or
+    not `--serve`'s HTTP/SSE layer exists: realtime_transcribe.main()
+    always constructs one of these, and SubtitleServer optionally fronts
+    it with an HTTP server on top (see that class below).
 
-      GET  /replacements            -> {"wrong": "right", ...}
-      POST /replacements            -> replaces the whole dictionary
-      GET  /itn_overrides           -> {"exclude": [...], "force": {...}}
-      POST /itn_overrides           -> replaces the whole overrides object
-
-    Both endpoints are no-ops (404) when no `.asr` is attached.
+    Two independent ways to consume events:
+      * subscribe()/unsubscribe() -- pull a queue.Queue of JSON strings,
+        one per event, in publish order. This is what the /events SSE
+        handler and ws_ingest.py's WebSocket mirror use.
+      * add_listener() -- push a plain Python dict to a synchronous
+        in-process callback, no serialization round-trip. This is what an
+        embedding app that links against this module directly (rather
+        than talking HTTP) should use.
     """
 
-    def __init__(self, port: int = 8833):
-        self.port = port
+    def __init__(self):
         self._clients: list[queue.Queue] = []
+        self._listeners: list[Callable[[dict], None]] = []
         self._refines: list[str] = []  # recent refine events, replayed to new clients
         self._lock = threading.Lock()
-        self._httpd = None
-        self.asr = None  # RoutedASR, attached after construction if --serve
+        self._listener_errored: set[int] = set()  # id(callback) already reported to stderr
 
-    def publish(self, event: dict):
+    def publish(self, event: dict) -> None:
         data = json.dumps(event, ensure_ascii=False)
         with self._lock:
             if event.get("type") == "refine":
                 self._refines.append(data)
                 del self._refines[:-200]
-            for q in self._clients:
-                q.put(data)
+            clients = list(self._clients)
+            listeners = list(self._listeners)
+        for q in clients:
+            q.put(data)
+        # Listener callbacks run AFTER the lock is released (and over a
+        # snapshot of the listener list) so a slow, re-entrant, or
+        # exception-raising listener can never block publish()'s own
+        # bookkeeping, or a concurrent subscribe()/add_listener() call.
+        for cb in listeners:
+            try:
+                cb(event)
+            except Exception as exc:
+                key = id(cb)
+                if key not in self._listener_errored:
+                    # Reported once per callback, not once per event: a
+                    # listener that fails on every publish() would
+                    # otherwise spam stderr once per subtitle segment for
+                    # the rest of the session.
+                    self._listener_errored.add(key)
+                    print(f"[hayamimi] event listener raised (further errors from "
+                          f"this listener are suppressed): {exc!r}", file=sys.stderr)
 
-    def partial(self, text: str):
+    def partial(self, text: str) -> None:
         self.publish({"type": "partial", "text": text})
 
     def final(self, text: str, lang: str = "", speaker: str = "",
-              latency_ms: float | None = None, tier: str = ""):
-        self.publish({"type": "final", "text": text, "lang": lang,
-                      "speaker": speaker, "latency_ms": latency_ms, "tier": tier})
+              latency_ms: float | None = None, tier: str = "",
+              audio_s: float | None = None, lid_ms: float | None = None,
+              decode_ms: float | None = None, switched: bool = False) -> None:
+        self.publish({"type": "final", "text": text, "lang": lang, "speaker": speaker,
+                      "latency_ms": latency_ms, "tier": tier, "audio_s": audio_s,
+                      "lid_ms": lid_ms, "decode_ms": decode_ms, "switched": switched})
 
     def subscribe(self) -> queue.Queue:
         """Register a new consumer; past `refine` events are replayed first.
@@ -141,10 +169,193 @@ class SubtitleServer:
             self._clients.append(q)
         return q
 
-    def unsubscribe(self, q: queue.Queue):
+    def unsubscribe(self, q: queue.Queue) -> None:
         with self._lock:
             if q in self._clients:
                 self._clients.remove(q)
+
+    def add_listener(self, callback: Callable[[dict], None]) -> None:
+        """Register an in-process callback invoked synchronously on every
+        publish(), once per event, with the raw event dict (not the JSON
+        string subscribe()'s queue carries). See the class docstring for
+        when to use this instead of subscribe()."""
+        with self._lock:
+            self._listeners.append(callback)
+
+
+class RuntimeControls:
+    """Bundles the runtime-configurable pieces of a live realtime_
+    transcribe.py session so SubtitleServer's GET/POST /config and POST
+    /reset handlers can read and apply them without this module importing
+    realtime_transcribe.py (this module stays a leaf: stdlib imports
+    only, so it keeps importing cleanly in the CI environment described in
+    the project's contributing docs).
+
+    Attach an instance to `server.controls` after construction (same
+    pattern as `server.asr` for /replacements and /itn_overrides); every
+    field defaults to None so a caller can wire up only the pieces it
+    actually has (e.g. no `live_vad` handle when driving the pipeline from
+    a fixed --wav source with no live capture VAD to reconfigure). GET/POST
+    /config and POST /reset are 404 when no controls are attached at all,
+    and each individual key's setter call is skipped in favor of a 400 if
+    the specific handle it needs (asr / translator_pool / live_vad /
+    reset_fn) wasn't wired.
+
+      asr             -- RoutedASR instance: forced_lang/dual_confirm/
+                         punctuate/lid_switch_confirm/min_switch_s setters
+      translator_pool -- TranslatorPool instance: add_target/remove_target
+      live_vad        -- realtime_transcribe.LiveVad instance:
+                         set_sensitivity
+      reset_fn        -- zero-argument callable performing a full session
+                         reset (a closure over reset_live_session() and
+                         its other arguments, built by the caller)
+    """
+
+    def __init__(self, asr=None, translator_pool=None, live_vad=None, reset_fn=None):
+        self.asr = asr
+        self.translator_pool = translator_pool
+        self.live_vad = live_vad
+        self.reset_fn = reset_fn
+
+    def get_config(self) -> dict:
+        cfg = {"lang": None, "dual_confirm": None, "punctuate": None,
+               "lid_switch_confirm": None, "min_switch_s": None,
+               "translate": [], "vad": None}
+        if self.asr is not None:
+            cfg["lang"] = self.asr.forced_lang
+            cfg["dual_confirm"] = self.asr.dual_confirm
+            cfg["punctuate"] = self.asr._punctuate
+            cfg["lid_switch_confirm"] = self.asr.lid_switch_confirm
+            cfg["min_switch_s"] = self.asr.min_switch_s
+        if self.translator_pool is not None:
+            cfg["translate"] = self.translator_pool.targets
+        if self.live_vad is not None:
+            cfg["vad"] = self.live_vad.current_params()
+        return cfg
+
+    def apply_config(self, payload: dict) -> None:
+        """Apply any subset of GET /config's keys from `payload`.
+
+        Each key is applied in the order below and validated by the
+        underlying setter it calls; the first invalid value raises
+        ValueError immediately (the caller turns that into a 400), and
+        whichever keys were already applied before that point stay
+        applied -- this is a thin pass-through over each piece's own
+        setter, not a transaction, matching how the individual setters
+        already validate their own single value with no cross-key
+        coordination needed.
+        """
+        if "lang" in payload:
+            if self.asr is None:
+                raise ValueError("no ASR engine attached")
+            self.asr.set_forced_lang(payload["lang"])
+        if "dual_confirm" in payload:
+            if self.asr is None:
+                raise ValueError("no ASR engine attached")
+            self.asr.set_dual_confirm(bool(payload["dual_confirm"]))
+        if "punctuate" in payload:
+            if self.asr is None:
+                raise ValueError("no ASR engine attached")
+            self.asr.set_punctuate(bool(payload["punctuate"]))
+        if "lid_switch_confirm" in payload:
+            if self.asr is None:
+                raise ValueError("no ASR engine attached")
+            self.asr.set_lid_switch_confirm(payload["lid_switch_confirm"])
+        if "min_switch_s" in payload:
+            if self.asr is None:
+                raise ValueError("no ASR engine attached")
+            self.asr.set_min_switch_s(payload["min_switch_s"])
+        if "translate" in payload:
+            if self.translator_pool is None:
+                raise ValueError("no translator pool attached")
+            wanted = payload["translate"]
+            if not isinstance(wanted, list) or not all(isinstance(x, str) for x in wanted):
+                raise ValueError('"translate" must be a list of language codes')
+            current = set(self.translator_pool.targets)
+            wanted_set = set(wanted)
+            for lang in wanted_set - current:
+                self.translator_pool.add_target(lang)  # raises ValueError on an unsupported code
+            for lang in current - wanted_set:
+                self.translator_pool.remove_target(lang)
+        if "vad" in payload:
+            if self.live_vad is None:
+                raise ValueError("no VAD handle attached")
+            vad_cfg = payload["vad"]
+            if not isinstance(vad_cfg, dict):
+                raise ValueError('"vad" must be an object')
+            self.live_vad.set_sensitivity(
+                threshold=vad_cfg.get("threshold"),
+                min_silence=vad_cfg.get("min_silence"),
+                max_speech=vad_cfg.get("max_speech"))
+
+    def reset(self) -> None:
+        if self.reset_fn is None:
+            raise ValueError("no reset function attached")
+        self.reset_fn()
+
+
+class SubtitleServer:
+    """HTTP/SSE front end over an EventHub.
+
+    Fans a session's structured events out to any number of browser SSE
+    clients (the OBS overlay, the dashboard, the transcript view) and
+    exposes a handful of small JSON control endpoints. All of the actual
+    pub/sub bookkeeping lives in EventHub (`self.hub`, constructed
+    automatically if not passed in); this class is purely the HTTP
+    plumbing on top, so realtime_transcribe.main() can create an EventHub
+    unconditionally and only add this HTTP layer when `--serve` was
+    passed.
+
+    Optionally fronts a RoutedASR instance (set via `.asr` after
+    construction, e.g. by realtime_transcribe.py once the engine is built)
+    to expose its live replacement dictionary and ITN overrides over two
+    tiny JSON endpoints, so an external UI can edit them mid-session:
+
+      GET  /replacements            -> {"wrong": "right", ...}
+      POST /replacements            -> replaces the whole dictionary
+      GET  /itn_overrides           -> {"exclude": [...], "force": {...}}
+      POST /itn_overrides           -> replaces the whole overrides object
+
+    Both endpoints are no-ops (404) when no `.asr` is attached. Similarly,
+    a RuntimeControls instance set via `.controls` (see that class) backs:
+
+      GET  /config                  -> current runtime config
+      POST /config                  -> apply any subset of it
+      POST /reset                   -> run a full session reset
+
+    all 404 when no `.controls` is attached.
+    """
+
+    def __init__(self, port: int = 8833, hub: "EventHub | None" = None):
+        self.port = port
+        self.hub = hub if hub is not None else EventHub()
+        self._httpd = None
+        self.asr = None       # RoutedASR, attached after construction if --serve
+        self.controls = None  # RuntimeControls, attached after construction if --serve
+
+    def publish(self, event: dict):
+        self.hub.publish(event)
+
+    def partial(self, text: str):
+        self.hub.partial(text)
+
+    def final(self, text: str, lang: str = "", speaker: str = "",
+              latency_ms: float | None = None, tier: str = "",
+              audio_s: float | None = None, lid_ms: float | None = None,
+              decode_ms: float | None = None, switched: bool = False):
+        self.hub.final(text, lang, speaker, latency_ms, tier,
+                       audio_s=audio_s, lid_ms=lid_ms, decode_ms=decode_ms, switched=switched)
+
+    def subscribe(self) -> queue.Queue:
+        """Register a new consumer; past `refine` events are replayed first.
+
+        Used by the /events SSE handler and by ws_ingest.py to mirror the
+        same broadcast onto a WebSocket ingest client.
+        """
+        return self.hub.subscribe()
+
+    def unsubscribe(self, q: queue.Queue):
+        self.hub.unsubscribe(q)
 
     def start(self):
         server = self
@@ -196,6 +407,11 @@ class SubtitleServer:
                     overrides = server.asr._itn_overrides
                     self._json(200, {"exclude": sorted(overrides.exclude),
                                      "force": overrides.force})
+                elif self.path == "/config":
+                    if server.controls is None:
+                        self._json(404, {"error": "no runtime controls attached"})
+                        return
+                    self._json(200, server.controls.get_config())
                 else:
                     body = OVERLAY_HTML.encode("utf-8")
                     self.send_response(200)
@@ -205,10 +421,25 @@ class SubtitleServer:
                     self.wfile.write(body)
 
             def do_POST(self):
-                if self.path not in ("/replacements", "/itn_overrides"):
+                if self.path == "/reset":
+                    if server.controls is None:
+                        self._json(404, {"error": "no runtime controls attached"})
+                        return
+                    try:
+                        server.controls.reset()
+                    except ValueError as exc:
+                        self._json(400, {"error": str(exc)})
+                        return
+                    self._json(200, {"ok": True})
+                    return
+                if self.path not in ("/replacements", "/itn_overrides", "/config"):
                     self._json(404, {"error": "not found"})
                     return
-                if server.asr is None:
+                if self.path == "/config":
+                    if server.controls is None:
+                        self._json(404, {"error": "no runtime controls attached"})
+                        return
+                elif server.asr is None:
                     self._json(404, {"error": "no ASR engine attached"})
                     return
                 length = int(self.headers.get("Content-Length") or 0)
@@ -221,22 +452,26 @@ class SubtitleServer:
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                     self._json(400, {"error": f"invalid JSON: {exc}"})
                     return
+                if not isinstance(payload, dict):
+                    self._json(400, {"error": "body must be a JSON object"})
+                    return
                 if self.path == "/replacements":
-                    if not isinstance(payload, dict):
-                        self._json(400, {"error": "body must be a JSON object"})
-                        return
                     server.asr.set_replacements(payload)
                     self._json(200, {"ok": True})
-                else:  # /itn_overrides
-                    if not isinstance(payload, dict):
-                        self._json(400, {"error": "body must be a JSON object"})
-                        return
+                elif self.path == "/itn_overrides":
                     exclude = payload.get("exclude") or []
                     force = payload.get("force") or {}
                     if not isinstance(exclude, list) or not isinstance(force, dict):
                         self._json(400, {"error": '"exclude" must be a list, "force" a dict'})
                         return
                     server.asr.set_itn_overrides(exclude=set(exclude), force=force)
+                    self._json(200, {"ok": True})
+                else:  # /config
+                    try:
+                        server.controls.apply_config(payload)
+                    except (ValueError, TypeError) as exc:
+                        self._json(400, {"error": str(exc)})
+                        return
                     self._json(200, {"ok": True})
 
             def _json(self, status: int, payload: dict):
