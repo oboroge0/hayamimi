@@ -96,4 +96,41 @@ void main() {
       );
     });
   });
+
+  group('isVadBuildStale', () {
+    test('false when the generation is unchanged since the build started', () {
+      expect(
+        isVadBuildStale(buildGeneration: 3, currentGeneration: 3),
+        isFalse,
+      );
+    });
+
+    test(
+      'true once the generation has advanced (stop() torn down native '
+      'state while the rebuild was in flight)',
+      () {
+        expect(
+          isVadBuildStale(buildGeneration: 3, currentGeneration: 4),
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'true after a stop()+start() cycle bumped the generation twice',
+      () {
+        expect(
+          isVadBuildStale(buildGeneration: 3, currentGeneration: 5),
+          isTrue,
+        );
+      },
+    );
+
+    test('false at generation 0 (nothing has ever been built/torn down)', () {
+      expect(
+        isVadBuildStale(buildGeneration: 0, currentGeneration: 0),
+        isFalse,
+      );
+    });
+  });
 }

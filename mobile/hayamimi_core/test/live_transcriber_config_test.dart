@@ -170,4 +170,101 @@ void main() {
       },
     );
   });
+
+  group('LiveTranscriber.start failure cleanup', () {
+    // Regression coverage for the native-state-leak fix: start() used to
+    // call _buildNativeState unguarded, so a failure partway through it
+    // (e.g. the recognizer built fine but the VAD model didn't) left
+    // whatever was already built never freed, with isRunning still false
+    // so stop()/dispose() had nothing to tear down. A nonexistent model
+    // directory can't reach that exact partial-build point without real
+    // model files, but it does exercise the same try/catch/teardown path
+    // this fix added around _buildNativeState, and confirms start() keeps
+    // reporting the truth (not running) and stays retryable afterward.
+    test(
+      'a failed start() (model directory not found) throws and leaves '
+      'isRunning false',
+      () async {
+        final transcriber = LiveTranscriber();
+        addTearDown(transcriber.dispose);
+
+        await expectLater(
+          transcriber.start(
+            modelKind: ModelKind.zipformerTransducer,
+            modelDir: 'C:/definitely/does/not/exist/model',
+            vadModelPath: 'C:/definitely/does/not/exist/vad.onnx',
+          ),
+          throwsA(isA<LiveTranscriberException>()),
+        );
+
+        expect(transcriber.isRunning, isFalse);
+
+        // stop() must stay a safe no-op: nothing native was ever built to
+        // tear down, so this must not throw.
+        await transcriber.stop();
+      },
+    );
+
+    test(
+      'start() can be retried after a failure (the _starting guard resets '
+      'even when _buildNativeState throws)',
+      () async {
+        final transcriber = LiveTranscriber();
+        addTearDown(transcriber.dispose);
+
+        for (var i = 0; i < 2; i++) {
+          await expectLater(
+            transcriber.start(
+              modelKind: ModelKind.zipformerTransducer,
+              modelDir: 'C:/definitely/does/not/exist/model',
+              vadModelPath: 'C:/definitely/does/not/exist/vad.onnx',
+            ),
+            throwsA(isA<LiveTranscriberException>()),
+          );
+        }
+        expect(transcriber.isRunning, isFalse);
+      },
+    );
+  });
+
+  group('LiveTranscriber.setVadSensitivity during start()', () {
+    // Regression coverage for the "queued while _starting" fix:
+    // setVadSensitivity used to treat _starting the same as fully idle,
+    // applying its value to the _vadSensitivity field immediately -- which
+    // start()'s own in-flight _buildNativeState call would then silently
+    // overwrite with whatever it was originally given. A call made while
+    // start() is loading (here, failing fast on a bad model dir) must not
+    // throw and must not build anything of its own.
+    test(
+      'a call made while start() is loading does not throw and builds '
+      'nothing on its own',
+      () async {
+        final transcriber = LiveTranscriber();
+        addTearDown(transcriber.dispose);
+
+        final loads = <ModelLoadEvent>[];
+        transcriber.modelLoads.listen(loads.add);
+
+        final startFuture = expectLater(
+          transcriber.start(
+            modelKind: ModelKind.zipformerTransducer,
+            modelDir: 'C:/definitely/does/not/exist/model',
+            vadModelPath: 'C:/definitely/does/not/exist/vad.onnx',
+          ),
+          throwsA(isA<LiveTranscriberException>()),
+        );
+
+        // start() is now awaiting its first `await` (the permission check)
+        // with _starting already true -- call setVadSensitivity in that
+        // window rather than after start() has already failed.
+        await transcriber.setVadSensitivity(VadSensitivity(threshold: 0.9));
+
+        await startFuture;
+        await Future<void>.delayed(Duration.zero);
+
+        expect(transcriber.isRunning, isFalse);
+        expect(loads, isEmpty);
+      },
+    );
+  });
 }
