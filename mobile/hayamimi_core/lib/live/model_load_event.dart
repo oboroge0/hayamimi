@@ -16,7 +16,12 @@ class ModelLoadEvent {
   /// `"recognizer"` (the plain, non-routed path's single model), for
   /// [RoutingProfile.jaSenseVoice]: `"ja"`, `"sensevoice"`, `"lid"`, and
   /// `"punct"` (the Japanese punctuation model, when `start` was given a
-  /// `JaPunctuation` — it loads last, after the recognizers).
+  /// `JaPunctuation` — it loads last, after the recognizers). `"punct"`'s
+  /// `ms` on `"done"` includes one warm-up inference run right after the
+  /// model loads, so the model's first real `restore()` call in this
+  /// process is fast: without it, the ~300 ms a cold ONNX Runtime session
+  /// pays on its first run would land on the first punctuated final or
+  /// refine instead of here.
   final String model;
 
   /// `"start"` right before the background-isolate build call, `"done"`
