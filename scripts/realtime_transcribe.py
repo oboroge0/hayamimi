@@ -992,7 +992,7 @@ def main():
     ap.add_argument("--refine-ja-second-opinion", action="store_true",
                     help="refine pass only: also decode ja utterance groups with "
                          "parakeet-ja and adopt its text when both models agree "
-                         "(needs download_models.py --eval-baselines; +~625MB resident)")
+                         "(needs download_models.py --eval-baselines; measured +~250MB RSS)")
     ap.add_argument("--refine-agree-threshold", type=float, default=None, metavar="CER",
                     help="agreement threshold for --refine-ja-second-opinion "
                          "(mutual CER between the two hypotheses; default 0.25)")
