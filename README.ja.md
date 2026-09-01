@@ -17,7 +17,7 @@ CPUだけでリアルタイム音声認識をやろうとすると、普通はWh
 その言語がいちばん得意なモデルに振り分けます。モデルはすべてINT8量子化のONNX形式で、
 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)の上で動くため、PyTorchもCUDAも要りません。
 
-実際のテレビ放送の日本語音声で測ると、この方式で**CER 5.8%**が出ます（`docs/SCORECARD.md`）。
+実際のテレビ放送の日本語音声で測ると、この方式で**CER 3.8%**が出ます（2026-09-01再計測、冒頭欠落修正と数字正規化を含む現行パイプライン。`docs/SCORECARD.md`）。
 同じ音声で`whisper-large-v3-turbo`は13.8%なので、誤りは半分以下。速度は6コアの
 デスクトップCPUで実時間の10〜50倍です。
 Whisper系・クラウドSTT API・他のローカルモデルとの比較（hayamimiが負けている言語も含めて）は
@@ -197,7 +197,7 @@ python -m venv .venv
 
 主な実測値:
 
-- **日本語CER 5.8%**（ビームサーチ使用時）。同じ実放送音声で`whisper-large-v3-turbo`は13.8%。
+- **日本語CER 3.8%**。同じ実放送音声で`whisper-large-v3-turbo`は13.8%。オプションの清書時二段照合（`--refine-ja-second-opinion`）は別の実放送50分セットで4.0%。
 - **確定までの平均が約100ms**（日本語、句読点込み）。5言語混在で全機能を有効にしても平均236ms。
 - **メモリ2GB未満**（`--max-resident 3`のとき）。`--max-resident 2`なら1.35GB。
 
