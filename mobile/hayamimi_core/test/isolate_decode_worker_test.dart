@@ -25,6 +25,14 @@ void main() {
 
     expect(worker.isAlive, isFalse);
 
+    // A failing worker reports itself twice: it sends a frame saying what
+    // went wrong, and then its exit and error ports say it is gone. Both
+    // land on the same `_ready` completer, and completing an
+    // already-completed one throws a StateError that no caller could
+    // catch -- it would surface here as an unhandled async error, which
+    // flutter_test fails the test on. Give both messages time to arrive.
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+
     // Tidying up after a failed start must stay a safe no-op rather than
     // throwing on the ports the failure already closed.
     await worker.shutdown();

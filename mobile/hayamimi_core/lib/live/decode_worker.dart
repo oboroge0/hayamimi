@@ -209,7 +209,7 @@ class IsolateDecodeWorker implements DecodeWorker {
       case DecodeWorkerReady():
         _settle(_ready);
       case DecodeWorkerBuildFailed(:final message):
-        _ready?.completeError(DecodeWorkerException(message));
+        _settleError(_ready, DecodeWorkerException(message));
       case DecodeWorkerAck(kind: DecodeRequestKind.shutdown):
         _alive = false;
         _settle(_shutdownAck);
@@ -228,7 +228,8 @@ class IsolateDecodeWorker implements DecodeWorker {
     _alive = false;
     final ready = _ready;
     if (ready != null && !ready.isCompleted) {
-      ready.completeError(
+      _settleError(
+        ready,
         DecodeWorkerException(
           'The decode worker stopped while loading models ($reason).',
         ),
@@ -241,9 +242,24 @@ class IsolateDecodeWorker implements DecodeWorker {
     }
   }
 
+  // Every completer here can be settled from two directions -- a frame the
+  // worker sent, and the error/exit ports reporting that it is gone -- and
+  // the two race. A build failure is the sharpest case: the worker sends
+  // `build_failed` and then exits, so if the exit lands first, _onDeath has
+  // already settled `_ready` by the time the frame arrives. Completing an
+  // already-completed Completer throws a StateError, and inside a port
+  // listener that surfaces as an unhandled async error rather than as
+  // anything a caller could catch. So neither direction ever completes
+  // blind.
   static void _settle(Completer<void>? completer) {
     if (completer != null && !completer.isCompleted) {
       completer.complete();
+    }
+  }
+
+  static void _settleError(Completer<void>? completer, Object error) {
+    if (completer != null && !completer.isCompleted) {
+      completer.completeError(error);
     }
   }
 
