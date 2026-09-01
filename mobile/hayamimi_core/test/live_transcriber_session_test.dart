@@ -206,6 +206,117 @@ void main() {
     });
   });
 
+  group('Japanese punctuation', () {
+    // The punctuation model runs inside the worker, so what a session can be
+    // checked for here is what it does with a punctuated reply: it is passed
+    // through untouched, it is reported, and it does not quietly excuse a
+    // refine that lost content.
+
+    test('a ja refine is emitted as the worker punctuated it', () async {
+      await h.start(punctuation: h.writePunctuationFiles());
+
+      await h.endSegment(seconds: 1.0);
+      h.worker.reply('今日めっちゃ疲れたわ', lang: 'ja');
+      await settle();
+
+      final refine = h.transcriber.refineNow();
+      await settle();
+      h.worker.reply(
+        '今日めっちゃ疲れたわ。もう寝る。',
+        lang: 'ja',
+        punctuated: true,
+      );
+      await settle();
+      await refine;
+
+      expect(h.refines.single.text, '今日めっちゃ疲れたわ。もう寝る。');
+      expect(h.refines.single.punctuated, isTrue);
+      // Only the refine. The final that came before it is the recognizer's
+      // own text, and says so.
+      expect(h.entries.single.text, '今日めっちゃ疲れたわ');
+      expect(h.entries.single.punctuated, isFalse);
+    });
+
+    test('an unpunctuated refine still reports itself as such', () async {
+      // What a routed session's non-Japanese refine, or any session started
+      // without a punctuation model, looks like from here.
+      await h.start();
+
+      await h.endSegment(seconds: 1.0);
+      h.worker.reply('hello there', lang: 'en');
+      await settle();
+
+      final refine = h.transcriber.refineNow();
+      await settle();
+      h.worker.reply('hello there, refined', lang: 'en');
+      await settle();
+      await refine;
+
+      expect(h.refines.single.punctuated, isFalse);
+    });
+
+    test('restored marks do not save a refine that lost content', () async {
+      // The fallback guard compares lengths, and punctuation adds
+      // characters nobody said. Here the marks alone are what would push a
+      // truncated re-decode over the 0.7 threshold, so this is the case
+      // that fails if the comparison forgets to strip them.
+      await h.start(punctuation: h.writePunctuationFiles());
+
+      await h.endSegment(seconds: 1.0);
+      h.worker.reply('あいうえおかきくけこ', lang: 'ja');
+      await settle();
+      await h.endSegment(seconds: 1.0);
+      h.worker.reply('さしすせそたちつてと', lang: 'ja');
+      await settle();
+
+      // 21 characters of fast text; the guard fires below 14.7 of them.
+      const fastText = 'あいうえおかきくけこ さしすせそたちつてと';
+      expect(fastText.length, 21);
+
+      final refine = h.transcriber.refineNow();
+      await settle();
+      // 13 characters of speech, 16 with the marks: over the threshold as
+      // sent, under it once the marks come off.
+      h.worker.reply(
+        'あい、うえお。かきくけこさしす。',
+        lang: 'ja',
+        punctuated: true,
+      );
+      await settle();
+      await refine;
+
+      expect(h.refines.single.text, fastText);
+      // The text that survived is the finals', which nothing punctuated.
+      expect(h.refines.single.punctuated, isFalse);
+    });
+
+    test('a long enough punctuated refine keeps its own text', () async {
+      // The other side of the same guard: a refine that did not lose
+      // anything is emitted as the worker sent it, marks included.
+      await h.start(punctuation: h.writePunctuationFiles());
+
+      await h.endSegment(seconds: 1.0);
+      h.worker.reply('あいうえおかきくけこ', lang: 'ja');
+      await settle();
+      await h.endSegment(seconds: 1.0);
+      h.worker.reply('さしすせそたちつてと', lang: 'ja');
+      await settle();
+
+      final refine = h.transcriber.refineNow();
+      await settle();
+      h.worker.reply(
+        'あいうえおかきくけこ、さしすせそたちつてと。',
+        lang: 'ja',
+        punctuated: true,
+      );
+      await settle();
+      await refine;
+
+      expect(h.refines.single.text, 'あいうえおかきくけこ、さしすせそたちつてと。');
+      expect(h.refines.single.punctuated, isTrue);
+    });
+  });
+
   group('resetSession', () {
     test('lands behind the segment still decoding, then clears and reports', () async {
       await h.start();
@@ -424,11 +535,24 @@ class _Harness {
     return worker;
   }
 
-  Future<void> start() => transcriber.start(
+  Future<void> start({JaPunctuation? punctuation}) => transcriber.start(
     modelKind: ModelKind.zipformerTransducer,
     modelDir: modelDir.path,
     vadModelPath: vadModelPath,
+    punctuation: punctuation,
   );
+
+  /// Stand-ins for the punctuation model and its vocabulary. `start()`
+  /// checks both files exist before it spawns anything; the fake worker
+  /// never loads them, so their contents do not matter.
+  JaPunctuation writePunctuationFiles() {
+    final sep = Platform.pathSeparator;
+    final model = '${modelDir.path}${sep}punct.onnx';
+    final vocab = '${modelDir.path}${sep}vocab.txt';
+    File(model).writeAsBytesSync(<int>[0]);
+    File(vocab).writeAsStringSync('[PAD]\n');
+    return JaPunctuation(modelPath: model, vocabPath: vocab);
+  }
 
   /// Delivers [count] frames' worth of microphone audio.
   Future<void> pushFrames(int count) async {

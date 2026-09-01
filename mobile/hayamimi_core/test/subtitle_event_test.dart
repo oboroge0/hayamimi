@@ -67,6 +67,7 @@ void main() {
         'speaker': '',
         'latency_ms': null,
         'audio_s': null,
+        'punctuated': false,
       });
     });
 
@@ -85,7 +86,20 @@ void main() {
         'speaker': 'S2',
         'latency_ms': 456.0,
         'audio_s': 12.0,
+        'punctuated': false,
       });
+    });
+
+    test('toJson reports restored Japanese punctuation', () {
+      // A consumer that receives this over the LAN can tell text the
+      // punctuation model wrote from text the recognizer produced.
+      const event = RefineSubtitleEvent(
+        text: '今日は疲れた。もう寝る。',
+        lang: 'ja',
+        punctuated: true,
+      );
+      expect(event.toJson()['punctuated'], isTrue);
+      expect(event.toJson()['text'], '今日は疲れた。もう寝る。');
     });
   });
 

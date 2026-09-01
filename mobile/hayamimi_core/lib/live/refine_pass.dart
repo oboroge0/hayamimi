@@ -4,12 +4,13 @@ import 'dart:typed_data';
 /// over several already-finalized VAD segments' audio, run together instead
 /// of one at a time, the same "re-decode with more context" trick the
 /// desktop pipeline's `Refiner` class uses (see
-/// `scripts/realtime_transcribe.py`, `GROUP_GAP_S`/`GROUP_MAX_S`). No
-/// punctuation-restoration model is added here — this is re-decode only.
+/// `scripts/realtime_transcribe.py`, `GROUP_GAP_S`/`GROUP_MAX_S`).
 ///
 /// Everything in this file is plain data/logic with no FFI or platform
 /// dependency, so it's unit tested directly. The FFI glue (actually running
-/// the recognizer over the combined audio) lives in `live_transcriber.dart`.
+/// the recognizer over the combined audio, and restoring Japanese
+/// punctuation into the result when the session asked for it) lives in
+/// `decode_worker.dart`; `live_transcriber.dart` drives both.
 
 /// Hard cap on how much audio [RefineBuffer] holds at once, in seconds.
 ///
@@ -122,6 +123,12 @@ String combineSegmentFastText(List<RefineSegment> segments) {
 /// than the fast finals combined, trust those" (scripts/realtime_transcribe.py).
 /// Length is compared in UTF-16 code units, which is good enough for the
 /// relative-shrink check this guards (not meant as a linguistic measure).
+///
+/// Both arguments must be equally punctuated, or the comparison is unfair:
+/// restoring 、 and 。 into a refine adds characters nobody said, so a
+/// punctuated [refineText] would be measured against unpunctuated fast text
+/// and could pass a check it should fail. Callers strip it first — see
+/// `withoutRestoredMarks` in `punct/punct_ja_text.dart`.
 bool isRefineTextTooShort(
   String refineText,
   String fastJoinedText, {

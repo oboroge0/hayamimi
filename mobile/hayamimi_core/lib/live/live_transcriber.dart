@@ -7,6 +7,7 @@ import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa_onnx;
 
 import '../bench/model_file_resolver.dart';
 import '../bench/model_kind.dart';
+import '../punct/punct_ja_text.dart';
 import '../remote/wav_pcm_reader.dart';
 import '../routing/routed_recognizer.dart';
 import '../routing/routing_profile.dart';
@@ -14,6 +15,7 @@ import 'decode_protocol.dart';
 import 'decode_session.dart';
 import 'decode_worker.dart';
 import 'draft_pass.dart';
+import 'ja_punctuation.dart';
 import 'live_transcript_entry.dart';
 import 'live_vad.dart';
 import 'model_load_event.dart';
@@ -235,10 +237,11 @@ class LiveTranscriber {
   // demand, re-decode the whole group together for a cleaner result than
   // any single segment got on its own (same effect the desktop pipeline's
   // `Refiner` gets from re-decoding across segment boundaries — see
-  // `scripts/realtime_transcribe.py`). No punctuation-restoration model is
-  // layered on top of this; it's re-decode only. Built in the constructor
-  // initializer list above (its cap comes from the refineBufferMaxSeconds
-  // constructor parameter).
+  // `scripts/realtime_transcribe.py`). When start() was given a
+  // `punctuation` model, the worker also restores 、 and 。 into the result
+  // before sending it back; without one this stays re-decode only. Built in
+  // the constructor initializer list above (its cap comes from the
+  // refineBufferMaxSeconds constructor parameter).
   final RefineBuffer _refineBuffer;
   DateTime? _lastSegmentAt;
   Timer? _autoRefineTimer;
@@ -308,6 +311,11 @@ class LiveTranscriber {
   /// Refine ("清書") results: one entry per manual or automatic refine
   /// pass, each covering everything buffered since the previous refine (or
   /// since the session started).
+  ///
+  /// This is the only stream Japanese punctuation restoration touches: when
+  /// [start] was given a `punctuation` model, an entry here can carry 、 。
+  /// ？ that the recognizer never produced, and says so through
+  /// [LiveTranscriptEntry.punctuated].
   Stream<LiveTranscriptEntry> get refineEntries => _refineEntriesController.stream;
 
   /// In-progress ("draft") decodes: one per draft re-decode while a VAD
@@ -419,6 +427,29 @@ class LiveTranscriber {
   /// knobs and [vadSensitivity], hotwords have no runtime setter — they're
   /// baked into the recognizer at build time, so changing them requires a
   /// fresh [start] (or [stop] + [start]).
+  ///
+  /// [punctuation] turns on Japanese punctuation restoration for this
+  /// session's refine ("清書") results: the recognizer emits a bare run of
+  /// characters, and the model named here puts 、 and 。 (and ？ after a
+  /// question ending) back into it, the way the desktop pipeline's
+  /// `scripts/punct_ja.py` does. `null` (the
+  /// default) leaves it off, which is what this method did before the
+  /// parameter existed. What changes when it is set:
+  ///
+  ///  * only [refineEntries] is affected — [entries] and [drafts] carry the
+  ///    recognizer's text unchanged (see `decode_worker.dart` for why);
+  ///  * a routed session punctuates the refines that came back as Japanese
+  ///    and leaves the rest alone; a plain session punctuates every refine,
+  ///    so **only pass this to a plain session whose model is Japanese**;
+  ///  * each affected entry carries [LiveTranscriptEntry.punctuated];
+  ///  * the model is loaded in the decode worker, after the recognizers,
+  ///    and reported on [modelLoads] as `model: 'punct'`. It is another
+  ///    181.8 MB of memory for the life of the session, and a failure to
+  ///    load it fails this call rather than starting a session that
+  ///    quietly produces unpunctuated text.
+  ///
+  /// Like hotwords, it is fixed for the session: changing it means a fresh
+  /// [start].
   Future<void> start({
     required ModelKind modelKind,
     required String modelDir,
@@ -430,6 +461,7 @@ class LiveTranscriber {
     VadSensitivity? vadSensitivity,
     String? hotwordsFile,
     double hotwordsScore = 1.5,
+    JaPunctuation? punctuation,
   }) async {
     if (isRunning || _debugStreaming || _starting) {
       return;
@@ -455,6 +487,7 @@ class LiveTranscriber {
           vadSensitivity: vadSensitivity ?? _vadSensitivity,
           hotwordsFile: hotwordsFile,
           hotwordsScore: hotwordsScore,
+          punctuation: punctuation,
         );
       } catch (_) {
         // _buildNativeState can throw after already building the
@@ -557,6 +590,7 @@ class LiveTranscriber {
     required VadSensitivity vadSensitivity,
     String? hotwordsFile,
     double hotwordsScore = 1.5,
+    JaPunctuation? punctuation,
   }) async {
     // A new generation starts the moment this build begins, not once it
     // succeeds: any setVadSensitivity rebuild already in flight for the
@@ -590,6 +624,22 @@ class LiveTranscriber {
       );
     }
 
+    if (punctuation != null) {
+      // Checked here, alongside the recognizer and VAD paths, so a missing
+      // 182 MB model is reported before an isolate is spawned and up to
+      // 396 MB of recognizer weights are loaded for a session that is about
+      // to fail anyway. The worker checks again -- it is the one that can
+      // tell a file that exists from a file it can actually load.
+      for (final (label, path) in <(String, String)>[
+        ('Japanese punctuation model', punctuation.modelPath),
+        ('Japanese punctuation vocabulary', punctuation.vocabPath),
+      ]) {
+        if (!await File(path).exists()) {
+          throw LiveTranscriberException('$label not found: $path');
+        }
+      }
+    }
+
     // Captured before the worker is started and stamped on every callback
     // below (see [_ifCurrent]): a worker replies on its own schedule, so
     // this is what tells a reply whether the session it belongs to is
@@ -609,6 +659,15 @@ class LiveTranscriber {
           hotwordsFile: hotwordsFile,
           hotwordsScore: hotwordsScore,
           sampleRate: sampleRate,
+          punctModelPath: punctuation?.modelPath,
+          punctVocabPath: punctuation?.vocabPath,
+          punctLibraryPath: punctuation?.libraryPath,
+          punctNumThreads: punctuation?.numThreads ?? defaultPunctNumThreads,
+          // Left at the default (true): for a plain single-model session
+          // there is no language tag to test, and passing a Japanese
+          // punctuation model to one is itself the statement that its model
+          // transcribes Japanese. See
+          // DecodeWorkerConfig.punctuatePlainSession.
         ),
         buildRefinePayload: () => _buildRefinePayload(generation),
         onFinal: (samples, result) =>
@@ -855,11 +914,24 @@ class LiveTranscriber {
     DecodeWorkerResult result,
   ) {
     var text = result.text.trim();
+    var punctuated = result.punctuated;
     // A merged re-decode must never LOSE content: if it comes back much
     // shorter than the fast finals combined, trust those instead (mirrors
     // scripts/realtime_transcribe.py's Refiner).
-    if (isRefineTextTooShort(text, payload.fastText)) {
+    //
+    // The length compared is the text WITHOUT the marks the punctuation
+    // model wrote: it runs in the worker, before this, so by here a
+    // punctuated refine is several characters longer than what was actually
+    // said, and crediting it for those would let a truncated re-decode pass
+    // a check it should fail. The fast text it is compared against is never
+    // punctuated (only refines are), so only this side is stripped.
+    if (isRefineTextTooShort(
+      punctuated ? withoutRestoredMarks(text) : text,
+      payload.fastText,
+    )) {
       text = payload.fastText;
+      // The fallback is the finals' own text, which no model punctuated.
+      punctuated = false;
     }
     if (text.isEmpty) {
       return;
@@ -872,6 +944,7 @@ class LiveTranscriber {
           latencyMs: result.latencyMs,
           lang: result.lang,
           audioSeconds: payload.samples.length / sampleRate,
+          punctuated: punctuated,
         ),
       );
     }
@@ -1298,7 +1371,9 @@ class LiveTranscriber {
   /// segment has been flushed and decoded -- same shutdown behavior [stop]
   /// gives a live session.
   /// See [start] for what [decodingMethod]/[vadSensitivity]/[hotwordsFile]/
-  /// [hotwordsScore] do -- identical meaning and defaults here.
+  /// [hotwordsScore]/[punctuation] do -- identical meaning and defaults
+  /// here, which is what makes this the way to see punctuated refine output
+  /// on an emulator.
   Future<void> startDebugWavStream({
     required ModelKind modelKind,
     required String modelDir,
@@ -1312,6 +1387,7 @@ class LiveTranscriber {
     VadSensitivity? vadSensitivity,
     String? hotwordsFile,
     double hotwordsScore = 1.5,
+    JaPunctuation? punctuation,
   }) async {
     if (isRunning || _debugStreaming || _starting) {
       return;
@@ -1331,6 +1407,7 @@ class LiveTranscriber {
         vadSensitivity: vadSensitivity ?? _vadSensitivity,
         hotwordsFile: hotwordsFile,
         hotwordsScore: hotwordsScore,
+        punctuation: punctuation,
       );
     } finally {
       _starting = false;
@@ -1350,6 +1427,7 @@ class LiveTranscriber {
     required VadSensitivity vadSensitivity,
     String? hotwordsFile,
     double hotwordsScore = 1.5,
+    JaPunctuation? punctuation,
   }) async {
     final wavFile = File(wavPath);
     if (!await wavFile.exists()) {
@@ -1368,6 +1446,7 @@ class LiveTranscriber {
         vadSensitivity: vadSensitivity,
         hotwordsFile: hotwordsFile,
         hotwordsScore: hotwordsScore,
+        punctuation: punctuation,
       );
     } catch (_) {
       // See start()'s identical catch: _buildNativeState can throw after

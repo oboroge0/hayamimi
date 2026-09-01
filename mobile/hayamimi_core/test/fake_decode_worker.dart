@@ -98,16 +98,32 @@ class FakeDecodeWorker implements DecodeWorker {
       commands.whereType<DecodeRequest>().toList();
 
   /// Answers the outstanding request with a result.
-  void reply(String text, {String? lang, bool switched = false}) =>
-      replyTo(lastRequest, text, lang: lang, switched: switched);
+  void reply(
+    String text, {
+    String? lang,
+    bool switched = false,
+    bool punctuated = false,
+  }) => replyTo(
+    lastRequest,
+    text,
+    lang: lang,
+    switched: switched,
+    punctuated: punctuated,
+  );
 
   /// Answers a specific request -- including one that was answered already,
   /// which is how a reply arriving after its session ended is staged.
+  ///
+  /// [punctuated] stands in for the real worker having run the punctuation
+  /// model over a refine result: this fake never restores anything itself,
+  /// so a test supplies both the punctuated text and the flag, and what it
+  /// is checking is what the session does with them.
   void replyTo(
     DecodeRequest request,
     String text, {
     String? lang,
     bool switched = false,
+    bool punctuated = false,
   }) {
     _emit(
       DecodeWorkerResult(
@@ -118,6 +134,7 @@ class FakeDecodeWorker implements DecodeWorker {
         lang: lang,
         switched: switched,
         latencyMs: 12.5,
+        punctuated: punctuated,
       ),
     );
   }
