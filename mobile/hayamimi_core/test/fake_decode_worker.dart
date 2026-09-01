@@ -27,6 +27,16 @@ class FakeDecodeWorker implements DecodeWorker {
   int startCount = 0;
   int shutdownCount = 0;
 
+  /// When set, every request is answered with this text on the next turn
+  /// of the event loop, and every control request is acked. For tests that
+  /// care about what came out rather than about when.
+  String? autoReplyText;
+
+  /// Whether [shutdown] closes the reply stream, as the real worker's does.
+  /// Set false to keep pushing frames at a session that has already
+  /// stopped, which is how "a reply that arrives too late" is staged.
+  bool closeOnShutdown = true;
+
   final StreamController<DecodeWorkerMessage> _controller =
       StreamController<DecodeWorkerMessage>.broadcast();
   bool _alive = false;
@@ -57,13 +67,25 @@ class FakeDecodeWorker implements DecodeWorker {
   @override
   void send(DecodeWorkerCommand command) {
     commands.add(command);
+    final text = autoReplyText;
+    if (text != null) {
+      Future<void>.delayed(Duration.zero, () => _autoAnswer(command, text));
+    }
+  }
+
+  void _autoAnswer(DecodeWorkerCommand command, String text) {
+    if (command is DecodeRequest) {
+      replyTo(command, text);
+    } else {
+      _emit(DecodeWorkerAck(id: command.id, kind: command.kind));
+    }
   }
 
   @override
   Future<void> shutdown() async {
     shutdownCount++;
     _alive = false;
-    if (!_controller.isClosed) {
+    if (closeOnShutdown && !_controller.isClosed) {
       await _controller.close();
     }
   }
@@ -76,8 +98,17 @@ class FakeDecodeWorker implements DecodeWorker {
       commands.whereType<DecodeRequest>().toList();
 
   /// Answers the outstanding request with a result.
-  void reply(String text, {String? lang, bool switched = false}) {
-    final request = lastRequest;
+  void reply(String text, {String? lang, bool switched = false}) =>
+      replyTo(lastRequest, text, lang: lang, switched: switched);
+
+  /// Answers a specific request -- including one that was answered already,
+  /// which is how a reply arriving after its session ended is staged.
+  void replyTo(
+    DecodeRequest request,
+    String text, {
+    String? lang,
+    bool switched = false,
+  }) {
     _emit(
       DecodeWorkerResult(
         id: request.id,
@@ -101,6 +132,16 @@ class FakeDecodeWorker implements DecodeWorker {
         message: message,
       ),
     );
+  }
+
+  /// Answers every request this worker has ever been sent. Only the one
+  /// actually outstanding takes effect -- the rest no longer match an id
+  /// the session is waiting on -- so this is a safe way to let a session
+  /// drain on its way out of a test.
+  void answerAll([String text = 'teardown']) {
+    for (final command in List<DecodeWorkerCommand>.of(commands)) {
+      _autoAnswer(command, text);
+    }
   }
 
   /// Acknowledges the outstanding control request.
