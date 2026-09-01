@@ -81,10 +81,13 @@ class JaPunctuation {
   /// punctuated to fall back to — the same thing the desktop relies on,
   /// where the fast finals have already been through `punct_ja.py`.
   ///
-  /// The cost is one extra run of the punctuation model per utterance
-  /// (~25-35 ms per ~11-14 characters on the Android emulator the README
-  /// measured; no phone was measured), inside the decode worker, on text
-  /// the next refine may replace anyway. Set `false` to buy that back and
+  /// The cost is one extra run of the punctuation model per utterance,
+  /// inside the decode worker, on text the next refine may replace anyway.
+  /// Measured directly on an Android emulator (x86_64, API 35, host Ryzen 5
+  /// 5600 — not a phone) by decoding the same audio with this flag on and
+  /// off: **~40-50 ms per ~11-14 characters** (1.8-2.4 s of audio; finals
+  /// went from 61.7/77.6/68.8 ms to 109.5/115.4/117.3 ms). No phone was
+  /// measured. Set `false` to buy that back and
   /// keep the fast line exactly as the recognizer produced it; refines are
   /// still punctuated, and a refine that falls back to the finals then
   /// reports `punctuated: false` as it did before this flag existed.
