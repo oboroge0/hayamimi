@@ -613,12 +613,31 @@ _KEY_FILES = {
     "v3": (V3_MODEL_DIR, "encoder*.onnx"),
     "omni": (OMNI_MODEL_DIR, "model*.onnx"),
     "pja": (PJA_MODEL_DIR, "model*.onnx"),
+    "lid": (WHISPER_TINY_DIR, "tiny-encoder.int8.onnx"),
 }
 
 
 def _model_present(name: str) -> bool:
     d, pat = _KEY_FILES[name]
     return bool(_find(d, pat))
+
+
+def _build_lid_guarded(threads: int):
+    """The single guarded entry point for the whisper-tiny LID model.
+
+    Every native sherpa-onnx construction in this module must be preceded by
+    a _model_present() check: sherpa-onnx's C++ layer calls the process's
+    exit() -- not a catchable Python exception -- when handed an empty or
+    invalid model path (see _KEY_FILES' comment and ModelUnavailable below).
+    _get() already funnels the six _BUILDERS recognizers through exactly
+    that check; the LID model is built eagerly in RoutedASR.__init__
+    (outside _get()'s lazy-load path), so it needs its own guard here rather
+    than silently reaching sherpa_onnx.SpokenLanguageIdentification(...)
+    with a possibly-missing encoder/decoder path.
+    """
+    if not _model_present("lid"):
+        raise ModelUnavailable("lid")
+    return _build_lid(threads)
 
 
 _BUILDERS = {
@@ -687,7 +706,7 @@ class RoutedASR:
         self._pending_lang = None   # candidate new language awaiting confirmation
         self._pending_count = 0
         self.lid_switch_confirm = lid_switch_confirm  # consecutive detections to accept a switch
-        self.lid = _build_lid(threads)
+        self.lid = _build_lid_guarded(threads)
         if warmup:
             # LID + tier-0 pay their one-time kernel/allocation costs here
             # so the first real segment isn't penalized.
