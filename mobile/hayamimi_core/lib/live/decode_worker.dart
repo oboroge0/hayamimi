@@ -569,6 +569,13 @@ Future<sherpa_onnx.OfflineRecognizer> _buildPlainRecognizer(
 /// `model: 'punct'` on the same `model_load` `start`/`done` events every
 /// other model uses, with the measured elapsed milliseconds on `done`.
 ///
+/// That `done` duration includes one warm-up [PunctuatorJa.restore] call on
+/// a short fixed string, run right after the model loads: the first
+/// `restore()` in a process costs ~300 ms more than every later one, and
+/// with finals punctuated by default that cost would otherwise fall on the
+/// first caption line a user sees rather than on this already-reported
+/// startup cost. See the comment at the call site below.
+///
 /// A failure here throws [DecodeWorkerException] with a message naming the
 /// files, which the worker turns into a build failure and
 /// `LiveTranscriber.start` rethrows: a missing 182 MB file on a phone is a
@@ -612,6 +619,18 @@ Future<PunctuatorJa?> loadWorkerPunctuator(
       libraryPath: config.punctLibraryPath,
       intraOpNumThreads: config.punctNumThreads,
     );
+    // Warm-up: the fp16 model's first restore() in a process costs ~300 ms
+    // more than every later one (ONNX Runtime builds its execution plan and
+    // allocates workspace on first run). Finals are punctuated by default
+    // now (see JaPunctuation.applyToFinals), so without this, that cold
+    // start would land on the first caption line a user sees instead of
+    // here. Paying it now folds the cost into this model's `model_load`
+    // duration -- already ~0.9-1.8 s and already understood as startup
+    // cost -- so the number reported on `done` below is ~300 ms higher, in
+    // exchange for no 400 ms spike on the first final or refine. The input
+    // and its result are both throwaway; only the side effect of warming
+    // the ONNX Runtime session is wanted.
+    punctuator.restore('あ');
   } catch (e) {
     throw DecodeWorkerException(
       'Could not load the Japanese punctuation model "$modelPath" '
