@@ -203,28 +203,86 @@ Notes on the choice:
 
 ## Threading / known limitations
 
-**Model loading is off the main isolate.** `HayamimiLive.start()` /
-`LiveTranscriber.start()` build the sherpa-onnx recognizer(s) and the VAD on
-a short-lived background isolate and hand the native handles back — see
-[`lib/live/native_model_loader.dart`](lib/live/native_model_loader.dart) for
-why that handoff is safe. Loading 72 MB (ja only) to 396 MB
-(`RoutingProfile.jaSenseVoice`) of ONNX weights is a multi-second
-*synchronous* FFI call; doing it inline on Flutter's UI isolate — which is
-what this package used to do — froze the whole app for that entire time,
-which is what a "freezes at startup" report on a real iPhone 15 turned out
-to be.
+**The problem this section used to describe.** Everything sherpa-onnx does
+is a *synchronous* FFI call — a direct call into a native library that runs
+to completion before the next line of Dart executes. A Dart isolate is
+single-threaded, so while such a call is running, nothing else on that
+isolate happens, Flutter's rendering included. Loading the models that way
+froze host apps for seconds at startup. Decoding that way blocked the UI
+once per utterance, and for much longer on a refine ("清書") pass, which
+re-decodes a whole buffered group at once (up to 60 s of audio by default).
 
-**Per-segment decode still runs on the caller's isolate.** Once a session is
-live, each VAD-bounded segment is decoded with a synchronous FFI call on
-whichever isolate drives the mic stream — for a normal host app, the UI
-isolate. Budget roughly **0.1–0.5 s of blocked UI per utterance** for the
-fast per-segment pass on a modern phone, and noticeably longer for a refine
-("清書") pass, which re-decodes a whole buffered group at once (up to 60 s of
-audio by default). If your app animates continuously while transcribing,
-this shows up as dropped frames. Moving the decode path onto a persistent
-worker isolate is tracked upstream in the
-[hayamimi issue tracker](https://github.com/oboroge0/hayamimi/issues) and is
-*not* fixed by the loading change above.
+**Where the work runs now.**
+
+| Work | Runs on |
+| --- | --- |
+| Microphone capture | the `record` plugin's own platform thread; audio chunks arrive as a stream on the caller's isolate |
+| Silero VAD — one `acceptWaveform` per 32 ms frame | the caller's isolate |
+| Building the recognizers | the decode worker isolate, which loads them itself |
+| Building the VAD | a short-lived background isolate, which hands the handle back ([`lib/live/native_model_loader.dart`](lib/live/native_model_loader.dart)) |
+| Every decode — per-segment finals, drafts, refine passes, and the whisper-tiny language identification a routed session runs | the decode worker isolate ([`lib/live/decode_worker.dart`](lib/live/decode_worker.dart)) |
+| Emitting `entries`/`drafts`/`refineEntries`/`decoding`/`errors`/`modelLoads`/`sessionResets` | the caller's isolate |
+
+Each session owns one decode worker. It is created by `start`, it owns that
+session's recognizer handles from first load to last free, and it is shut
+down by `stop`/`dispose`. Requests reach it as messages carrying the audio;
+results come back as messages carrying the text. The worker serves them one
+at a time, which is the same "only one decode at a time" guarantee the old
+synchronous code got for free.
+
+**What the queue does with each kind of request.** Being asynchronous means
+work can now arrive while a decode is still running, so each kind has an
+explicit rule:
+
+* **Finals** (one per completed speech segment) are always queued, never
+  dropped, and emitted in the order the segments closed.
+* **Drafts** (the periodic re-decode of a segment still being spoken) are
+  dropped rather than queued while anything else is outstanding, and a draft
+  whose result arrives after its segment already produced a final is thrown
+  away instead of overwriting that final.
+* **Refines** are coalesced: asking for one while another is still waiting
+  its turn returns that pass's future instead of starting a second pass over
+  overlapping audio. A refine claims the buffered audio at the moment it is
+  actually sent, so a segment that was still decoding when you tapped 清書 is
+  part of the group rather than the next one.
+* `decoding` reports whether *anything* is outstanding, so it emits one
+  `true`/`false` pair per burst rather than one per decode.
+
+**Decode latency is unchanged.** The work moved; it did not shrink. A
+segment still takes as long to decode as it did, and `LiveTranscriptEntry.latencyMs`
+still reports that same decode time (measured inside the worker, excluding
+the message round trip). What changed is that your isolate is not the one
+waiting for it.
+
+**Not measured here.** No on-device frame-timing or jank measurement was
+taken for this change — the claim above is about where the work runs, not a
+measured improvement in any particular app. If you need numbers for your
+own app, measure them there.
+
+**What still runs on your isolate.** One Silero VAD `acceptWaveform` call
+per 32 ms frame, and the event dispatch for the streams above. The VAD stays
+put deliberately: it is a small, frequent call, and a message round trip per
+frame would cost more than the call it replaced.
+
+**Other limits worth knowing.**
+
+* If the decode worker isolate dies mid-session, the session stops: a
+  `LiveTranscriberException` is emitted on `errors` (an `ErrorSubtitleEvent`
+  on `HayamimiLive.events`), microphone capture is torn down, and the object
+  is left ready to `start` again — the same handling a revoked microphone
+  gets. A single decode failing inside the worker is reported the same way
+  but does not stop the session; only that utterance is lost.
+* `stop`/`dispose` wait for the worker to acknowledge shutdown, and kill the
+  isolate if it does not answer within a few seconds. In that case the
+  worker's native memory is not freed: the recognizer handles belong to that
+  isolate, and freeing them from another one while it might still be inside
+  a decode would be a use-after-free. Losing the allocation of a session
+  that was ending anyway is the cheaper failure.
+* The debug-only `LiveTranscriber.runDebugWavRefineTest` helper still
+  decodes on the isolate that calls it. It is a one-shot, explicitly
+  awaited call with its own short-lived models, so a worker would buy
+  nothing and cost a spawn and a full model load per invocation. Use
+  `startDebugWavStream` to exercise the real pipeline, worker included.
 
 ## Minimal example: on-device subtitles
 
@@ -356,8 +414,8 @@ await live.setVadSensitivity(VadSensitivity(threshold: 0.4));
 ```
 
 `setVadSensitivity` rebuilds Silero VAD off-isolate (same background-isolate
-technique `start` uses for the initial load — see "Threading / known
-limitations" below) and swaps it in at the next safe point: never
+technique `start` uses for the initial VAD load — see "Threading /
+known limitations") and swaps it in at the next safe point: never
 mid-segment, so a speaker's in-progress utterance is never silently
 truncated by the swap. If no session is running yet, the value is just
 remembered for the next `start`. Calling it again before an earlier call has
@@ -381,10 +439,12 @@ something a host app wants to pay again just because the user tapped "new
 session." `resetSession()` clears everything about the *current*
 conversation instead: the refine buffer, in-progress draft state, and (for
 a routed session) which language it's currently locked to, all without
-touching a single loaded native model. If a decode is in flight when it's
-called, it waits for that decode to finish first, so the reset can't race a
-final/refine/draft write into the buffers it's about to clear. It's a no-op
-(nothing cleared, no event emitted) when no session is running.
+touching a single loaded native model. The clear is queued behind whatever
+the decode worker already has, so a segment that was still decoding when
+you called it still lands in the transcript first rather than racing a
+write into the buffers being emptied; the returned future completes once
+the worker has confirmed it cleared its own state. It's a no-op (nothing
+cleared, no event emitted) when no session is running.
 
 ```dart
 await live.resetSession(); // fresh conversation, same loaded models
@@ -489,9 +549,15 @@ from `HayamimiRemote.events` rather than raising an error.
 - `lib/bench/` — offline WAV→RTF benchmarking (`BenchRunner`), the
   `ModelKind` enum, and `model_file_resolver.dart`'s pure file-matching
   logic (unit tested, no FFI).
-- `lib/live/` — `LiveTranscriber` (mic → VAD → decode orchestration) and
-  its pure building blocks: `pcm_frame_buffer.dart` (PCM16→float, frame
-  re-slicing), `speech_segment_filter.dart` (is-this-segment-worth-decoding),
+- `lib/live/` — `LiveTranscriber` (mic → VAD → decode orchestration), the
+  decode worker it sends every decode to — `decode_worker.dart` (the
+  isolate that owns the recognizers, and the handle it is driven through),
+  `decode_session.dart` (the caller's-isolate half: request ids, dispatch,
+  the futures `refineNow`/`resetSession` hand out), `decode_protocol.dart`
+  (the message types and their wire encoding) and `decode_scheduler.dart`
+  (the pure queue policy) — and its other pure building blocks:
+  `pcm_frame_buffer.dart` (PCM16→float, frame re-slicing),
+  `speech_segment_filter.dart` (is-this-segment-worth-decoding),
   `refine_pass.dart` (the two-pass "清書" buffer/merge/due-check logic —
   mirrors the desktop pipeline's `Refiner` with phone-tuned defaults),
   `draft_pass.dart` (the "発話中の暫定字幕" pacing logic), `vad_sensitivity.dart`
@@ -516,9 +582,14 @@ from `HayamimiRemote.events` rather than raising an error.
 - `test/` — unit tests for everything pure-logic above (`flutter test`),
   plus `lifecycle_test.dart`, which covers the start/connect/dispose
   lifecycle of `LiveTranscriber`/`RemoteTranscriber` against a fake
-  `RecordPlatform` and a real `dart:io` WebSocket server. Their *decoding*
-  paths still aren't unit tested — those need the sherpa-onnx native libs
-  and a real mic — but are built from pieces that are.
+  `RecordPlatform` and a real `dart:io` WebSocket server, and
+  `decode_session_test.dart`, which drives a whole decode session — finals
+  in order, drafts dropped and discarded, refines coalesced, a reset behind
+  outstanding work, a worker dying mid-session — against a scripted
+  stand-in for the worker isolate. What is still untested is the FFI itself:
+  no `flutter test` run can load the sherpa-onnx native libraries or open a
+  microphone, so whether a decode produces the right *text* is only ever
+  verified on a device.
 
 ## Consumers
 
