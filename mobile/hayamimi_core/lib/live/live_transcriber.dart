@@ -9,6 +9,9 @@ import '../bench/model_file_resolver.dart';
 import '../bench/model_kind.dart';
 import '../routing/routed_recognizer.dart';
 import '../routing/routing_profile.dart';
+import 'decode_protocol.dart';
+import 'decode_session.dart';
+import 'decode_worker.dart';
 import 'draft_pass.dart';
 import 'live_transcript_entry.dart';
 import 'model_load_event.dart';
@@ -22,6 +25,22 @@ import 'vad_sensitivity.dart';
 /// session is live and auto mode is on. Cheap (a few comparisons), so a 1s
 /// tick is plenty responsive without meaningfully affecting battery.
 const _autoRefineCheckInterval = Duration(seconds: 1);
+
+/// How long [LiveTranscriber.stop] waits for whatever is still queued at
+/// the decode worker before giving up on it.
+///
+/// Stopping flushes the VAD, which usually produces one last segment; that
+/// segment's transcript is worth waiting for, and used to arrive for free
+/// when decoding was synchronous. The bound is here so a worker that has
+/// wedged inside a decode cannot wedge the host app's stop()/dispose()
+/// with it. Ten seconds is generous next to the fraction of a second a
+/// segment takes, and still short next to a user waiting for a screen to
+/// close.
+const _decodeDrainTimeout = Duration(seconds: 10);
+
+/// Builds the real, isolate-backed decode worker. Swapped out only by
+/// tests (see [LiveTranscriber]'s `decodeWorkerFactory`).
+DecodeWorker _spawnDecodeWorker() => IsolateDecodeWorker();
 
 class LiveTranscriberException implements Exception {
   LiveTranscriberException(this.message);
@@ -41,10 +60,15 @@ class LiveTranscriberException implements Exception {
 /// pieces it's built from — [pcm16BytesToFloat32], [PcmFrameBuffer], and
 /// [isSegmentWorthDecoding] — are unit tested separately.
 ///
-/// Threading: model *loading* happens on a background isolate (see
-/// `native_model_loader.dart`), so [start] doesn't freeze the UI. Per-segment
-/// *decoding* still runs synchronously on whichever isolate drives the mic
-/// stream — see the README's "Threading / known limitations".
+/// Threading: neither model loading nor decoding runs on the caller's
+/// isolate. Loading happens on short-lived background isolates (see
+/// `native_model_loader.dart`); every decode — per-segment finals, drafts
+/// and refine passes alike — is sent to a decode worker isolate that owns
+/// the recognizers for the session (`decode_worker.dart`). What is left on
+/// the caller's isolate is the microphone stream, one Silero VAD
+/// `acceptWaveform` call per 32 ms frame, and dispatching the events below.
+/// See the README's "Threading / known limitations" for what that does and
+/// does not buy.
 class LiveTranscriber {
   /// [draftIntervalSeconds]/[draftWindowSeconds]/[minDraftAudioSeconds]
   /// (see `draft_pass.dart`) and [autoRefineSilenceSeconds]/
@@ -62,8 +86,16 @@ class LiveTranscriber {
   /// platform-channel call under the hood, so a caller passing an invalid
   /// knob value gets a clean, synchronous [ArgumentError] instead of also
   /// leaking that half-started platform call.
+  ///
+  /// [decodeWorkerFactory] decides what a session's decodes are sent to.
+  /// Leave it unset in an app: the default spawns the real isolate-backed
+  /// worker. It exists because the sherpa-onnx native libraries cannot be
+  /// loaded in a plain `flutter test` run, so without it none of the
+  /// queueing, staleness and lifecycle behaviour around decoding could be
+  /// exercised by a test at all.
   LiveTranscriber({
     AudioRecorder? recorder,
+    DecodeWorker Function()? decodeWorkerFactory,
     double draftIntervalSeconds = defaultDraftIntervalSeconds,
     double draftWindowSeconds = defaultDraftWindowSeconds,
     double minDraftAudioSeconds = defaultMinDraftAudioSeconds,
@@ -97,6 +129,7 @@ class LiveTranscriber {
            'refineBufferMaxSeconds',
          ),
        ),
+       _decodeWorkerFactory = decodeWorkerFactory ?? _spawnDecodeWorker,
        _recorder = recorder ?? AudioRecorder();
 
   static const int sampleRate = 16000;
@@ -109,6 +142,7 @@ class LiveTranscriber {
   }
 
   final AudioRecorder _recorder;
+  final DecodeWorker Function() _decodeWorkerFactory;
   final _entriesController = StreamController<LiveTranscriptEntry>.broadcast();
   final _decodingController = StreamController<bool>.broadcast();
   final _refineEntriesController =
@@ -120,8 +154,10 @@ class LiveTranscriber {
   final _sessionResetController = StreamController<void>.broadcast();
 
   sherpa_onnx.VoiceActivityDetector? _vad;
-  sherpa_onnx.OfflineRecognizer? _recognizer;
-  RoutedRecognizerSet? _routed;
+  // The worker isolate that owns this session's recognizer(s), and the
+  // queue in front of it. Null between sessions; built by
+  // _buildNativeState, shut down by _teardownNativeState.
+  DecodeSession? _decode;
   StreamSubscription<Uint8List>? _micSubscription;
   StreamSubscription<RecordState>? _recorderStateSubscription;
   PcmFrameBuffer? _frameBuffer;
@@ -152,7 +188,14 @@ class LiveTranscriber {
   // periodically re-decode what's been captured of it so far and emit a
   // provisional partial -- see `draft_pass.dart` for the timing/skip logic
   // and why it's a coarser, cheaper pass than the fast-final/refine ones.
-  bool _busy = false; // true while ANY decode (final/refine/draft) is running
+  // True while ANY request (final, draft, refine, session reset) is
+  // outstanding at the decode worker -- in flight or still waiting its
+  // turn on this side. This is what [decoding] reports, and what the draft
+  // and VAD-swap guards read. It used to be a plain flag set around a
+  // synchronous decode call; now it is the decode queue's own state, which
+  // means it stays true across the whole burst rather than flickering once
+  // per decode.
+  bool get _busy => _decode?.isBusy ?? false;
   // Kept trimmed to defaultDraftWindowSeconds as frames arrive (see
   // slideDraftFrames in draft_pass.dart) -- without this, a long
   // uninterrupted utterance would grow this list without bound and
@@ -247,10 +290,13 @@ class LiveTranscriber {
   /// Finalized transcript lines, one per detected speech segment.
   Stream<LiveTranscriptEntry> get entries => _entriesController.stream;
 
-  /// Emits `true` right before a segment starts decoding and `false` right
-  /// after, so the UI can show a busy indicator. Shared by both the fast
-  /// per-segment decode and the refine pass, since only one decode ever
-  /// runs at a time on this recognizer.
+  /// Emits `true` when the decode worker has work outstanding and `false`
+  /// when it runs out, so the UI can show a busy indicator. Covers every
+  /// kind of request — per-segment finals, drafts, refine passes and
+  /// session resets — because the worker serves them one at a time.
+  ///
+  /// One event per transition, not one per decode: a burst of segments
+  /// queued back to back reads as a single `true` … `false` pair.
   Stream<bool> get decoding => _decodingController.stream;
 
   /// Refine ("清書") results: one entry per manual or automatic refine
@@ -265,11 +311,17 @@ class LiveTranscriber {
   Stream<LiveTranscriptEntry> get drafts => _draftController.stream;
 
   /// Asynchronous session failures that aren't attributable to a call the
-  /// caller made — today, mic capture dying under a running session (the OS
-  /// revoking the mic on backgrounding, another app taking it). The session
-  /// is already stopped by the time the error is emitted, so [isRunning]
-  /// reflects reality; errors raised *by* [start] itself are thrown, not
-  /// emitted here.
+  /// caller made. Three things reach here:
+  ///
+  ///  * mic capture dying under a running session (the OS revoking the mic
+  ///    on backgrounding, another app taking it),
+  ///  * the decode worker isolate dying mid-session,
+  ///  * a single decode throwing inside the worker.
+  ///
+  /// The first two stop the session, so [isRunning] reflects reality by the
+  /// time the error is emitted; the third loses only that one utterance and
+  /// leaves the session running. Errors raised *by* [start] itself are
+  /// thrown, not emitted here.
   Stream<LiveTranscriberException> get errors => _errorsController.stream;
 
   /// One event right before and one right after each native model finishes
@@ -298,7 +350,7 @@ class LiveTranscriber {
   /// The session's current language when running with
   /// [RoutingProfile.jaSenseVoice] (`null` before the first segment
   /// resolves one, and always `null` for a plain single-model session).
-  String? get currentLang => _routed?.currentLang;
+  String? get currentLang => _decode?.currentLang;
 
   /// Total audio currently buffered for the next refine pass, in seconds.
   double get refineBufferedSeconds => _refineBuffer.totalDurationSeconds;
@@ -524,69 +576,74 @@ class LiveTranscriber {
       throw LiveTranscriberException('VAD model not found: $vadModelPath');
     }
 
-    if (routingProfile.dualConfirmed) {
-      if (senseVoiceModelDir == null || lidModelDir == null) {
-        throw LiveTranscriberException(
-          '${routingProfile.label} requires senseVoiceModelDir and '
-          'lidModelDir.',
-        );
-      }
-      try {
-        _routed = await RoutedRecognizerSet.build(
-          reazonModelDir: modelDir,
-          senseVoiceModelDir: senseVoiceModelDir,
-          lidModelDir: lidModelDir,
-          decodingMethod: decodingMethod ?? 'modified_beam_search',
-          hotwordsFile: hotwordsFile,
-          hotwordsScore: hotwordsScore,
-          onModelLoad: (model, phase, ms) =>
-              _emitModelLoad(model: model, phase: phase, ms: ms),
-        );
-      } on RoutedRecognizerException catch (e) {
-        throw LiveTranscriberException(e.message);
-      }
-    } else {
-      final filenames = await dir
-          .list()
-          .where((e) => e is File)
-          .map((e) => e.uri.pathSegments.last)
-          .toList();
-
-      final ResolvedModelFiles resolved;
-      try {
-        resolved = resolveZipformerTransducerFiles(filenames);
-      } on ModelFileResolutionException catch (e) {
-        throw LiveTranscriberException(e.message);
-      }
-
-      final sep = Platform.pathSeparator;
-      _emitModelLoad(model: 'recognizer', phase: 'start');
-      final recognizerStopwatch = Stopwatch()..start();
-      _recognizer = await buildOfflineRecognizerOffIsolate(
-        sherpa_onnx.OfflineRecognizerConfig(
-          model: sherpa_onnx.OfflineModelConfig(
-            transducer: sherpa_onnx.OfflineTransducerModelConfig(
-              encoder: '$modelDir$sep${resolved.encoder}',
-              decoder: '$modelDir$sep${resolved.decoder}',
-              joiner: '$modelDir$sep${resolved.joiner}',
-            ),
-            tokens: '$modelDir$sep${resolved.tokens}',
-            numThreads: 2,
-            debug: false,
-            provider: 'cpu',
-          ),
-          decodingMethod: decodingMethod ?? 'greedy_search',
-          hotwordsFile: hotwordsFile ?? '',
-          hotwordsScore: hotwordsScore,
-        ),
-      );
-      recognizerStopwatch.stop();
-      _emitModelLoad(
-        model: 'recognizer',
-        phase: 'done',
-        ms: recognizerStopwatch.elapsedMicroseconds / 1000,
+    if (routingProfile.dualConfirmed &&
+        (senseVoiceModelDir == null || lidModelDir == null)) {
+      throw LiveTranscriberException(
+        '${routingProfile.label} requires senseVoiceModelDir and '
+        'lidModelDir.',
       );
     }
+
+    // Captured before the worker is started and stamped on every callback
+    // below (see [_ifCurrent]): a worker replies on its own schedule, so
+    // this is what tells a reply whether the session it belongs to is
+    // still the one running -- the same generation check
+    // [isVadBuildStale] applies to a VAD rebuild.
+    final generation = _sessionGeneration;
+    final DecodeSession session;
+    try {
+      session = await DecodeSession.start(
+        worker: _decodeWorkerFactory(),
+        config: DecodeWorkerConfig(
+          routed: routingProfile.dualConfirmed,
+          modelDir: modelDir,
+          senseVoiceModelDir: senseVoiceModelDir,
+          lidModelDir: lidModelDir,
+          decodingMethod: decodingMethod,
+          hotwordsFile: hotwordsFile,
+          hotwordsScore: hotwordsScore,
+          sampleRate: sampleRate,
+        ),
+        buildRefinePayload: () => _buildRefinePayload(generation),
+        onFinal: (samples, result) =>
+            _ifCurrent(generation, () => _onFinalDecoded(samples, result)),
+        onDraft: (result) =>
+            _ifCurrent(generation, () => _onDraftDecoded(result)),
+        onRefine: (payload, result) =>
+            _ifCurrent(generation, () => _onRefineDecoded(payload, result)),
+        onReset: () => _ifCurrent(generation, _onSessionReset),
+        onModelLoad: (model, phase, ms) => _ifCurrent(
+          generation,
+          () => _emitModelLoad(model: model, phase: phase, ms: ms),
+        ),
+        onBusyChanged: (busy) => _ifCurrent(generation, () {
+          if (!_decodingController.isClosed) {
+            _decodingController.add(busy);
+          }
+        }),
+        onDecodeError: (message) =>
+            _ifCurrent(generation, () => _onDecodeError(message)),
+        onWorkerDied: (message) => _ifCurrent(
+          generation,
+          () => unawaited(_handleWorkerFailure(message)),
+        ),
+      );
+    } on DecodeWorkerException catch (e) {
+      // The worker frees whatever it had already built and exits before
+      // this throw, so there is nothing left over here -- only the message,
+      // which is verbatim what the in-process loader used to throw.
+      throw LiveTranscriberException(e.message);
+    }
+    if (generation != _sessionGeneration) {
+      // The session was torn down (or restarted) while these models were
+      // loading. Installing this worker would orphan whichever one the new
+      // session built, so shut it down instead of keeping it.
+      await session.shutdown();
+      throw LiveTranscriberException(
+        'The session was stopped while its models were still loading.',
+      );
+    }
+    _decode = session;
 
     _vadModelPath = vadModelPath;
     _vadSensitivity = vadSensitivity;
@@ -719,6 +776,13 @@ class LiveTranscriber {
 
   void _clearDraftFrames() {
     _draftFrames = [];
+    // Whichever segment those frames belonged to is over (it closed, or a
+    // new one just started, or the session was reset). A draft still in
+    // flight for it would come back describing audio the UI has already
+    // moved past, so bump the id it was stamped with -- that is what lets
+    // its result be recognized as stale and dropped instead of
+    // overwriting the final that replaced it.
+    _decode?.beginDraftSegment();
   }
 
   void _drainReadySegments() {
@@ -738,94 +802,201 @@ class LiveTranscriber {
     }
   }
 
-  void _setBusy(bool value) {
-    _busy = value;
-    _decodingController.add(value);
-  }
-
   void _decodeSegment(sherpa_onnx.SpeechSegment segment) {
     if (!isSegmentWorthDecoding(segment, sampleRate: sampleRate)) {
       return;
     }
-    final routed = _routed;
-    if (routed != null) {
-      _decodeSegmentRouted(routed, segment);
+    // Queued at the worker, never dropped, and answered in the order the
+    // segments closed -- so the transcript keeps the order the speaker
+    // said things in even when several segments finish back to back.
+    _decode?.submitFinal(segment.samples);
+  }
+
+  /// Turns one finished segment's decode into a transcript line and files
+  /// its audio for the next refine pass.
+  ///
+  /// The empty check is on the trimmed text but the emitted text is not
+  /// trimmed. That asymmetry is what the in-process version did, and it is
+  /// what a caller diffing output across this change would notice if it
+  /// were quietly cleaned up here.
+  void _onFinalDecoded(Float32List samples, DecodeWorkerResult result) {
+    final text = result.text.trim();
+    if (text.isEmpty) {
       return;
     }
+    final now = DateTime.now();
+    if (!_entriesController.isClosed) {
+      _entriesController.add(
+        LiveTranscriptEntry(
+          text: result.text,
+          timestamp: now,
+          latencyMs: result.latencyMs,
+          lang: result.lang,
+          audioSeconds: samples.length / sampleRate,
+          switched: result.switched,
+        ),
+      );
+    }
+    _lastSegmentAt = now;
+    _refineBuffer.add(
+      RefineSegment(samples: samples, text: text, capturedAt: now),
+    );
+  }
 
-    final recognizer = _recognizer;
-    if (recognizer == null) {
+  void _onDraftDecoded(DecodeWorkerResult result) {
+    final text = result.text.trim();
+    if (text.isEmpty) {
       return;
     }
-
-    _setBusy(true);
-    final stopwatch = Stopwatch()..start();
-    final stream = recognizer.createStream();
-    try {
-      stream.acceptWaveform(samples: segment.samples, sampleRate: sampleRate);
-      recognizer.decode(stream);
-      final result = recognizer.getResult(stream);
-      stopwatch.stop();
-      final text = result.text.trim();
-      if (text.isNotEmpty) {
-        final now = DateTime.now();
-        _entriesController.add(
-          LiveTranscriptEntry(
-            text: result.text,
-            timestamp: now,
-            latencyMs: stopwatch.elapsedMicroseconds / 1000,
-            audioSeconds: segment.samples.length / sampleRate,
-          ),
-        );
-        _lastSegmentAt = now;
-        _refineBuffer.add(
-          RefineSegment(samples: segment.samples, text: text, capturedAt: now),
-        );
-      }
-    } finally {
-      stream.free();
-      _setBusy(false);
+    if (!_draftController.isClosed) {
+      _draftController.add(
+        LiveTranscriptEntry(
+          text: text,
+          timestamp: DateTime.now(),
+          latencyMs: result.latencyMs,
+          lang: result.lang,
+        ),
+      );
     }
   }
 
-  void _decodeSegmentRouted(
-    RoutedRecognizerSet routed,
-    sherpa_onnx.SpeechSegment segment,
+  void _onRefineDecoded(
+    RefineRequestPayload payload,
+    DecodeWorkerResult result,
   ) {
-    _setBusy(true);
-    final stopwatch = Stopwatch()..start();
-    try {
-      final result = routed.decode(segment.samples);
-      stopwatch.stop();
-      final text = result.text.trim();
-      if (text.isNotEmpty) {
-        final now = DateTime.now();
-        _entriesController.add(
-          LiveTranscriptEntry(
-            text: text,
-            timestamp: now,
-            latencyMs: stopwatch.elapsedMicroseconds / 1000,
-            lang: result.lang,
-            audioSeconds: segment.samples.length / sampleRate,
-            switched: result.switched,
-          ),
-        );
-        _lastSegmentAt = now;
-        _refineBuffer.add(
-          RefineSegment(samples: segment.samples, text: text, capturedAt: now),
-        );
-      }
-    } finally {
-      _setBusy(false);
+    var text = result.text.trim();
+    // A merged re-decode must never LOSE content: if it comes back much
+    // shorter than the fast finals combined, trust those instead (mirrors
+    // scripts/realtime_transcribe.py's Refiner).
+    if (isRefineTextTooShort(text, payload.fastText)) {
+      text = payload.fastText;
     }
+    if (text.isEmpty) {
+      return;
+    }
+    if (!_refineEntriesController.isClosed) {
+      _refineEntriesController.add(
+        LiveTranscriptEntry(
+          text: text,
+          timestamp: DateTime.now(),
+          latencyMs: result.latencyMs,
+          lang: result.lang,
+          audioSeconds: payload.samples.length / sampleRate,
+        ),
+      );
+    }
+  }
+
+  /// Claims the buffered segments for a refine pass, at the moment that
+  /// pass is actually about to be sent rather than when it was asked for.
+  ///
+  /// The difference matters when the user taps the refine button while the
+  /// last thing they said is still decoding: claiming the buffer late
+  /// means that segment's final lands first and is part of the group being
+  /// refined, instead of being pushed into the next one.
+  ///
+  /// Returns null when there is nothing worth decoding -- an empty buffer,
+  /// or under half a second of audio (mirrors the desktop `Refiner`'s
+  /// `len(buf) < sr // 2` guard) -- and the refine is dropped.
+  RefineRequestPayload? _buildRefinePayload(int generation) {
+    if (generation != _sessionGeneration || _refineBuffer.isEmpty) {
+      return null;
+    }
+    final segments = _refineBuffer.takeAll();
+    final combined = combineSegmentSamples(segments);
+    if (combined.length < sampleRate ~/ 2) {
+      return null;
+    }
+    return RefineRequestPayload(
+      samples: combined,
+      fastText: combineSegmentFastText(segments),
+    );
+  }
+
+  /// Clears the "conversation" state this class owns, once the worker has
+  /// confirmed it cleared its own (see [resetSession]).
+  void _onSessionReset() {
+    _refineBuffer.clear();
+    _lastSegmentAt = null;
+    _clearDraftFrames();
+    _draftSegmentActive = false;
+    _lastDraftAt = null;
+    if (!_sessionResetController.isClosed) {
+      _sessionResetController.add(null);
+    }
+  }
+
+  /// One decode threw inside the worker. That utterance is lost; the
+  /// worker and the session are both still fine, so this is reported and
+  /// nothing is torn down.
+  void _onDecodeError(String message) {
+    if (!_errorsController.isClosed) {
+      _errorsController.add(
+        LiveTranscriberException('Decode failed: $message'),
+      );
+    }
+  }
+
+  /// The decode worker isolate died without being asked to.
+  ///
+  /// Nothing can be transcribed any more, and the queue that was waiting
+  /// on it is gone, so this is handled exactly like the microphone being
+  /// revoked: report it on [errors] and tear the session down, leaving the
+  /// object ready to [start] again.
+  Future<void> _handleWorkerFailure(String message) async {
+    if (_decode == null) {
+      return;
+    }
+    if (!_errorsController.isClosed) {
+      _errorsController.add(
+        LiveTranscriberException(
+          'The decode worker stopped unexpectedly ($message); this session '
+          'has been stopped.',
+        ),
+      );
+    }
+    if (isRunning) {
+      await stop();
+      return;
+    }
+    if (_debugStreaming) {
+      // The wav loop notices this once per frame and tears down in its own
+      // finally, the same way stopDebugWavStream() ends it.
+      _debugStreamCancelRequested = true;
+      return;
+    }
+    await _teardownNativeState();
+  }
+
+  /// Runs [action] only if the session it was registered for is still the
+  /// one running. Every decode-worker callback goes through this: a
+  /// worker replies on its own schedule, so a reply that was already in
+  /// flight when the session stopped must not write into the streams of
+  /// whatever came after it.
+  void _ifCurrent(int generation, void Function() action) {
+    if (generation != _sessionGeneration) {
+      return;
+    }
+    action();
+  }
+
+  /// Waits, with a bound, for everything queued at the decode worker to
+  /// finish. See [_decodeDrainTimeout] for why the bound is there.
+  Future<void> _waitForDecodesToDrain() async {
+    final decode = _decode;
+    if (decode == null) {
+      return;
+    }
+    await decode.waitForIdle().timeout(_decodeDrainTimeout, onTimeout: () {});
   }
 
   /// Fires a draft decode if one is due (see [isDraftDue]): enough draft
-  /// audio has accumulated, the interval has elapsed, and nothing else is
-  /// currently decoding. A no-op otherwise -- the next mic/wav frame will
-  /// just check again.
+  /// audio has accumulated, the interval has elapsed, and the decode
+  /// worker has nothing outstanding. A no-op otherwise -- the next mic/wav
+  /// frame will just check again.
   void _maybeEmitDraft() {
-    if (_draftFrames.isEmpty) {
+    final decode = _decode;
+    if (decode == null || _draftFrames.isEmpty) {
       return;
     }
     final now = DateTime.now();
@@ -840,143 +1011,38 @@ class LiveTranscriber {
       return;
     }
     _lastDraftAt = now;
-    unawaited(_runDraftDecode());
-  }
-
-  Future<void> _runDraftDecode() async {
-    // Snapshot now: more frames may arrive (and even a final may pop) while
-    // this decode is in flight, since decoding is async but frame handling
-    // isn't -- decoding off a snapshot avoids racing the live buffer.
-    final frames = List<Float32List>.of(_draftFrames);
-    if (frames.isEmpty) {
-      return;
-    }
-    final combined = concatFloat32Lists(frames);
+    // Snapshot now: more frames arrive (and a final may pop) while this
+    // decode is in flight at the worker, so decoding off a copy avoids
+    // racing the live accumulator.
     final windowed = capDraftWindow(
-      combined,
+      concatFloat32Lists(_draftFrames),
       sampleRate: sampleRate,
       maxSeconds: _draftWindowSeconds,
     );
     if (windowed.length < sampleRate * _minDraftAudioSeconds) {
       return;
     }
-
-    _setBusy(true);
-    final stopwatch = Stopwatch()..start();
-    try {
-      String text;
-      String? lang;
-      final routed = _routed;
-      if (routed != null) {
-        // Current-language-only decode, no LID/routing judgment -- see
-        // RoutedRecognizerSet.decodeCurrentLangOnly's doc for why.
-        final result = routed.decodeCurrentLangOnly(windowed);
-        text = result.text.trim();
-        lang = result.lang;
-      } else {
-        final recognizer = _recognizer;
-        if (recognizer == null) {
-          return;
-        }
-        // The plain (non-routed) recognizer already defaults to
-        // `greedy_search` (sherpa_onnx's OfflineRecognizerConfig default) --
-        // unlike the routed set's ReazonSpeech tier, which is explicitly
-        // `modified_beam_search` for fast-final quality. Reusing it here
-        // rather than building a second, lighter recognizer avoids doubling
-        // this session's model memory footprint just for drafts.
-        final stream = recognizer.createStream();
-        try {
-          stream.acceptWaveform(samples: windowed, sampleRate: sampleRate);
-          recognizer.decode(stream);
-          text = recognizer.getResult(stream).text.trim();
-        } finally {
-          stream.free();
-        }
-      }
-      stopwatch.stop();
-      if (text.isNotEmpty) {
-        _draftController.add(
-          LiveTranscriptEntry(
-            text: text,
-            timestamp: DateTime.now(),
-            latencyMs: stopwatch.elapsedMicroseconds / 1000,
-            lang: lang,
-          ),
-        );
-      }
-    } finally {
-      _setBusy(false);
-    }
+    decode.submitDraft(windowed);
   }
 
   /// Runs a refine pass over everything currently buffered: combines the
-  /// buffered segments' audio and re-decodes it as one utterance, using the
-  /// same recognizer the fast per-segment path uses. Emits nothing if the
-  /// buffer is empty, the combined audio is under half a second (mirrors
-  /// the desktop `Refiner`'s `len(buf) < sr // 2` guard), or the result is
-  /// empty after the too-short fallback below.
+  /// buffered segments' audio and re-decodes it as one utterance in the
+  /// decode worker. Emits nothing if the buffer is empty, the combined
+  /// audio is under half a second, or the result is empty after the
+  /// too-short fallback.
   ///
-  /// Safe to call whether or not [autoRefineEnabled] is on — this is also
-  /// what the manual "清書" button calls directly, and what the debug wav
-  /// test path (see `runDebugWavRefineTest`) exercises indirectly via its
-  /// own recognizer.
+  /// The returned future completes once that pass's result has been
+  /// emitted on [refineEntries] (or once it has been decided there was
+  /// nothing to emit). Calling this again while a refine is still waiting
+  /// its turn behind other work returns *that* pass's future rather than
+  /// starting a second one over overlapping audio; a refine that has
+  /// already been sent to the worker is past that point, so a call made
+  /// then does queue a second pass over whatever has been buffered since.
+  ///
+  /// Safe to call whether or not [autoRefineEnabled] is on -- this is also
+  /// what the manual refine button calls directly.
   Future<void> refineNow() async {
-    final recognizer = _recognizer;
-    final routed = _routed;
-    if ((recognizer == null && routed == null) || _refineBuffer.isEmpty) {
-      return;
-    }
-    final segments = _refineBuffer.takeAll();
-    final combined = combineSegmentSamples(segments);
-    if (combined.length < sampleRate ~/ 2) {
-      return;
-    }
-    final fastJoined = combineSegmentFastText(segments);
-
-    _setBusy(true);
-    final stopwatch = Stopwatch()..start();
-    try {
-      var text = '';
-      String? lang;
-      if (routed != null) {
-        // Re-runs LID on the merged group audio too, same as the desktop
-        // refine pass's re-judgment (docs/LID.md's REFINE_MIN_REGROUP_S
-        // rationale: a longer merged group is a better LID input than any
-        // single segment).
-        final result = routed.decode(combined);
-        text = result.text.trim();
-        lang = result.lang;
-      } else if (recognizer != null) {
-        final stream = recognizer.createStream();
-        try {
-          stream.acceptWaveform(samples: combined, sampleRate: sampleRate);
-          recognizer.decode(stream);
-          text = recognizer.getResult(stream).text.trim();
-        } finally {
-          stream.free();
-        }
-      }
-      stopwatch.stop();
-      // A merged re-decode must never LOSE content: if it comes back much
-      // shorter than the fast finals combined, trust those instead (mirrors
-      // scripts/realtime_transcribe.py's Refiner).
-      if (isRefineTextTooShort(text, fastJoined)) {
-        text = fastJoined;
-      }
-      if (text.isNotEmpty) {
-        _refineEntriesController.add(
-          LiveTranscriptEntry(
-            text: text,
-            timestamp: DateTime.now(),
-            latencyMs: stopwatch.elapsedMicroseconds / 1000,
-            lang: lang,
-            audioSeconds: combined.length / sampleRate,
-          ),
-        );
-      }
-    } finally {
-      _setBusy(false);
-    }
+    await _decode?.refine();
   }
 
   /// Stops capturing, flushes any speech still buffered in the VAD, and
@@ -1003,6 +1069,10 @@ class LiveTranscriber {
 
     _vad?.flush();
     _drainReadySegments();
+    // The flush above usually produces one last segment. Its transcript
+    // used to arrive before stop() returned simply because decoding was
+    // synchronous; now it has to be waited for on purpose.
+    await _waitForDecodesToDrain();
 
     _refineBuffer.clear();
     _lastSegmentAt = null;
@@ -1031,10 +1101,13 @@ class LiveTranscriber {
     _pendingVadInstall?.free();
     _pendingVadInstall = null;
     _vadModelPath = null;
-    _recognizer?.free();
-    _recognizer = null;
-    _routed?.free();
-    _routed = null;
+    // The decode worker owns this session's recognizer handles and is the
+    // only isolate allowed to free them, so ending the session means
+    // asking it to (and, if it will not answer, killing it -- see
+    // IsolateDecodeWorker.shutdown for why nothing is freed by force).
+    final decode = _decode;
+    _decode = null;
+    await decode?.shutdown();
     _frameBuffer = null;
   }
 
@@ -1203,9 +1276,11 @@ class LiveTranscriber {
   /// conversation -- e.g. the user tapped "new session" -- without paying
   /// to reload up to 396 MB of model weights.
   ///
-  /// If a decode is in flight, waits for it to finish first (so the reset
-  /// can't race a final/refine/draft write into the buffers it's about to
-  /// clear) before actually clearing anything.
+  /// The clear is queued behind whatever the decode worker already has,
+  /// so a segment that was still decoding when this was called still lands
+  /// in the transcript first, rather than racing a write into the buffers
+  /// this is about to empty. The returned future completes once the worker
+  /// has confirmed it cleared its own state and [sessionResets] has fired.
   ///
   /// A no-op when no session ([isRunning]) or debug wav stream is active --
   /// there is nothing to reset, and [sessionResets] does not fire.
@@ -1213,18 +1288,7 @@ class LiveTranscriber {
     if (!isRunning && !_debugStreaming) {
       return;
     }
-    while (_busy) {
-      await Future<void>.delayed(const Duration(milliseconds: 20));
-    }
-    _refineBuffer.clear();
-    _lastSegmentAt = null;
-    _clearDraftFrames();
-    _draftSegmentActive = false;
-    _lastDraftAt = null;
-    _routed?.reset();
-    if (!_sessionResetController.isClosed) {
-      _sessionResetController.add(null);
-    }
+    await _decode?.reset();
   }
 
   /// Debug-only (see `kDebugMode` at the call site in `live_page.dart`):
@@ -1372,6 +1436,12 @@ class LiveTranscriber {
         offset = end;
         if (realtime) {
           await Future.delayed(samplesPerFrameDuration);
+        } else {
+          // Even when not pacing, yield once per frame: decodes now come
+          // back from the worker as messages, and a loop that never
+          // returns to the event loop would hold every result until the
+          // whole file had been fed through.
+          await Future<void>.delayed(Duration.zero);
         }
       }
 
@@ -1379,6 +1449,7 @@ class LiveTranscriber {
         _vad?.flush();
         _drainReadySegments();
       }
+      await _waitForDecodesToDrain();
     } finally {
       _debugStreaming = false;
       await _teardownNativeState();
@@ -1419,6 +1490,15 @@ class LiveTranscriber {
   /// path can also exercise the routing badge shown on the Live screen
   /// without a live mic session — the only way to do so on an emulator,
   /// which has no usable microphone.
+  ///
+  /// Unlike a live session, this helper's three decodes run on the isolate
+  /// that calls it, not on a decode worker. It is a debug-only,
+  /// one-shot, explicitly-awaited call with its own short-lived models and
+  /// no session to keep responsive, so a worker would buy nothing here and
+  /// cost a spawn and a full model load per invocation. If you call it
+  /// from a UI isolate, expect it to block for as long as the three
+  /// decodes take. [startDebugWavStream] is the path that exercises the
+  /// real pipeline, worker included.
   static Future<DebugRefineTestResult> runDebugWavRefineTest({
     required String modelDir,
     required String wavPath,
