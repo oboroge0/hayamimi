@@ -555,9 +555,11 @@ from `HayamimiRemote.events` rather than raising an error.
   `decode_session.dart` (the caller's-isolate half: request ids, dispatch,
   the futures `refineNow`/`resetSession` hand out), `decode_protocol.dart`
   (the message types and their wire encoding) and `decode_scheduler.dart`
-  (the pure queue policy) — and its other pure building blocks:
-  `pcm_frame_buffer.dart` (PCM16→float, frame re-slicing),
-  `speech_segment_filter.dart` (is-this-segment-worth-decoding),
+  (the pure queue policy) — `live_vad.dart` (the `LiveVad` interface a
+  session feeds, and the Silero-via-sherpa-onnx implementation of it), and
+  its other pure building blocks: `pcm_frame_buffer.dart` (PCM16→float,
+  frame re-slicing), `speech_segment_filter.dart`
+  (is-this-segment-worth-decoding),
   `refine_pass.dart` (the two-pass "清書" buffer/merge/due-check logic —
   mirrors the desktop pipeline's `Refiner` with phone-tuned defaults),
   `draft_pass.dart` (the "発話中の暫定字幕" pacing logic), `vad_sensitivity.dart`
@@ -582,14 +584,18 @@ from `HayamimiRemote.events` rather than raising an error.
 - `test/` — unit tests for everything pure-logic above (`flutter test`),
   plus `lifecycle_test.dart`, which covers the start/connect/dispose
   lifecycle of `LiveTranscriber`/`RemoteTranscriber` against a fake
-  `RecordPlatform` and a real `dart:io` WebSocket server, and
-  `decode_session_test.dart`, which drives a whole decode session — finals
-  in order, drafts dropped and discarded, refines coalesced, a reset behind
-  outstanding work, a worker dying mid-session — against a scripted
-  stand-in for the worker isolate. What is still untested is the FFI itself:
-  no `flutter test` run can load the sherpa-onnx native libraries or open a
-  microphone, so whether a decode produces the right *text* is only ever
-  verified on a device.
+  `RecordPlatform` and a real `dart:io` WebSocket server;
+  `decode_session_test.dart`, which drives the decode queue on its own —
+  finals in order, drafts dropped and discarded, refines coalesced, a reset
+  behind outstanding work, a worker dying mid-session; and
+  `live_transcriber_session_test.dart`, which drives a whole *live* session
+  with both of its native edges stood in for (the decode worker and the
+  VAD, via the `decodeWorkerFactory`/`vadFactory` constructor hooks), from
+  microphone bytes to transcript line. What is still untested is the FFI
+  itself: no `flutter test` run can load the sherpa-onnx native libraries or
+  open a microphone, so whether a decode produces the right *text* — and
+  what any of this does to frame timing — is only ever verified on a
+  device.
 
 ## Consumers
 
