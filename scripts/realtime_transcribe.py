@@ -14,12 +14,19 @@ import sys
 import threading
 import time
 import wave
+from typing import Callable
 
 import numpy as np
 import sherpa_onnx
 
 from asr_engine import ModelUnavailable, RoutedASR
 from audio_utils import resample_linear
+# subtitle_server.py only imports stdlib modules, so this is safe to import
+# unconditionally even under .github/workflows/test.yml's CI install list
+# (sherpa-onnx numpy scipy soundfile pytest, nothing else) -- GitHub issue
+# #29 needs the EventHub available whether or not --serve's HTTP layer is
+# requested.
+from subtitle_server import EventHub, RuntimeControls, SubtitleServer
 
 SAMPLE_RATE = 16000
 WINDOW_SIZE = 512  # samples per VAD chunk, ~32ms @ 16kHz
@@ -79,6 +86,192 @@ def build_vad(min_silence: float = 0.35,
         num_threads=1,
     )
     return sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=30)
+
+
+class LiveVad:
+    """Wraps the live-capture VAD so its sensitivity can change at runtime
+    (GitHub issue #29's `POST /config` "vad" key).
+
+    sherpa-onnx's VoiceActivityDetector exposes no setters for its config
+    (see build_vad()'s docstring on vad_threshold) -- the only way to
+    change min_silence/max_speech/threshold is to construct a brand new
+    detector. Doing that while a speech segment is in progress would throw
+    away that segment's accumulated audio and reset the endpointer mid-
+    utterance, so a set_sensitivity() request is only actually applied at
+    the next safe point: the next accept_waveform() call (one per audio
+    chunk, called from run_stream()'s loop) that finds the detector NOT
+    currently inside a detected speech segment. A request made mid-speech
+    just waits until that segment closes.
+
+    Implements the subset of sherpa_onnx.VoiceActivityDetector's API that
+    run_stream()/drain_segments() actually use, so `LiveVad(...)` is a
+    drop-in replacement for `build_vad(...)` at every call site.
+    """
+
+    def __init__(self, min_silence: float = 0.35, max_speech: float = 12.0,
+                 vad_threshold: float = 0.5):
+        self._min_silence = min_silence
+        self._max_speech = max_speech
+        self._threshold = vad_threshold
+        self._vad = build_vad(min_silence, max_speech, vad_threshold)
+        self._pending: dict | None = None  # requested-but-not-yet-applied params
+        self._lock = threading.Lock()
+
+    def current_params(self) -> dict:
+        """Currently ACTIVE sensitivity (not a pending, not-yet-applied
+        request -- see the class docstring), for GET /config."""
+        return {"threshold": self._threshold, "min_silence": self._min_silence,
+                "max_speech": self._max_speech}
+
+    def set_sensitivity(self, threshold: float | None = None,
+                        min_silence: float | None = None,
+                        max_speech: float | None = None) -> None:
+        """Request new sensitivity parameters. Any argument left as None
+        keeps its current value (including an explicit JSON `null` coming
+        through POST /config -- payload.get() can't tell "key absent" from
+        "key present but null" apart, and both mean "no change" here,
+        which is what a caller sending a partial `vad` object expects).
+        Applied at the next safe chunk boundary (see the class docstring),
+        not synchronously.
+
+        Validated HERE, synchronously, so a bad value (GitHub issue #29
+        review round 1: POST /config {"vad": {"threshold": "abc"}}, or a
+        negative/zero/out-of-range number) raises ValueError immediately
+        and is never queued into self._pending. The alternative --
+        validating only when _maybe_apply_pending() later hands the value
+        to build_vad() -- would crash the DECODE thread arbitrarily long
+        after the HTTP request that caused it had already returned 200.
+        """
+        if threshold is not None:
+            _require_number("threshold", threshold)
+            if not (0 < threshold <= 1):
+                raise ValueError(f"threshold must be > 0 and <= 1, got {threshold!r}")
+        if min_silence is not None:
+            _require_number("min_silence", min_silence)
+            if not (min_silence > 0):
+                raise ValueError(f"min_silence must be > 0, got {min_silence!r}")
+        if max_speech is not None:
+            _require_number("max_speech", max_speech)
+            if not (max_speech > 0):
+                raise ValueError(f"max_speech must be > 0, got {max_speech!r}")
+        with self._lock:
+            self._pending = {
+                "threshold": self._threshold if threshold is None else threshold,
+                "min_silence": self._min_silence if min_silence is None else min_silence,
+                "max_speech": self._max_speech if max_speech is None else max_speech,
+            }
+
+    def _maybe_apply_pending(self) -> None:
+        with self._lock:
+            if self._pending is None:
+                return
+            if self._vad.is_speech_detected():
+                return  # mid-speech: wait for this segment to close
+            params = self._pending
+            self._pending = None
+        self._threshold = params["threshold"]
+        self._min_silence = params["min_silence"]
+        self._max_speech = params["max_speech"]
+        self._vad = build_vad(self._min_silence, self._max_speech, self._threshold)
+
+    # --- the subset of sherpa_onnx.VoiceActivityDetector's API used by
+    # run_stream()/drain_segments() ---
+
+    def accept_waveform(self, chunk) -> None:
+        self._maybe_apply_pending()  # checked once per chunk: the "next safe point"
+        self._vad.accept_waveform(chunk)
+
+    def empty(self) -> bool:
+        return self._vad.empty()
+
+    @property
+    def front(self):
+        return self._vad.front
+
+    def pop(self):
+        return self._vad.pop()
+
+    def is_speech_detected(self) -> bool:
+        return self._vad.is_speech_detected()
+
+    @property
+    def current_segment(self):
+        return self._vad.current_segment
+
+    def flush(self):
+        return self._vad.flush()
+
+
+def _require_number(name: str, value) -> None:
+    """bool is a subclass of int in Python (isinstance(True, int) is
+    True), so it's excluded explicitly -- {"threshold": true} must be
+    rejected, not silently accepted as 1.0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number, got {value!r}")
+
+
+RESET_TIMEOUT_S = 10.0  # how long POST /reset waits for a chunk boundary before answering 202
+
+
+class ControlQueue:
+    """Runs submitted callables on the DECODE thread instead of the
+    caller's own thread (GitHub issue #29 review round 1).
+
+    Session-mutating operations like reset_live_session() touch state the
+    decode thread (run_stream()'s loop -- drain_segments(),
+    Refiner.maybe_refine(), SpeakerLabeler.match_embedding()) reads and
+    writes with no locking of its own, by design: none of those were built
+    to be thread-safe against a concurrent mutation, the same way the raw
+    sherpa VAD object LiveVad wraps isn't (see that class's own docstring
+    for why IT defers instead of mutating in place). Running
+    reset_live_session() directly on an HTTP handler thread (POST /reset)
+    would race the decode thread -- SpeakerLabeler.reset() clearing
+    _centroids/_counts mid-match_embedding() can raise IndexError there,
+    and two threads both calling Refiner.maybe_refine() at once race on
+    self.spans with nothing serializing them.
+
+    submit(fn) queues a zero-argument callable and returns a
+    threading.Event that is set once `fn` has actually run, ON the decode
+    thread, via poll(). Any exception `fn` raises is caught, printed
+    (never silently lost), and the Event is still set regardless -- a
+    broken control operation must not leave a caller blocked on
+    Event.wait() forever, the same "never let a control-plane problem
+    break the decode loop, but never let it vanish silently either"
+    principle RoutedASR._emit()/EventHub.publish() apply on the
+    event-publishing side (see those methods' docstrings).
+
+    poll() is meant to be called once per chunk by run_stream() -- the
+    same "next safe point" granularity LiveVad's own deferred VAD rebuild
+    uses -- and drains and runs every callable queued so far, in
+    submission (FIFO) order. If nothing is currently driving run_stream()
+    (no --wav/--input mic/ws in progress, or a --input ws session with no
+    client sending audio -- see reset_live_session()'s docstring for what
+    that means for POST /reset in that case), nobody calls poll() and a
+    submitted callable simply sits queued until something does.
+    """
+
+    def __init__(self):
+        self._q: "queue.Queue[tuple[Callable[[], None], threading.Event]]" = queue.Queue()
+
+    def submit(self, fn: Callable[[], None]) -> threading.Event:
+        done = threading.Event()
+        self._q.put((fn, done))
+        return done
+
+    def poll(self) -> None:
+        while True:
+            try:
+                fn, done = self._q.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                fn()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                sys.stderr.flush()
+            finally:
+                done.set()
 
 
 def wav_chunks(samples: np.ndarray, sample_rate: int, realtime: bool):
@@ -162,17 +355,20 @@ PARTIAL_WINDOW_S = 8.0  # cap draft decoding to the last N seconds of the uttera
 class PartialPrinter:
     """Shows in-progress drafts; overwrites in place on a tty, one line otherwise."""
 
-    def __init__(self, enabled: bool, server=None):
+    def __init__(self, enabled: bool, hub: "EventHub | None" = None):
         self.enabled = enabled
-        self.server = server
+        # main() always has a real hub to pass (GitHub issue #29: structured
+        # events must flow whether or not --serve's HTTP layer exists); a
+        # throwaway one here just keeps every other caller (existing tests,
+        # ad-hoc scripts) working unchanged without having to construct one.
+        self.hub = hub if hub is not None else EventHub()
         self._tty = sys.stdout.isatty()
         self._last_len = 0
 
     def show(self, text: str):
         if not self.enabled or not text:
             return
-        if self.server is not None:
-            self.server.partial(text)
+        self.hub.partial(text)
         if self._tty:
             pad = max(self._last_len - len(text), 0)
             print("\r~ " + text + " " * pad, end="", flush=True)
@@ -208,6 +404,13 @@ class SessionStats:
         # overcount, independent of eval_diar.py's simplified replica.
         self.refine_groups_closed = 0
         self.refine_lang_boundary_flushes = 0
+        # The previous `final` event's language, so drain_segments() can
+        # compute that event's `switched` field (GitHub issue #29's wire
+        # format: true when this final's lang differs from the previous
+        # final's, false for the first). Reset alongside everything else
+        # so a new session after reset_live_session() doesn't report its
+        # own first final as "switched" from the old session's last one.
+        self.last_final_lang: str | None = None
 
     def summary(self) -> str:
         if not self.latencies_ms:
@@ -218,6 +421,12 @@ class SessionStats:
                 f"refine_lang_corrections={self.refine_lang_corrections} "
                 f"refine_groups_closed={self.refine_groups_closed} "
                 f"refine_lang_boundary_flushes={self.refine_lang_boundary_flushes}")
+
+    def reset(self) -> None:
+        """Zero every counter, e.g. for reset_live_session(). Equivalent to
+        a fresh SessionStats() -- there is no state here worth preserving
+        across a reset."""
+        self.__init__()
 
 
 PREROLL_S = 1.0  # audio to prepend before the VAD's detected speech onset
@@ -247,6 +456,18 @@ class AudioHistory:
         if len(pre) == 0:
             return seg_samples
         return np.concatenate([pre, seg_samples])
+
+    def clear(self) -> None:
+        """Drop all buffered audio, e.g. for reset_live_session(). The VAD
+        driving run_stream() keeps counting samples from stream start
+        regardless of this reset (rebuilding it is a separate, unrelated
+        concern -- see LiveVad), so the first with_preroll() call after a
+        clear() naturally finds nothing to prepend (its `want` bound falls
+        outside the now-empty buf) rather than raising: numpy clamps an
+        out-of-range slice to empty instead of erroring."""
+        self.buf = np.zeros(0, dtype=np.float32)
+        self.offset = 0
+        self.last_seg_end = 0
 
 
 def drain_segments(vad, sample_rate: int, asr: RoutedASR, stats: SessionStats,
@@ -294,9 +515,19 @@ def drain_segments(vad, sample_rate: int, asr: RoutedASR, stats: SessionStats,
         stats.segments += 1
         stats.latencies_ms.append(latency_ms)
         printer.clear()
-        if printer.server is not None:
-            printer.server.final(result["text"], result["lang"], display_speaker,
-                                 latency_ms, result.get("tier", ""))
+        # GitHub issue #29: `switched` is true only when this final's
+        # language differs from the PREVIOUS final's -- tracked on `stats`
+        # (not asr.last_lang, which transcribe() has already advanced to
+        # this same segment's language by the time we get here) so it
+        # survives across drain_segments() calls for the life of the
+        # session, and resets cleanly via SessionStats.reset().
+        switched = (stats.last_final_lang is not None
+                   and stats.last_final_lang != result["lang"])
+        stats.last_final_lang = result["lang"]
+        printer.hub.final(result["text"], result["lang"], display_speaker,
+                          latency_ms, result.get("tier", ""),
+                          audio_s=seg_s, lid_ms=result.get("lid_ms"),
+                          decode_ms=result.get("decode_ms"), switched=switched)
         probe_part = f", probe={result['probe_ms']:.0f}ms" if result.get("probe_ms") else ""
         print(f"[{speaker_tag}{result['lang']}/{result.get('tier', '?')}] {result['text']}  "
               f"(seg={seg_s:.1f}s, lid={result['lid_ms']:.0f}ms{probe_part}, "
@@ -345,38 +576,147 @@ def translate_by_sentence(translator, text: str) -> str:
     return " ".join(out)
 
 
-def build_translators(langs: str) -> dict:
-    """"en,zh,ko,es,..." -> {lang: translator}.
+def _build_translator(lang: str):
+    """One target language code -> a constructed translator instance.
 
     en uses the dedicated FuguMT module; any other target is accepted if
-    M2M-100's vocabulary has a token for it (see
-    translate_m2m.is_supported_target()). Only a subset of those targets have
-    measured translation quality (translate_m2m.VALIDATED_TARGETS) --
-    constructing a translator for an unvalidated target prints a note to
-    stderr but still works.
+    M2M-100's vocabulary has a token for it (translate_m2m.
+    is_supported_target()) -- ValueError otherwise. Only a subset of M2M
+    targets have measured translation quality (translate_m2m.
+    VALIDATED_TARGETS); TranslatorM2M itself prints a note to stderr for
+    an unvalidated one but still constructs it.
     """
-    out = {}
+    if lang == "en":
+        from translate_ja_en import TranslatorJaEn
+
+        return TranslatorJaEn()
+    from translate_m2m import TranslatorM2M, is_supported_target
+
+    if not is_supported_target(lang):
+        raise ValueError(f"unsupported translation target: {lang}")
+    return TranslatorM2M(lang)
+
+
+class TranslatorPool:
+    """Shared, mutable set of ja->target translators (GitHub issue #29).
+
+    Both the live TranslationWorker and the Refiner's second pass read
+    from the SAME pool instance, so adding or removing a translation
+    target at runtime (POST /config's "translate" key) applies to both
+    passes at once instead of needing two separate APIs kept in sync.
+    Translators are built lazily, one per add_target() call, each
+    reporting a `model_load` event (start/done, timed) on `hub` if one was
+    given -- the same event shape asr_engine.RoutedASR emits for its own
+    recognizer builds, using "translator:<lang>" as the model name.
+
+    `targets` is insertion order (oldest first), which is also the order
+    TranslationWorker/Refiner print/publish each line's translations in.
+    """
+
+    def __init__(self, hub: "EventHub | None" = None):
+        self._translators: dict[str, object] = {}
+        self._order: list[str] = []
+        self._lock = threading.Lock()
+        self.hub = hub
+
+    @property
+    def targets(self) -> list[str]:
+        # GitHub issue #29 review round 1: snapshotted under the lock, not
+        # a bare `list(self._order)` -- add_target()/remove_target() both
+        # mutate _order (append/remove) under this same lock, and reading
+        # it while a mutation is in flight is a real hazard (CPython list
+        # iteration/copy over a list another thread is resizing), not just
+        # a theoretical one.
+        with self._lock:
+            return list(self._order)
+
+    def __len__(self) -> int:
+        return len(self._translators)
+
+    def get(self, lang: str):
+        return self._translators.get(lang)
+
+    def items(self):
+        """[(lang, translator), ...] in target-insertion order -- a
+        drop-in for `dict.items()` at Refiner's existing iteration sites.
+
+        Snapshotted under the lock (GitHub issue #29 review round 1): the
+        live TranslationWorker iterates this on its own thread while
+        add_target()/remove_target() can run concurrently from an HTTP
+        handler thread (POST /config's "translate" key). Without the lock,
+        a remove_target() landing between this reading `self._order` and
+        looking up each `lang` in `self._translators` could KeyError --
+        the worker thread has no try/except around its translation loop,
+        so that would silently kill it and translations would stop for
+        the rest of the session. Once snapshotted, the returned (lang,
+        translator) pairs hold real translator object references, so a
+        target removed a moment AFTER this call returns is harmless: the
+        caller just finishes using the object it already has (at most one
+        extra translation after the removal was requested), never a
+        re-lookup by name that could miss.
+        """
+        with self._lock:
+            return [(lang, self._translators[lang]) for lang in self._order]
+
+    def add_target(self, lang: str) -> None:
+        """Build and register a translator for `lang`. A no-op if `lang`
+        is already a target (idempotent, matching set-like add semantics).
+        Raises ValueError if `lang` isn't a supported translation target
+        (see _build_translator) -- callers driving this from an external
+        request (POST /config) should turn that into a 400; the CLI's own
+        --translate startup path (build_translators() below) degrades it
+        to a stderr note instead."""
+        with self._lock:
+            if lang in self._translators:
+                return
+            t0 = time.perf_counter()
+            if self.hub is not None:
+                self.hub.publish({"type": "model_load", "model": f"translator:{lang}",
+                                  "phase": "start", "ms": None})
+            translator = _build_translator(lang)  # ValueError propagates on an unsupported code
+            ms = (time.perf_counter() - t0) * 1000
+            if self.hub is not None:
+                self.hub.publish({"type": "model_load", "model": f"translator:{lang}",
+                                  "phase": "done", "ms": ms})
+            self._translators[lang] = translator
+            self._order.append(lang)
+
+    def remove_target(self, lang: str) -> None:
+        """Drop `lang` from the pool. A no-op if it wasn't a target."""
+        with self._lock:
+            if self._translators.pop(lang, None) is not None:
+                self._order.remove(lang)
+
+
+def build_translators(langs: str, pool: "TranslatorPool") -> None:
+    """Populate `pool` from a "--translate en,zh,ko,es,..." style string.
+
+    Unlike TranslatorPool.add_target() itself, an unsupported target here
+    degrades to a stderr note and is skipped rather than raising -- this
+    is the CLI startup path, which has always continued past a bad
+    --translate code instead of aborting the whole session over it.
+    """
     for lang in [x.strip() for x in langs.split(",") if x.strip()]:
-        if lang == "en":
-            from translate_ja_en import TranslatorJaEn
-
-            out["en"] = TranslatorJaEn()
-        else:
-            from translate_m2m import TranslatorM2M, is_supported_target
-
-            if not is_supported_target(lang):
-                print(f"unsupported translation target: {lang}", file=sys.stderr)
-                continue
-            out[lang] = TranslatorM2M(lang)
-    return out
+        try:
+            pool.add_target(lang)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
 
 
 class TranslationWorker:
-    """Async ja->target translation of finalized lines (console display)."""
+    """Async ja->target translation of finalized lines (console display).
 
-    def __init__(self, translators: dict, server=None):
-        self._translators = translators
-        self._server = server
+    Reads `pool.targets` fresh on every submitted line, so a target added
+    or removed at runtime (TranslatorPool.add_target()/remove_target(),
+    e.g. via POST /config) takes effect on the very next line with no
+    restart needed. Always constructed by main() (even with no --translate
+    targets at startup) precisely so a runtime-added target has a live
+    worker already pulling ja finals to translate -- see main()'s wiring.
+    """
+
+    def __init__(self, pool: TranslatorPool, hub: "EventHub"):
+        self._pool = pool
+        self._hub = hub
         self._q: "queue.Queue[str]" = queue.Queue()
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -386,12 +726,11 @@ class TranslationWorker:
     def _run(self):
         while True:
             text = self._q.get()
-            for lang, tr in self._translators.items():
+            for lang, tr in self._pool.items():
                 out = safe_translate(tr, text)
                 if out != text:  # fallback returns the source: nothing worth showing
                     print(f"[→{lang}] {out}", flush=True)
-                    if self._server is not None:
-                        self._server.publish({"type": "translation", "lang": lang, "text": out})
+                    self._hub.publish({"type": "translation", "lang": lang, "text": out})
 
 
 from asr_engine import (  # shared with the engine's live correction / refine dual-LID confirm
@@ -413,7 +752,7 @@ class Refiner:
 
     def __init__(self, asr: RoutedASR, history: AudioHistory, sample_rate: int,
                  printer: PartialPrinter, transcript_path: str | None = None,
-                 translators: dict | None = None, stats: "SessionStats | None" = None,
+                 translators: "TranslatorPool | None" = None, stats: "SessionStats | None" = None,
                  speaker_labeler=None, diarizer=None, min_remap_update_s: float = 0.0,
                  joint_remap: bool = False, exclude_provisional_remap: bool = False,
                  global_recluster: bool = False,
@@ -424,7 +763,14 @@ class Refiner:
         self.history = history
         self.sr = sample_rate
         self.printer = printer
-        self.translators = translators or {}  # ja->target, synchronous per refine
+        # ja->target, synchronous per refine. Same TranslatorPool instance
+        # main() hands the live TranslationWorker, so a runtime add/remove
+        # target (POST /config) applies to both passes -- see that class's
+        # docstring. Falls back to an empty pool (never translates
+        # anything) rather than None so every call site below can use it
+        # unconditionally (`self.translators.items()`/truthiness) without
+        # an `is not None` guard.
+        self.translators = translators if translators is not None else TranslatorPool()
         self.stats = stats
         # docs/DIARIZATION_PLAN.md iterations 3-4: when --speakers is on,
         # re-diarize each group's audio (group-local speaker turns) and
@@ -504,6 +850,33 @@ class Refiner:
             finally:
                 self._task_queue.task_done()
 
+    def reset(self) -> None:
+        """Drop pending spans/group state and clear the rolling audio
+        history, e.g. for a session reset (GitHub issue #29).
+
+        Waits for the worker queue to drain FIRST so this never races an
+        in-flight refine task still reading self.spans/self.history --
+        this makes reset() safe to call on its own, but it means anything
+        still pending here is simply DISCARDED, not decoded. Call this
+        only after any refine output worth keeping has already been
+        flushed (e.g. via maybe_refine(force=True) + a queue join, as
+        module-level reset_live_session() does) if losing an in-progress
+        group's text would be a problem.
+        """
+        self._task_queue.join()
+        self.spans = []
+        self.history.clear()
+        self._recluster_entries = []
+        self._recluster_group_idx = 0
+        if self._transcript is not None:
+            # visible marker in the transcript file, which stays open --
+            # readers scrolling through it need some indication that
+            # everything after this line belongs to a new, unrelated
+            # session (new speakers, reset language state), not a
+            # continuation of what came before.
+            self._transcript.write("\n----- session reset -----\n\n")
+            self._transcript.flush()
+
     def add_span(self, seg_start: int, seg_end: int, lang: str, text: str, speaker: str):
         """Append one finalized segment to the pending refine group.
 
@@ -572,8 +945,10 @@ class Refiner:
         try:
             raw = self.diarizer.process(buf, self.sr, num_clusters=num_clusters_hint_value)
         except Exception as exc:
-            print(f"[refine] diarization failed, falling back to single-speaker line: {exc}",
-                  file=sys.stderr)
+            message = f"diarization failed, falling back to single-speaker line: {exc}"
+            print(f"[refine] {message}", file=sys.stderr)
+            self.printer.hub.publish({"type": "warning", "code": "diarization_failed",
+                                      "message": message})
             raw = []
 
         # Round 8 (docs/DIARIZATION_PLAN.md section 18) T1: this helper
@@ -691,27 +1066,27 @@ class Refiner:
         # No-op unless --speaker-merge was passed.
         self.speaker_labeler.maybe_merge_centroids()
 
-        outputs = []  # (global_label, turn_text), in chronological turn order
+        outputs = []  # (global_label, turn_text, audio_s), in chronological turn order
         for local_id, start, end in turns:
             turn_text = self.asr.transcribe(buf[start:end], self.sr, known_lang=refine_lang,
                                             live=False)["text"]
             if turn_text.strip():
-                outputs.append((global_label[local_id], turn_text))
+                outputs.append((global_label[local_id], turn_text, (end - start) / self.sr))
 
-        total_text = " ".join(t for _, t in outputs)
+        total_text = " ".join(t for _, t, _ in outputs)
         if len(total_text.strip()) < 0.7 * len(fast_joined):
             return False
 
-        for label, turn_text in outputs:
+        for label, turn_text, turn_audio_s in outputs:
             # label is the canonical assignment from match_embedding() above
             # (unchanged); disp is only for what actually gets printed here
             # -- issue #11 / section 10.8 option B.
             disp = self.speaker_labeler.display_label(label) if label else label
             tag = f"{disp}|{refine_lang}" if disp else refine_lang
             print(f"[refine/{tag}] {turn_text}", flush=True)
-            if self.printer.server is not None:
-                self.printer.server.publish({"type": "refine", "text": turn_text,
-                                             "lang": refine_lang, "speaker": disp})
+            self.printer.hub.publish({"type": "refine", "text": turn_text,
+                                      "lang": refine_lang, "speaker": disp,
+                                      "audio_s": turn_audio_s})
             outs = []
             if self.translators and refine_lang == "ja":
                 for tlang, tr in self.translators.items():
@@ -776,6 +1151,11 @@ class Refiner:
         print(f"=== global re-cluster: {stats['n_entries']} local-cluster embeddings -> "
               f"{stats['n_clusters']} session-global speakers in {stats['time_s']:.2f}s "
               f"(diagnostic only, not applied to already-printed output) ===")
+        # GitHub issue #29: published only when the diagnostic actually ran
+        # (not on the early no-op return above), matching this docstring's
+        # own "diagnostic only" framing -- an embedder that cares about
+        # this gets the exact same mapping the console line summarizes.
+        self.printer.hub.publish({"type": "recluster", **stats})
         return stats
 
     def maybe_refine(self, now_sample: int, force: bool = False, force_sync: bool | None = None):
@@ -929,9 +1309,8 @@ class Refiner:
                     if speaker and self.speaker_labeler is not None else speaker)
             tag = f"{disp}|{refine_lang}" if disp else refine_lang
             print(f"[refine/{tag}] {text}", flush=True)
-            if self.printer.server is not None:
-                self.printer.server.publish({"type": "refine", "text": text, "lang": refine_lang,
-                                             "speaker": disp})
+            self.printer.hub.publish({"type": "refine", "text": text, "lang": refine_lang,
+                                      "speaker": disp, "audio_s": len(buf) / self.sr})
             outs = []
             if self.translators and refine_lang == "ja":
                 # synchronous here (we're already off the hot path) so the
@@ -978,7 +1357,8 @@ def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStat
                printer: PartialPrinter, refiner: "Refiner | None" = None,
                history: AudioHistory | None = None,
                translator_worker: "TranslationWorker | None" = None,
-               speaker_labeler=None, stop_event: "threading.Event | None" = None):
+               speaker_labeler=None, stop_event: "threading.Event | None" = None,
+               control: "ControlQueue | None" = None):
     """Drive the VAD -> ASR pipeline over `chunks` until it's exhausted or
     `stop_event` is set.
 
@@ -989,6 +1369,12 @@ def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStat
     source unblocking on its own. Checked once per chunk here; mic_chunks()
     additionally polls it directly since a plain `q.get()` would otherwise
     block indefinitely with nothing to yield.
+
+    `control`, if given, is polled once per chunk (ControlQueue.poll()) --
+    GitHub issue #29 review round 1: this is how a session-mutating
+    operation submitted from another thread (POST /reset, via
+    RuntimeControls.reset_fn) actually runs ON this thread instead of
+    racing it. See ControlQueue's docstring.
     """
     audio_pos = 0.0
     last_partial = 0.0
@@ -998,6 +1384,8 @@ def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStat
     for chunk in chunks:
         if stop_event is not None and stop_event.is_set():
             break
+        if control is not None:
+            control.poll()
         if not isinstance(chunk, np.ndarray):
             # non-ndarray = a "flush now" signal (ws_ingest.FLUSH on client
             # disconnect): finalize whatever the VAD has in progress instead
@@ -1038,6 +1426,105 @@ def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStat
             early_lang = None
         if refiner is not None and not vad.is_speech_detected():
             refiner.maybe_refine(int(audio_pos * sample_rate))
+
+
+def _session_summary_event(stats: SessionStats, speaker_labeler=None) -> dict:
+    """Build the `session_summary` event (GitHub issue #29): the same
+    numbers main()'s shutdown block already prints, plus the same speaker
+    diagnostics (when --speakers is on), as one JSON-able dict. Shared
+    between shutdown and reset_live_session() so both report identically.
+
+    `stats.latencies_ms`'s raw per-segment list is deliberately NOT
+    included -- it is unbounded (grows for the life of a long-running
+    session) and the console summary itself only ever reports its mean and
+    max, so those are what this reports too.
+    """
+    speakers = None
+    if speaker_labeler is not None:
+        speakers = {
+            "confirmed": speaker_labeler.num_confirmed_speakers(),
+            "provisional": speaker_labeler.provisional_label_count(),
+            "merges": speaker_labeler.merge_history(),
+            "centroids": speaker_labeler.centroid_summary(),
+        }
+    return {
+        "type": "session_summary",
+        "stats": {
+            "total_audio_s": stats.total_audio_s,
+            "segments": stats.segments,
+            "mean_latency_ms": (sum(stats.latencies_ms) / len(stats.latencies_ms)
+                                if stats.latencies_ms else None),
+            "max_latency_ms": max(stats.latencies_ms) if stats.latencies_ms else None,
+            "refine_lang_corrections": stats.refine_lang_corrections,
+            "refine_groups_closed": stats.refine_groups_closed,
+            "refine_lang_boundary_flushes": stats.refine_lang_boundary_flushes,
+        },
+        "speakers": speakers,
+    }
+
+
+def reset_live_session(asr: "RoutedASR | None", refiner: "Refiner | None",
+                       labeler, stats: "SessionStats | None",
+                       hub: "EventHub | None", live_vad: "LiveVad | None" = None) -> None:
+    """Reset a live session's mutable state WITHOUT rebuilding any loaded
+    model (GitHub issue #29's `POST /reset`) -- a new conversation with the
+    same process, same resident models, same VAD sensitivity, just no
+    memory of the speakers/language/statistics that came before.
+
+    Every parameter may be None (e.g. --no-refine leaves refiner=None, no
+    --speakers leaves labeler=None), so this works for whatever subset of
+    pieces a given session actually wired up.
+
+    Order matters:
+      1. Flush any refine work still pending (refiner.maybe_refine(force=
+         True) + a queue join) so the outgoing session's tail isn't
+         silently thrown away.
+      2. Publish `session_summary` on `hub` -- summarizing the session
+         that's ENDING, using its state as of right after the flush above
+         (not the zeroed-out state reset leaves behind).
+      3. Reset each piece's own state (labeler, refiner, stats).
+      4. asr.reset_session() -- clears the sticky/pending LID state last,
+         so nothing above it still needed the old session's language.
+      5. Publish `session_reset` on `hub`, announcing the reset is done.
+
+    `live_vad` is accepted for API symmetry with the other live-session
+    pieces (and for a future caller that wants it) but is NOT touched here
+    -- VAD sensitivity is an orthogonal, cross-session setting (see
+    LiveVad's docstring), not part of a conversation's identity/state, so
+    a session reset has no reason to change it.
+
+    THREADING (GitHub issue #29 review round 1): this function is NOT
+    thread-safe against a concurrently running run_stream() -- it mutates
+    the same SpeakerLabeler/Refiner/SessionStats/RoutedASR state
+    run_stream()'s decode loop reads and writes with no locking of its
+    own (SpeakerLabeler.reset() clearing _centroids/_counts while
+    match_embedding() is mid-lookup can raise IndexError there; two
+    threads both calling Refiner.maybe_refine() race on self.spans).
+    Call this only from the SAME thread that is driving run_stream() (an
+    in-process embedder with a single-threaded pipeline can call it
+    directly, e.g. between two separate run_stream() calls, or from
+    inside a callback run_stream() itself invokes), or hand it to a
+    ControlQueue that thread is polling instead
+    (`control.submit(lambda: reset_live_session(...))`) -- main()'s own
+    `POST /reset` wiring does exactly that (see RuntimeControls.reset_fn
+    in main()) rather than calling this directly from the HTTP handler
+    thread.
+    """
+    if refiner is not None:
+        refiner.maybe_refine(0, force=True)
+        refiner._task_queue.join()
+    if hub is not None and stats is not None:
+        hub.publish(_session_summary_event(stats, labeler))
+    if labeler is not None:
+        labeler.reset()
+    if refiner is not None:
+        refiner.reset()
+    if stats is not None:
+        stats.reset()
+    if asr is not None:
+        asr.reset_session()
+    if hub is not None:
+        hub.publish({"type": "session_reset"})
 
 
 def main():
@@ -1205,11 +1692,20 @@ def main():
     if args.lid_switch_confirm is None:
         args.lid_switch_confirm = default_confirm
 
+    # GitHub issue #29: the EventHub is created unconditionally -- every
+    # structured event below is published on it whether or not --serve's
+    # HTTP/SSE layer exists, so an app embedding this module can
+    # hub.add_listener(...) and get model_load/warning/session_summary/etc.
+    # without running a local HTTP server at all. --serve just adds that
+    # HTTP layer as an optional front end over the same hub.
+    hub = EventHub()
+    # Review round 1: a POST /reset (or any other future control operation)
+    # must run ON the decode thread, not the HTTP handler thread -- see
+    # ControlQueue's docstring. Polled by every run_stream() call below.
+    control = ControlQueue()
     server = None
     if args.serve:
-        from subtitle_server import SubtitleServer
-
-        server = SubtitleServer(port=args.serve).start()
+        server = SubtitleServer(port=args.serve, hub=hub).start()
         print(f"subtitle overlay: http://localhost:{args.serve}/  (OBS browser source)",
               file=sys.stderr)
 
@@ -1222,9 +1718,10 @@ def main():
                         dual_confirm=(args.mode != "fast"),
                         forced_lang=args.lang if args.mode == "single" else None,
                         ja_second_opinion=args.refine_ja_second_opinion,
+                        on_event=hub.publish,
                         **({"agree_threshold": args.refine_agree_threshold}
                            if args.refine_agree_threshold is not None else {}))
-        vad = build_vad(args.min_silence, args.max_speech)
+        live_vad = LiveVad(args.min_silence, args.max_speech)
     except ModelUnavailable as exc:
         # A required model is missing under models/ -- asr_engine and
         # build_vad() both guard sherpa-onnx's native constructors so this
@@ -1239,7 +1736,7 @@ def main():
         # and update this engine's live postprocessing dictionaries
         server.asr = asr
     stats = SessionStats()
-    printer = PartialPrinter(enabled=not args.no_partial, server=server)
+    printer = PartialPrinter(enabled=not args.no_partial, hub=hub)
 
     speaker_labeler = None
     diarizer = None
@@ -1278,18 +1775,24 @@ def main():
             # just without the per-turn refine split. Not fatal.
             print(f"[refine] speaker diarization disabled: {exc}", file=sys.stderr)
 
-    translators = {}
-    translator_worker = None
+    # GitHub issue #29: the pool (and the worker reading from it) are
+    # always constructed, even with no --translate targets at startup, so
+    # a target added later at runtime (POST /config's "translate" key,
+    # RuntimeControls.apply_config -> TranslatorPool.add_target) has a
+    # live worker already pulling ja finals to translate -- without this,
+    # a runtime-added target would sit in the pool with nothing ever
+    # calling it. An empty pool costs nothing: TranslationWorker._run()
+    # iterates zero targets per submitted line until one is added.
+    translator_pool = TranslatorPool(hub=hub)
     if args.translate:
         print(f"loading translators ({args.translate})...", file=sys.stderr)
-        translators = build_translators(args.translate)
-        if translators:
-            translator_worker = TranslationWorker(translators, server=server)
+        build_translators(args.translate, translator_pool)
+    translator_worker = TranslationWorker(translator_pool, hub)
 
     history = AudioHistory(SAMPLE_RATE)
     refiner = None if args.no_refine else Refiner(asr, history, SAMPLE_RATE, printer,
                                                   transcript_path=args.transcript,
-                                                  translators=translators, stats=stats,
+                                                  translators=translator_pool, stats=stats,
                                                   speaker_labeler=speaker_labeler,
                                                   diarizer=diarizer,
                                                   min_remap_update_s=args.speaker_min_remap_update_s,
@@ -1300,9 +1803,38 @@ def main():
                                                   num_clusters_hint=args.speaker_num_clusters_hint,
                                                   num_clusters_hint_min_s=args.speaker_num_clusters_hint_min_s)
 
+    if server is not None:
+        # GitHub issue #29: wired only when --serve is running an HTTP
+        # server for POST /config and POST /reset to actually reach --
+        # RuntimeControls itself has no HTTP dependency, but there is no
+        # endpoint to call it without --serve, and an app embedding this
+        # module directly can just call these same setters/reset_live_
+        # session() in-process without needing this wrapper at all.
+        #
+        # Review round 1: reset_live_session() is not safe to call
+        # directly from this HTTP handler thread (see its own docstring),
+        # so this SUBMITS it to `control` instead -- run_stream()'s decode
+        # loop actually runs it, once its next per-chunk control.poll()
+        # comes around -- and waits for that to happen. RESET_TIMEOUT_S
+        # bounds the wait: if run_stream() isn't currently pulling chunks
+        # to poll from (no --wav/mic/ws source active, or --input ws with
+        # no client sending audio -- ws_chunks() blocks on the network
+        # queue between chunks, so poll() isn't reached until one
+        # arrives), the reset stays queued and this returns False so the
+        # HTTP handler can answer 202 instead of hanging the request or
+        # falsely claiming 200 before the reset actually ran.
+        def _do_reset() -> bool:
+            done = control.submit(
+                lambda: reset_live_session(asr, refiner, speaker_labeler, stats, hub,
+                                           live_vad=live_vad))
+            return done.wait(timeout=RESET_TIMEOUT_S)
+
+        server.controls = RuntimeControls(asr=asr, translator_pool=translator_pool,
+                                          live_vad=live_vad, reset_fn=_do_reset)
+
     def finish(sr):
-        vad.flush()
-        drain_segments(vad, sr, asr, stats, printer, history,
+        live_vad.flush()
+        drain_segments(live_vad, sr, asr, stats, printer, history,
                        refiner=refiner,
                        translator_worker=translator_worker,
                        speaker_labeler=speaker_labeler)
@@ -1333,15 +1865,14 @@ def main():
     stop_event = threading.Event()
 
     try:
-        if server is not None:
-            server.publish({"type": "session_start"})
+        hub.publish({"type": "session_start"})
         if input_mode == "wav":
             if not args.wav:
                 ap.error("--input wav requires --wav PATH")
             samples, sr = read_wave(args.wav)  # resampled to SAMPLE_RATE if needed
             run_stream(wav_chunks(samples, sr, realtime=not args.no_realtime),
-                       vad, sr, asr, stats, printer, refiner, history, translator_worker,
-                       speaker_labeler, stop_event=stop_event)
+                       live_vad, sr, asr, stats, printer, refiner, history, translator_worker,
+                       speaker_labeler, stop_event=stop_event, control=control)
             finish(sr)
         elif input_mode == "ws":
             from ws_ingest import INGEST_PATH, IngestServer
@@ -1350,12 +1881,13 @@ def main():
                                   subtitle_server=server).start()
             print(f"ws ingest: ws://{args.ws_host}:{args.ws_port}{INGEST_PATH}  "
                   f"(JSON handshake, then binary pcm_s16le frames)", file=sys.stderr)
-            run_stream(ws_chunks(ingest), vad, SAMPLE_RATE, asr, stats, printer, refiner,
-                       history, translator_worker, speaker_labeler, stop_event=stop_event)
+            run_stream(ws_chunks(ingest), live_vad, SAMPLE_RATE, asr, stats, printer, refiner,
+                       history, translator_worker, speaker_labeler, stop_event=stop_event,
+                       control=control)
         else:
-            run_stream(mic_chunks(stop_event=stop_event), vad, SAMPLE_RATE, asr, stats, printer,
-                       refiner, history, translator_worker, speaker_labeler,
-                       stop_event=stop_event)
+            run_stream(mic_chunks(stop_event=stop_event), live_vad, SAMPLE_RATE, asr, stats,
+                       printer, refiner, history, translator_worker, speaker_labeler,
+                       stop_event=stop_event, control=control)
     except KeyboardInterrupt:
         stop_event.set()
         finish(SAMPLE_RATE)
@@ -1385,6 +1917,11 @@ def main():
             # way for the whole session.
             print(f"=== speaker labels still provisional at session end: "
                   f"{speaker_labeler.provisional_label_count()} ===")
+        # GitHub issue #29: the same session_summary shape reset_live_
+        # session() publishes mid-session, published here at real process
+        # shutdown too, right after the console prints above so both
+        # report identical numbers.
+        hub.publish(_session_summary_event(stats, speaker_labeler))
 
 
 if __name__ == "__main__":
