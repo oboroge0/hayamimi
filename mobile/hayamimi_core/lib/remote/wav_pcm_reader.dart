@@ -17,6 +17,9 @@ class WavPcm16 {
   final Uint8List pcmBytes;
 }
 
+/// Thrown when a `.wav` file isn't the canonical, uncompressed 16-bit PCM
+/// format this reader parses -- e.g. a missing `RIFF`/`WAVE`/`fmt `/`data`
+/// chunk, or a compressed/float sample format.
 class WavParseException implements Exception {
   WavParseException(this.message);
   final String message;

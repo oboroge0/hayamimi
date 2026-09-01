@@ -32,16 +32,6 @@ const double defaultDraftWindowSeconds = 8.0;
 /// wasting a decode call on near-silence.
 const double defaultMinDraftAudioSeconds = 0.25;
 
-/// Whether it's time to fire another draft decode.
-///
-/// [isDecoding] is the "skip, don't queue" guard: [LiveTranscriber] sends
-/// every decode -- fast-final, refine and draft alike -- to a single
-/// worker isolate that serves them one at a time. If anything is already
-/// outstanding there, this returns `false` rather than letting drafts pile
-/// up behind it: a queued draft would only delay whichever decode actually
-/// matters (the next final), and would be superseded by that final anyway.
-/// The caller is expected to just try again on the next frame, which
-/// naturally catches up once the worker is free.
 /// Drops whole frames off the front of [frames] until their total sample
 /// count is within [maxSeconds] of [sampleRate] audio (or exactly one frame
 /// remains, even if that single frame alone exceeds the budget).
@@ -50,7 +40,7 @@ const double defaultMinDraftAudioSeconds = 0.25;
 /// draft accumulator, so the accumulator itself never grows past this
 /// window. Without it, a long uninterrupted utterance made the accumulator
 /// -- and therefore the concatFloat32Lists pass over the whole thing that
-/// [_runDraftDecode] repeated on every draft tick -- grow without bound,
+/// `_runDraftDecode` repeated on every draft tick -- grow without bound,
 /// even though [capDraftWindow] only ever decodes the trailing
 /// [defaultDraftWindowSeconds] of it anyway: total work across the
 /// utterance was effectively O(n^2) in its length. Trimming at the source
@@ -70,6 +60,16 @@ List<Float32List> slideDraftFrames(
   return start == 0 ? frames : frames.sublist(start);
 }
 
+/// Whether it's time to fire another draft decode.
+///
+/// [isDecoding] is the "skip, don't queue" guard: [LiveTranscriber] sends
+/// every decode -- fast-final, refine and draft alike -- to a single
+/// worker isolate that serves them one at a time. If anything is already
+/// outstanding there, this returns `false` rather than letting drafts pile
+/// up behind it: a queued draft would only delay whichever decode actually
+/// matters (the next final), and would be superseded by that final anyway.
+/// The caller is expected to just try again on the next frame, which
+/// naturally catches up once the worker is free.
 bool isDraftDue({
   required bool isDecoding,
   required Duration sinceLastDraft,

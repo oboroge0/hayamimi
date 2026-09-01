@@ -8,6 +8,8 @@ import '../live/native_model_loader.dart';
 import 'lang_routing.dart';
 import 'routing_profile.dart';
 
+/// Thrown by [RoutedRecognizerSet.build] for a bad routing configuration
+/// (e.g. a missing model file for one of the routed tiers).
 class RoutedRecognizerException implements Exception {
   RoutedRecognizerException(this.message);
   final String message;
