@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import wave
+from typing import Callable
 
 import numpy as np
 import sherpa_onnx
@@ -126,8 +127,33 @@ class LiveVad:
                         min_silence: float | None = None,
                         max_speech: float | None = None) -> None:
         """Request new sensitivity parameters. Any argument left as None
-        keeps its current value. Applied at the next safe chunk boundary
-        (see the class docstring), not synchronously."""
+        keeps its current value (including an explicit JSON `null` coming
+        through POST /config -- payload.get() can't tell "key absent" from
+        "key present but null" apart, and both mean "no change" here,
+        which is what a caller sending a partial `vad` object expects).
+        Applied at the next safe chunk boundary (see the class docstring),
+        not synchronously.
+
+        Validated HERE, synchronously, so a bad value (GitHub issue #29
+        review round 1: POST /config {"vad": {"threshold": "abc"}}, or a
+        negative/zero/out-of-range number) raises ValueError immediately
+        and is never queued into self._pending. The alternative --
+        validating only when _maybe_apply_pending() later hands the value
+        to build_vad() -- would crash the DECODE thread arbitrarily long
+        after the HTTP request that caused it had already returned 200.
+        """
+        if threshold is not None:
+            _require_number("threshold", threshold)
+            if not (0 < threshold <= 1):
+                raise ValueError(f"threshold must be > 0 and <= 1, got {threshold!r}")
+        if min_silence is not None:
+            _require_number("min_silence", min_silence)
+            if not (min_silence > 0):
+                raise ValueError(f"min_silence must be > 0, got {min_silence!r}")
+        if max_speech is not None:
+            _require_number("max_speech", max_speech)
+            if not (max_speech > 0):
+                raise ValueError(f"max_speech must be > 0, got {max_speech!r}")
         with self._lock:
             self._pending = {
                 "threshold": self._threshold if threshold is None else threshold,
@@ -174,6 +200,78 @@ class LiveVad:
 
     def flush(self):
         return self._vad.flush()
+
+
+def _require_number(name: str, value) -> None:
+    """bool is a subclass of int in Python (isinstance(True, int) is
+    True), so it's excluded explicitly -- {"threshold": true} must be
+    rejected, not silently accepted as 1.0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number, got {value!r}")
+
+
+RESET_TIMEOUT_S = 10.0  # how long POST /reset waits for a chunk boundary before answering 202
+
+
+class ControlQueue:
+    """Runs submitted callables on the DECODE thread instead of the
+    caller's own thread (GitHub issue #29 review round 1).
+
+    Session-mutating operations like reset_live_session() touch state the
+    decode thread (run_stream()'s loop -- drain_segments(),
+    Refiner.maybe_refine(), SpeakerLabeler.match_embedding()) reads and
+    writes with no locking of its own, by design: none of those were built
+    to be thread-safe against a concurrent mutation, the same way the raw
+    sherpa VAD object LiveVad wraps isn't (see that class's own docstring
+    for why IT defers instead of mutating in place). Running
+    reset_live_session() directly on an HTTP handler thread (POST /reset)
+    would race the decode thread -- SpeakerLabeler.reset() clearing
+    _centroids/_counts mid-match_embedding() can raise IndexError there,
+    and two threads both calling Refiner.maybe_refine() at once race on
+    self.spans with nothing serializing them.
+
+    submit(fn) queues a zero-argument callable and returns a
+    threading.Event that is set once `fn` has actually run, ON the decode
+    thread, via poll(). Any exception `fn` raises is caught, printed
+    (never silently lost), and the Event is still set regardless -- a
+    broken control operation must not leave a caller blocked on
+    Event.wait() forever, the same "never let a control-plane problem
+    break the decode loop, but never let it vanish silently either"
+    principle RoutedASR._emit()/EventHub.publish() apply on the
+    event-publishing side (see those methods' docstrings).
+
+    poll() is meant to be called once per chunk by run_stream() -- the
+    same "next safe point" granularity LiveVad's own deferred VAD rebuild
+    uses -- and drains and runs every callable queued so far, in
+    submission (FIFO) order. If nothing is currently driving run_stream()
+    (no --wav/--input mic/ws in progress, or a --input ws session with no
+    client sending audio -- see reset_live_session()'s docstring for what
+    that means for POST /reset in that case), nobody calls poll() and a
+    submitted callable simply sits queued until something does.
+    """
+
+    def __init__(self):
+        self._q: "queue.Queue[tuple[Callable[[], None], threading.Event]]" = queue.Queue()
+
+    def submit(self, fn: Callable[[], None]) -> threading.Event:
+        done = threading.Event()
+        self._q.put((fn, done))
+        return done
+
+    def poll(self) -> None:
+        while True:
+            try:
+                fn, done = self._q.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                fn()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                sys.stderr.flush()
+            finally:
+                done.set()
 
 
 def wav_chunks(samples: np.ndarray, sample_rate: int, realtime: bool):
@@ -523,7 +621,14 @@ class TranslatorPool:
 
     @property
     def targets(self) -> list[str]:
-        return list(self._order)
+        # GitHub issue #29 review round 1: snapshotted under the lock, not
+        # a bare `list(self._order)` -- add_target()/remove_target() both
+        # mutate _order (append/remove) under this same lock, and reading
+        # it while a mutation is in flight is a real hazard (CPython list
+        # iteration/copy over a list another thread is resizing), not just
+        # a theoretical one.
+        with self._lock:
+            return list(self._order)
 
     def __len__(self) -> int:
         return len(self._translators)
@@ -533,8 +638,25 @@ class TranslatorPool:
 
     def items(self):
         """[(lang, translator), ...] in target-insertion order -- a
-        drop-in for `dict.items()` at Refiner's existing iteration sites."""
-        return [(lang, self._translators[lang]) for lang in self._order]
+        drop-in for `dict.items()` at Refiner's existing iteration sites.
+
+        Snapshotted under the lock (GitHub issue #29 review round 1): the
+        live TranslationWorker iterates this on its own thread while
+        add_target()/remove_target() can run concurrently from an HTTP
+        handler thread (POST /config's "translate" key). Without the lock,
+        a remove_target() landing between this reading `self._order` and
+        looking up each `lang` in `self._translators` could KeyError --
+        the worker thread has no try/except around its translation loop,
+        so that would silently kill it and translations would stop for
+        the rest of the session. Once snapshotted, the returned (lang,
+        translator) pairs hold real translator object references, so a
+        target removed a moment AFTER this call returns is harmless: the
+        caller just finishes using the object it already has (at most one
+        extra translation after the removal was requested), never a
+        re-lookup by name that could miss.
+        """
+        with self._lock:
+            return [(lang, self._translators[lang]) for lang in self._order]
 
     def add_target(self, lang: str) -> None:
         """Build and register a translator for `lang`. A no-op if `lang`
@@ -1235,7 +1357,8 @@ def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStat
                printer: PartialPrinter, refiner: "Refiner | None" = None,
                history: AudioHistory | None = None,
                translator_worker: "TranslationWorker | None" = None,
-               speaker_labeler=None, stop_event: "threading.Event | None" = None):
+               speaker_labeler=None, stop_event: "threading.Event | None" = None,
+               control: "ControlQueue | None" = None):
     """Drive the VAD -> ASR pipeline over `chunks` until it's exhausted or
     `stop_event` is set.
 
@@ -1246,6 +1369,12 @@ def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStat
     source unblocking on its own. Checked once per chunk here; mic_chunks()
     additionally polls it directly since a plain `q.get()` would otherwise
     block indefinitely with nothing to yield.
+
+    `control`, if given, is polled once per chunk (ControlQueue.poll()) --
+    GitHub issue #29 review round 1: this is how a session-mutating
+    operation submitted from another thread (POST /reset, via
+    RuntimeControls.reset_fn) actually runs ON this thread instead of
+    racing it. See ControlQueue's docstring.
     """
     audio_pos = 0.0
     last_partial = 0.0
@@ -1255,6 +1384,8 @@ def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStat
     for chunk in chunks:
         if stop_event is not None and stop_event.is_set():
             break
+        if control is not None:
+            control.poll()
         if not isinstance(chunk, np.ndarray):
             # non-ndarray = a "flush now" signal (ws_ingest.FLUSH on client
             # disconnect): finalize whatever the VAD has in progress instead
@@ -1361,6 +1492,23 @@ def reset_live_session(asr: "RoutedASR | None", refiner: "Refiner | None",
     -- VAD sensitivity is an orthogonal, cross-session setting (see
     LiveVad's docstring), not part of a conversation's identity/state, so
     a session reset has no reason to change it.
+
+    THREADING (GitHub issue #29 review round 1): this function is NOT
+    thread-safe against a concurrently running run_stream() -- it mutates
+    the same SpeakerLabeler/Refiner/SessionStats/RoutedASR state
+    run_stream()'s decode loop reads and writes with no locking of its
+    own (SpeakerLabeler.reset() clearing _centroids/_counts while
+    match_embedding() is mid-lookup can raise IndexError there; two
+    threads both calling Refiner.maybe_refine() race on self.spans).
+    Call this only from the SAME thread that is driving run_stream() (an
+    in-process embedder with a single-threaded pipeline can call it
+    directly, e.g. between two separate run_stream() calls, or from
+    inside a callback run_stream() itself invokes), or hand it to a
+    ControlQueue that thread is polling instead
+    (`control.submit(lambda: reset_live_session(...))`) -- main()'s own
+    `POST /reset` wiring does exactly that (see RuntimeControls.reset_fn
+    in main()) rather than calling this directly from the HTTP handler
+    thread.
     """
     if refiner is not None:
         refiner.maybe_refine(0, force=True)
@@ -1551,6 +1699,10 @@ def main():
     # without running a local HTTP server at all. --serve just adds that
     # HTTP layer as an optional front end over the same hub.
     hub = EventHub()
+    # Review round 1: a POST /reset (or any other future control operation)
+    # must run ON the decode thread, not the HTTP handler thread -- see
+    # ControlQueue's docstring. Polled by every run_stream() call below.
+    control = ControlQueue()
     server = None
     if args.serve:
         server = SubtitleServer(port=args.serve, hub=hub).start()
@@ -1658,8 +1810,24 @@ def main():
         # endpoint to call it without --serve, and an app embedding this
         # module directly can just call these same setters/reset_live_
         # session() in-process without needing this wrapper at all.
-        def _do_reset():
-            reset_live_session(asr, refiner, speaker_labeler, stats, hub, live_vad=live_vad)
+        #
+        # Review round 1: reset_live_session() is not safe to call
+        # directly from this HTTP handler thread (see its own docstring),
+        # so this SUBMITS it to `control` instead -- run_stream()'s decode
+        # loop actually runs it, once its next per-chunk control.poll()
+        # comes around -- and waits for that to happen. RESET_TIMEOUT_S
+        # bounds the wait: if run_stream() isn't currently pulling chunks
+        # to poll from (no --wav/mic/ws source active, or --input ws with
+        # no client sending audio -- ws_chunks() blocks on the network
+        # queue between chunks, so poll() isn't reached until one
+        # arrives), the reset stays queued and this returns False so the
+        # HTTP handler can answer 202 instead of hanging the request or
+        # falsely claiming 200 before the reset actually ran.
+        def _do_reset() -> bool:
+            done = control.submit(
+                lambda: reset_live_session(asr, refiner, speaker_labeler, stats, hub,
+                                           live_vad=live_vad))
+            return done.wait(timeout=RESET_TIMEOUT_S)
 
         server.controls = RuntimeControls(asr=asr, translator_pool=translator_pool,
                                           live_vad=live_vad, reset_fn=_do_reset)
@@ -1704,7 +1872,7 @@ def main():
             samples, sr = read_wave(args.wav)  # resampled to SAMPLE_RATE if needed
             run_stream(wav_chunks(samples, sr, realtime=not args.no_realtime),
                        live_vad, sr, asr, stats, printer, refiner, history, translator_worker,
-                       speaker_labeler, stop_event=stop_event)
+                       speaker_labeler, stop_event=stop_event, control=control)
             finish(sr)
         elif input_mode == "ws":
             from ws_ingest import INGEST_PATH, IngestServer
@@ -1714,11 +1882,12 @@ def main():
             print(f"ws ingest: ws://{args.ws_host}:{args.ws_port}{INGEST_PATH}  "
                   f"(JSON handshake, then binary pcm_s16le frames)", file=sys.stderr)
             run_stream(ws_chunks(ingest), live_vad, SAMPLE_RATE, asr, stats, printer, refiner,
-                       history, translator_worker, speaker_labeler, stop_event=stop_event)
+                       history, translator_worker, speaker_labeler, stop_event=stop_event,
+                       control=control)
         else:
             run_stream(mic_chunks(stop_event=stop_event), live_vad, SAMPLE_RATE, asr, stats,
                        printer, refiner, history, translator_worker, speaker_labeler,
-                       stop_event=stop_event)
+                       stop_event=stop_event, control=control)
     except KeyboardInterrupt:
         stop_event.set()
         finish(SAMPLE_RATE)

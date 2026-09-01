@@ -288,10 +288,19 @@ class RuntimeControls:
                 min_silence=vad_cfg.get("min_silence"),
                 max_speech=vad_cfg.get("max_speech"))
 
-    def reset(self) -> None:
+    def reset(self) -> bool:
+        """Run the session reset. Returns True if it completed, False if
+        `reset_fn` reports it's still pending (GitHub issue #29 review
+        round 1: reset_live_session() has to run on the same thread as the
+        decode loop, not this HTTP handler thread -- see that function's
+        own docstring -- so `reset_fn` typically submits it to a control
+        queue and waits with a timeout; a timeout means it's still queued,
+        not that it failed). The HTTP handler below turns False into a
+        202, not a 500 or a false-positive 200.
+        """
         if self.reset_fn is None:
             raise ValueError("no reset function attached")
-        self.reset_fn()
+        return bool(self.reset_fn())
 
 
 class SubtitleServer:
@@ -426,11 +435,18 @@ class SubtitleServer:
                         self._json(404, {"error": "no runtime controls attached"})
                         return
                     try:
-                        server.controls.reset()
+                        completed = server.controls.reset()
                     except ValueError as exc:
                         self._json(400, {"error": str(exc)})
                         return
-                    self._json(200, {"ok": True})
+                    if completed:
+                        self._json(200, {"ok": True})
+                    else:
+                        # GitHub issue #29 review round 1: the reset was
+                        # queued but hasn't run yet (reset_fn's own timeout
+                        # elapsed -- see RuntimeControls.reset()'s
+                        # docstring) -- 202 Accepted, not a failure.
+                        self._json(202, {"ok": False, "pending": True})
                     return
                 if self.path not in ("/replacements", "/itn_overrides", "/config"):
                     self._json(404, {"error": "not found"})

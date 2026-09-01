@@ -453,6 +453,55 @@ def test_build_translators_degrades_unsupported_target_to_stderr(monkeypatch, ca
     assert "unsupported translation target: bad" in capsys.readouterr().err
 
 
+def test_translator_pool_items_and_targets_survive_concurrent_add_remove(monkeypatch):
+    """Regression for GitHub issue #29 review round 1: items()/targets
+    used to read self._order/self._translators without the lock
+    add_target()/remove_target() hold, so a remove_target() landing mid-
+    iteration could KeyError inside the live TranslationWorker's daemon
+    thread -- which has no try/except around its loop, so that silently
+    killed translation for the rest of the session. Hammers add/remove
+    from one thread while several reader threads repeatedly call
+    items()/targets; any exception in a reader is the regression."""
+    monkeypatch.setattr(rt, "_build_translator", lambda lang: _FakeTranslator({}))
+
+    pool = rt.TranslatorPool()
+    langs = [f"l{i}" for i in range(12)]
+    for lang in langs:
+        pool.add_target(lang)
+
+    errors = []
+    stop = threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            try:
+                for _lang, _tr in pool.items():
+                    pass
+                list(pool.targets)
+            except Exception as exc:
+                errors.append(exc)
+                return
+
+    def writer():
+        for i in range(300):
+            lang = langs[i % len(langs)]
+            pool.remove_target(lang)
+            pool.add_target(lang)
+
+    readers = [threading.Thread(target=reader) for _ in range(4)]
+    for r in readers:
+        r.start()
+    writer_thread = threading.Thread(target=writer)
+    writer_thread.start()
+    writer_thread.join(timeout=15.0)
+    stop.set()
+    for r in readers:
+        r.join(timeout=5.0)
+
+    assert not any(r.is_alive() for r in readers), "a reader thread never noticed stop"
+    assert errors == [], f"items()/targets raised under concurrent mutation: {errors!r}"
+
+
 # =============================================================================
 # LiveVad.set_sensitivity: deferred rebuild
 # =============================================================================
@@ -530,6 +579,74 @@ def test_live_vad_set_sensitivity_partial_args_keep_other_values(fake_build_vad)
     live.accept_waveform(np.zeros(512, dtype=np.float32))
     params = live.current_params()
     assert params == {"threshold": 0.5, "min_silence": 0.5, "max_speech": 12.0}
+
+
+# --- LiveVad.set_sensitivity: validation (GitHub issue #29 review round 1) --
+#
+# A bad value must raise ValueError synchronously, from set_sensitivity()
+# itself, and never reach self._pending / build_vad() on the decode thread --
+# these tests assert both halves: the exception, AND that current_params()
+# (and, where relevant, the build count) is completely unchanged afterward.
+
+@pytest.mark.parametrize("kwargs", [
+    {"threshold": "abc"},       # wrong type: string
+    {"threshold": True},        # wrong type: bool (a subclass of int -- must not pass as 1.0)
+    {"threshold": -1},          # out of range: negative
+    {"threshold": 0},           # out of range: not > 0
+    {"threshold": 5.0},         # out of range: not <= 1
+    {"min_silence": "abc"},
+    {"min_silence": True},
+    {"min_silence": -0.1},
+    {"min_silence": 0},         # out of range: not > 0
+    {"max_speech": "abc"},
+    {"max_speech": True},
+    {"max_speech": -1},
+    {"max_speech": 0},
+])
+def test_live_vad_set_sensitivity_rejects_invalid_values(fake_build_vad, kwargs):
+    live = rt.LiveVad(min_silence=0.35, max_speech=12.0, vad_threshold=0.5)
+    with pytest.raises(ValueError):
+        live.set_sensitivity(**kwargs)
+    # rejected outright: nothing queued, nothing rebuilt
+    assert live.current_params() == {"threshold": 0.5, "min_silence": 0.35, "max_speech": 12.0}
+    assert len(fake_build_vad) == 1
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"threshold": 0.1}, {"threshold": 1.0}, {"threshold": 1},
+    {"min_silence": 0.01}, {"min_silence": 5},
+    {"max_speech": 0.5}, {"max_speech": 30},
+])
+def test_live_vad_set_sensitivity_accepts_valid_values(fake_build_vad, kwargs):
+    live = rt.LiveVad(min_silence=0.35, max_speech=12.0, vad_threshold=0.5)
+    live.set_sensitivity(**kwargs)  # must not raise
+
+
+def test_live_vad_set_sensitivity_none_is_always_a_noop_no_change():
+    """Every argument defaults to (and explicitly accepts) None, meaning
+    "keep current" -- including the JSON-null case from POST /config,
+    which apply_config() can't distinguish from "key absent" (payload.get()
+    returns None either way). Neither must ever raise or change anything."""
+    live = rt.LiveVad(min_silence=0.35, max_speech=12.0, vad_threshold=0.5)
+    live.set_sensitivity(threshold=None, min_silence=None, max_speech=None)  # must not raise
+
+
+def test_post_config_invalid_vad_value_returns_400_not_a_crash(running_server):
+    """End-to-end: a bad "vad" value in POST /config must answer 400 from
+    RuntimeControls.apply_config() -> LiveVad.set_sensitivity()'s
+    validation, not reach build_vad() on some other thread later."""
+    server, port = running_server
+    live_vad = rt.LiveVad(min_silence=0.35, max_speech=12.0, vad_threshold=0.5)
+    server.controls = ss.RuntimeControls(live_vad=live_vad)
+
+    status, payload = _request(port, "POST", "/config", {"vad": {"threshold": "abc"}})
+    assert status == 400
+    assert "threshold" in payload["error"]
+    assert live_vad.current_params()["threshold"] == pytest.approx(0.5)  # unchanged
+
+    status, payload = _request(port, "POST", "/config", {"vad": {"min_silence": -1}})
+    assert status == 400
+    assert "min_silence" in payload["error"]
 
 
 # =============================================================================
@@ -690,6 +807,172 @@ def test_reset_live_session_flushes_pending_refine_before_summarizing():
 
 
 # =============================================================================
+# ControlQueue: runs submitted work on the decode thread (review round 1)
+# =============================================================================
+
+def test_control_queue_submit_does_not_run_synchronously():
+    control = rt.ControlQueue()
+    ran = []
+    done = control.submit(lambda: ran.append(1))
+    assert ran == []
+    assert not done.is_set()
+
+
+def test_control_queue_poll_runs_queued_callables_in_fifo_order():
+    control = rt.ControlQueue()
+    order = []
+    control.submit(lambda: order.append(1))
+    control.submit(lambda: order.append(2))
+    control.submit(lambda: order.append(3))
+    control.poll()
+    assert order == [1, 2, 3]
+
+
+def test_control_queue_poll_with_nothing_queued_is_a_noop():
+    control = rt.ControlQueue()
+    control.poll()  # must not raise or block
+
+
+def test_control_queue_poll_sets_the_event_after_running():
+    control = rt.ControlQueue()
+    done = control.submit(lambda: None)
+    assert not done.is_set()
+    control.poll()
+    assert done.is_set()
+
+
+def test_control_queue_poll_sets_event_and_continues_past_a_raising_callable(capsys):
+    control = rt.ControlQueue()
+    order = []
+
+    def boom():
+        raise RuntimeError("control task broke")
+
+    done1 = control.submit(boom)
+    done2 = control.submit(lambda: order.append("second"))
+    control.poll()
+
+    # a broken control task must not leave a caller blocked forever, and
+    # must not stop the next queued task from running
+    assert done1.is_set()
+    assert done2.is_set()
+    assert order == ["second"]
+    assert "control task broke" in capsys.readouterr().err
+
+
+def test_control_queue_task_runs_on_the_thread_that_calls_poll_not_the_submitter():
+    """The core guarantee this class exists for: a callable submitted from
+    one thread (e.g. an HTTP handler, for POST /reset) actually executes
+    on whichever thread calls poll() (the decode thread), never on the
+    submitter's own thread -- this is what keeps reset_live_session() off
+    the HTTP handler thread and out of a race with run_stream()'s loop."""
+    control = rt.ControlQueue()
+    ran_on = []
+    go = threading.Event()
+
+    def task():
+        ran_on.append(threading.current_thread())
+
+    def poller():
+        go.wait(timeout=3.0)
+        control.poll()
+
+    poller_thread = threading.Thread(target=poller)
+    poller_thread.start()
+
+    done = control.submit(task)
+    assert not done.is_set()  # queued, not yet run
+
+    go.set()
+    assert done.wait(timeout=3.0)
+    poller_thread.join(timeout=3.0)
+
+    assert ran_on == [poller_thread]
+    assert ran_on[0] is not threading.current_thread()
+
+
+# =============================================================================
+# run_stream(): control.poll() integration (review round 1)
+# =============================================================================
+
+class _NullVad:
+    """Never produces a segment -- these tests are only about whether
+    run_stream()'s chunk loop calls control.poll(), not about VAD/ASR
+    behavior (same minimal-stub spirit as tests/test_process_safety.py's
+    _StubVad)."""
+
+    def accept_waveform(self, chunk):
+        pass
+
+    def empty(self):
+        return True
+
+    def is_speech_detected(self):
+        return False
+
+    def flush(self):
+        pass
+
+
+def test_run_stream_polls_control_once_per_chunk():
+    sr = 16000
+    n_chunks = 5
+    samples = np.zeros(rt.WINDOW_SIZE * n_chunks, dtype=np.float32)
+    stats = rt.SessionStats()
+    printer = rt.PartialPrinter(enabled=False)
+    control = rt.ControlQueue()
+    poll_calls = []
+    original_poll = control.poll
+    control.poll = lambda: (poll_calls.append(1), original_poll())
+
+    rt.run_stream(rt.wav_chunks(samples, sr, realtime=False), _NullVad(), sr, None, stats,
+                  printer, control=control)
+
+    assert len(poll_calls) == n_chunks
+
+
+def test_run_stream_without_control_is_unaffected():
+    """Regression guard: omitting `control` (every pre-existing caller)
+    must behave exactly as before -- no AttributeError, no behavior
+    change."""
+    sr = 16000
+    samples = np.zeros(rt.WINDOW_SIZE * 3, dtype=np.float32)
+    stats = rt.SessionStats()
+    printer = rt.PartialPrinter(enabled=False)
+    rt.run_stream(rt.wav_chunks(samples, sr, realtime=False), _NullVad(), sr, None, stats,
+                  printer)  # control omitted entirely
+
+
+def test_run_stream_applies_a_submitted_task_on_the_decode_thread_not_the_submitter():
+    """End-to-end version of the review round 1 fix: a task submitted
+    from this (the test/"HTTP handler") thread runs on the thread that's
+    actually driving run_stream(), not here -- proving a POST /reset
+    wired the same way (main()'s RuntimeControls.reset_fn) can no longer
+    race the decode loop."""
+    sr = 16000
+    samples = np.zeros(int(1.0 * sr), dtype=np.float32)
+    stats = rt.SessionStats()
+    printer = rt.PartialPrinter(enabled=False)
+    control = rt.ControlQueue()
+
+    ran_on = []
+    control.submit(lambda: ran_on.append(threading.current_thread()))
+    assert ran_on == []  # not run synchronously by submit() itself
+
+    def run():
+        rt.run_stream(rt.wav_chunks(samples, sr, realtime=False), _NullVad(), sr, None, stats,
+                      printer, control=control)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(timeout=3.0)
+
+    assert not thread.is_alive()
+    assert ran_on == [thread]
+    assert ran_on[0] is not threading.current_thread()
+
+
+# =============================================================================
 # SubtitleServer: GET/POST /config, POST /reset via http.client
 # =============================================================================
 
@@ -798,11 +1081,29 @@ def test_post_config_invalid_value_returns_400_with_message(running_server):
 def test_post_reset_calls_the_reset_function(running_server):
     server, port = running_server
     calls = []
-    server.controls = ss.RuntimeControls(reset_fn=lambda: calls.append(True))
+
+    def reset_fn():
+        calls.append(True)
+        return True  # completed synchronously (see reset_fn's own contract)
+
+    server.controls = ss.RuntimeControls(reset_fn=reset_fn)
 
     status, payload = _request(port, "POST", "/reset")
     assert status == 200 and payload == {"ok": True}
     assert calls == [True]
+
+
+def test_post_reset_pending_returns_202(running_server):
+    """reset_fn reporting False (still queued -- e.g. main()'s real
+    wiring when a submitted ControlQueue task hasn't been polled by the
+    decode thread within its timeout, GitHub issue #29 review round 1)
+    must answer 202, not 200 and not a 4xx/5xx failure."""
+    server, port = running_server
+    server.controls = ss.RuntimeControls(reset_fn=lambda: False)
+
+    status, payload = _request(port, "POST", "/reset")
+    assert status == 202
+    assert payload == {"ok": False, "pending": True}
 
 
 def test_post_reset_without_reset_fn_returns_400(running_server):

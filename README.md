@@ -192,6 +192,20 @@ between unrelated recordings inside one long-running process (a stream host
 switching guests, a kiosk resetting between visitors), where paying the
 model-load cost again would be wasted time.
 
+The reset itself doesn't run on the HTTP handler thread: it has to run on
+the same thread that's decoding audio, since it touches speaker/language
+state that thread reads and writes with no locking of its own (running it
+directly from a second thread was found, in review, to be able to raise an
+exception on the decode thread mid-segment). It's queued instead, and picked
+up the next time that thread reaches a safe point between audio chunks --
+normally near-instant, since a chunk is only tens of milliseconds. `POST
+/reset` answers `200 {"ok": true}` once the reset has actually run, or, if
+ten seconds pass without a safe point to apply it at, `202 {"ok": false,
+"pending": true}` -- it's still queued and will still apply, just later.
+This matters mainly for `--input ws`: with no client currently sending
+audio, nothing is reaching those chunk boundaries at all, so a reset
+requested then won't apply until audio resumes.
+
 ## Requirements
 
 Python 3.10+ and ffmpeg on PATH. Developed and tested on **Windows 11**;
