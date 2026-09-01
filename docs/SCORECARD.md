@@ -3,6 +3,21 @@
 本番経路 (LID→ルーティング→デコード→ja句読点) のエンドツーエンド採点。
 単発クリップのためプリロール・二段パスは含まない。metricは en=WER, 他=CER（yueはt2s正規化）。
 
+## 評価データの出典
+
+| lang | データセット | 性質 |
+|---|---|---|
+| ja | ReazonSpeech test split(ミラー: japanese-asr/ja_asr.reazonspeech_test) | **日本のTV放送**由来。「実放送」と呼んでいるのはこのセット |
+| en | LibriSpeech dev-clean(openslr/librispeech_asr) | オーディオブック朗読(放送ではない) |
+| zh / ko | google/fleurs validation split | 朗読音声(放送ではない) |
+| yue | google/fleurs(yue_hant_hk) | 朗読音声(放送ではない) |
+
+「実放送でCER 3.8%」のような表現が指すのは **ja 行(ReazonSpeech=TV放送由来)のみ**。
+他言語は朗読系データでの計測であり、性質が異なる。再生成手順は
+`scripts/make_realset.py` / `make_realset_zhko.py` / `make_realset_yue.py`(各スクリプト
+冒頭に取得元の詳細あり)。標準ベンチ一本での5言語比較は FLEURS 統一計測
+(`docs/BENCHMARKS.md` 2026-09-01節)を参照。
+
 | lang | clips | LID正解 | 主tier | mean err | mean RTF |
 |---|---|---|---|---|---|
 | ja | 15 | 15/15 | rz | 0.038 | 0.090 |
