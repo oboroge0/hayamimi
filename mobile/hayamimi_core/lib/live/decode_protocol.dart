@@ -23,6 +23,8 @@ library;
 import 'dart:isolate';
 import 'dart:typed_data';
 
+import 'ja_punctuation.dart';
+
 /// A failure raised while starting, or by, the decode worker.
 ///
 /// `LiveTranscriber` re-wraps this as a `LiveTranscriberException` carrying
@@ -59,7 +61,8 @@ enum DecodeRequestKind {
   shutdown,
 }
 
-/// Everything the worker needs to build its recognizer(s) itself.
+/// Everything the worker needs to build its recognizer(s) — and, when the
+/// session asks for it, its Japanese punctuation model — itself.
 ///
 /// The worker loads the models rather than being handed them: the objects
 /// it builds never leave that isolate, so there is no pointer handoff to
@@ -76,7 +79,16 @@ class DecodeWorkerConfig {
     this.hotwordsScore = 1.5,
     this.numThreads = 2,
     this.sampleRate = 16000,
-  });
+    this.punctModelPath,
+    this.punctVocabPath,
+    this.punctLibraryPath,
+    this.punctNumThreads = defaultPunctNumThreads,
+    this.punctuatePlainSession = true,
+  }) : assert(
+         (punctModelPath == null) == (punctVocabPath == null),
+         'Japanese punctuation needs both punctModelPath and punctVocabPath, '
+         'or neither.',
+       );
 
   /// Build the three-model `RoutedRecognizerSet` (ReazonSpeech ja +
   /// SenseVoice + whisper-tiny LID) rather than one plain recognizer —
@@ -97,6 +109,65 @@ class DecodeWorkerConfig {
   final int numThreads;
   final int sampleRate;
 
+  /// The Japanese punctuation model to load, or `null` to load none — in
+  /// which case the worker behaves exactly as it did before punctuation
+  /// existed. Set together with [punctVocabPath]; setting one without the
+  /// other is a configuration error the worker reports as a build failure.
+  ///
+  /// See `JaPunctuation`, the value object `LiveTranscriber.start` takes,
+  /// for what these files are.
+  final String? punctModelPath;
+
+  /// The punctuation model's `vocab.txt`. See [punctModelPath].
+  final String? punctVocabPath;
+
+  /// Where ONNX Runtime comes from for the punctuation model; `null` uses
+  /// `OrtLibrary`'s per-platform default (the copy `sherpa_onnx` already
+  /// loaded, on Android). Threaded through so a desktop host — and the
+  /// tests — can name a library the loader would not otherwise find.
+  final String? punctLibraryPath;
+
+  /// Intra-op threads for the punctuation model. See
+  /// [defaultPunctNumThreads].
+  final int punctNumThreads;
+
+  /// Whether a **plain** (non-[routed]) session's refine results are
+  /// Japanese, and so should be punctuated.
+  ///
+  /// A routed session decides per result, from the language the routing
+  /// resolved ([DecodeWorkerResult.lang] `== 'ja'`). A plain session has one
+  /// model, one language, and no language tag to test — so it says here,
+  /// once, whether that language is Japanese. Defaults to `true`, because a
+  /// caller who configured a Japanese punctuation model for a single-model
+  /// session has already said what language it transcribes. **A plain
+  /// session whose model is not Japanese must not pass punctuation paths at
+  /// all**: punctuating, say, English with this model produces nonsense
+  /// rather than nothing.
+  ///
+  /// Ignored when [punctModelPath] is `null` or when [routed] is true.
+  final bool punctuatePlainSession;
+
+  /// Whether this session loads a punctuation model at all.
+  bool get hasPunctuation => punctModelPath != null && punctVocabPath != null;
+
+  /// Whether a refine result that came back as [lang] should have Japanese
+  /// punctuation restored into it.
+  ///
+  /// Kept here, as a pure function of the config and one result's language,
+  /// so the rule can be read and tested on its own rather than inferred
+  /// from the worker's decode loop. `lang` is `null` for a plain session,
+  /// which is why [punctuatePlainSession] exists.
+  ///
+  /// Only refine results are punctuated, so the worker checks the request
+  /// kind before calling this — see `decode_worker.dart` for why finals and
+  /// drafts are left alone.
+  bool shouldPunctuateRefine({String? lang}) {
+    if (!hasPunctuation) {
+      return false;
+    }
+    return routed ? lang == 'ja' : punctuatePlainSession;
+  }
+
   List<Object?> toMessage() => <Object?>[
     routed,
     modelDir,
@@ -107,6 +178,11 @@ class DecodeWorkerConfig {
     hotwordsScore,
     numThreads,
     sampleRate,
+    punctModelPath,
+    punctVocabPath,
+    punctLibraryPath,
+    punctNumThreads,
+    punctuatePlainSession,
   ];
 
   static DecodeWorkerConfig fromMessage(Object? message) {
@@ -121,6 +197,11 @@ class DecodeWorkerConfig {
       hotwordsScore: m[6]! as double,
       numThreads: m[7]! as int,
       sampleRate: m[8]! as int,
+      punctModelPath: m[9] as String?,
+      punctVocabPath: m[10] as String?,
+      punctLibraryPath: m[11] as String?,
+      punctNumThreads: m[12]! as int,
+      punctuatePlainSession: m[13]! as bool,
     );
   }
 }
@@ -227,6 +308,7 @@ sealed class DecodeWorkerMessage {
           lang: m[5] as String?,
           switched: m[6]! as bool,
           latencyMs: m[7]! as double,
+          punctuated: m[8]! as bool,
         );
       case 'failure':
         return DecodeWorkerFailure(
@@ -298,6 +380,7 @@ class DecodeWorkerResult extends DecodeWorkerMessage {
     this.segmentId = 0,
     this.lang,
     this.switched = false,
+    this.punctuated = false,
   });
 
   /// Echoes [DecodeWorkerCommand.id].
@@ -318,11 +401,19 @@ class DecodeWorkerResult extends DecodeWorkerMessage {
   /// Whether this segment is what made a routed session change language.
   final bool switched;
 
-  /// Wall-clock milliseconds the decode itself took inside the worker.
-  /// Deliberately excludes the message round trip, so it stays the same
-  /// quantity `LiveTranscriptEntry.latencyMs` reported when decoding
-  /// happened in-process.
+  /// Wall-clock milliseconds the work took inside the worker: the decode,
+  /// plus punctuation restoration when [punctuated] is true. Deliberately
+  /// excludes the message round trip, so for an unpunctuated result it
+  /// stays the same quantity `LiveTranscriptEntry.latencyMs` reported when
+  /// decoding happened in-process.
   final double latencyMs;
+
+  /// Whether Japanese punctuation was restored into [text] — i.e. the
+  /// punctuation model ran on this result. Only refine results are ever
+  /// punctuated, and only when the session was started with a punctuation
+  /// model that applies to this result's language (see
+  /// [DecodeWorkerConfig.shouldPunctuateRefine]).
+  final bool punctuated;
 
   @override
   List<Object?> toMessage() => <Object?>[
@@ -334,6 +425,7 @@ class DecodeWorkerResult extends DecodeWorkerMessage {
     lang,
     switched,
     latencyMs,
+    punctuated,
   ];
 }
 

@@ -27,6 +27,7 @@ export 'live/decode_scheduler.dart';
 export 'live/decode_session.dart';
 export 'live/decode_worker.dart';
 export 'live/draft_pass.dart';
+export 'live/ja_punctuation.dart';
 export 'live/live_transcriber.dart';
 export 'live/live_vad.dart';
 export 'live/model_load_event.dart';
