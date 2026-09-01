@@ -75,11 +75,15 @@ class VadSensitivity {
 ///    would silently truncate or corrupt whatever segment is in progress.
 ///    The caller keeps feeding audio to the old VAD until the segment closes
 ///    (`speechActive` goes false), then swaps.
-///  * [busy] -- never swap while a decode (final/refine/draft) is in
-///    flight, mirroring [isDraftDue]'s `isDecoding` guard in
-///    `draft_pass.dart`: `LiveTranscriber` reads/writes its native handles
-///    from a single call stack at a time by convention, and a swap
-///    interleaved with a decode would violate that.
+///  * [busy] -- never swap while a decode is outstanding at the decode
+///    worker, mirroring [isDraftDue]'s `isDecoding` guard in
+///    `draft_pass.dart`. This one is now belt and braces rather than
+///    strictly required: the recognizers moved to their own isolate, so a
+///    VAD swap on the caller's isolate can no longer interleave with a
+///    decode at all. It is kept because it costs nothing (between
+///    utterances the queue is empty anyway) and because it keeps the swap
+///    point defined by one rule -- "when nothing is happening" -- rather
+///    than by which piece of state happens to be shared today.
 ///
 /// Pure function so the "only swap at a segment boundary" decision is
 /// unit-testable without the sherpa-onnx native VAD itself -- the actual
