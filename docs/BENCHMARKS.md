@@ -550,7 +550,11 @@ faster-whisper large-v3-turbo を5言語×100本、直接比較した。
 （err: en=WER、他=CER。yueはt2s正規化後。RTF = 処理時間 / 音声長、小さいほど速い。）
 
 - **速度**: hayamimiがturboの約12〜21倍速い（RTF比較: ja 16x, en 11x, zh 13x, ko 18x, yue 20x）。
-  turboはこのCPUでリアルタイム未達（RTF > 0.6）、hayamimiは全言語RTF < 0.08で大幅にリアルタイム内。
+  turboのRTFは0.64〜0.83で、**この短尺クリップ(平均十数秒)のバッチ処理では実時間を下回る**。
+  `docs/COMPARISON.md` の旧実測(実放送クリップ、RTF 1.03〜1.39)と食い違うのは計測条件の差
+  (クリップ長・スレッド数)によるもので、どちらも実測値。なおバッチRTFが1を切っても、
+  Whisper系は発話中の逐次出力(ストリーミング字幕)ができない点は変わらない。
+  hayamimiは全言語RTF < 0.08。
 - **精度**: zh(0.0744 vs 0.0777)のみhayamimiがturboよりわずかに良く、他4言語（ja/en/ko/yue）は
   turboがhayamimiを上回る——ただし上記の言語指定の非対称（turboに正解言語を渡している）を
   差し引く必要がある。差は ja +0.0159, en +0.0443, ko +0.0411, yue +0.0059 (turbo優位)、
