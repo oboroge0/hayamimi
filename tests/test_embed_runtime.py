@@ -622,19 +622,27 @@ def test_live_vad_set_sensitivity_accepts_valid_values(fake_build_vad, kwargs):
     live.set_sensitivity(**kwargs)  # must not raise
 
 
-def test_live_vad_set_sensitivity_none_is_always_a_noop_no_change():
+def test_live_vad_set_sensitivity_none_is_always_a_noop_no_change(fake_build_vad):
     """Every argument defaults to (and explicitly accepts) None, meaning
     "keep current" -- including the JSON-null case from POST /config,
     which apply_config() can't distinguish from "key absent" (payload.get()
-    returns None either way). Neither must ever raise or change anything."""
+    returns None either way). Neither must ever raise or change anything.
+
+    Uses fake_build_vad (CI has no models/silero_vad.onnx -- LiveVad.
+    __init__ calls build_vad() unconditionally, so every LiveVad
+    construction in this file needs it, real VAD or not)."""
     live = rt.LiveVad(min_silence=0.35, max_speech=12.0, vad_threshold=0.5)
     live.set_sensitivity(threshold=None, min_silence=None, max_speech=None)  # must not raise
 
 
-def test_post_config_invalid_vad_value_returns_400_not_a_crash(running_server):
+def test_post_config_invalid_vad_value_returns_400_not_a_crash(running_server, fake_build_vad):
     """End-to-end: a bad "vad" value in POST /config must answer 400 from
     RuntimeControls.apply_config() -> LiveVad.set_sensitivity()'s
-    validation, not reach build_vad() on some other thread later."""
+    validation, not reach build_vad() on some other thread later.
+
+    Uses fake_build_vad (see test_live_vad_set_sensitivity_none_is_always_
+    a_noop_no_change's docstring for why every LiveVad construction here
+    needs it)."""
     server, port = running_server
     live_vad = rt.LiveVad(min_silence=0.35, max_speech=12.0, vad_threshold=0.5)
     server.controls = ss.RuntimeControls(live_vad=live_vad)
