@@ -2715,7 +2715,296 @@ pytest: 163 passed, 1 skipped（§17の159 passed, 1 skippedに、本ラウン�
   設計する動機だった再クラスタリング手法自体が、粒度floorにより
   当面採用見込みが立たないため。
 
-### 総括（Round 1〜8、本ループの最終まとめ）
+## 19. Round 9 Experiment A: FastClusteringへのnum_clustersヒント（確信済みグローバル話者数）— 不採用（改善はゼロ会議のみ、ES2011aで+2.5〜2.6pt悪化）
+
+### 背景
+
+§18（Round 8）までの8ラウンドで「採用に至った本番動作変更は実質ゼロ」
+という結論に達したあと、文献ベースで再検討し、Round 1〜8のループが
+きちんと実行しなかった2つの具体的候補が見つかった。本セクションは
+そのうち1つ目——`sherpa_onnx.FastClusteringConfig`が受け付ける
+`num_clusters`引数（現在`scripts/diarize.GroupDiarizer`は
+コンストラクタ引数として持っているが、常に-1＝自動判定で呼ばれており、
+実質未使用）を、清書グループのローカルクラスタリングに対する
+ヒントとして使う実験。
+
+**仮説**: §14（Round 4）以来、LOCAL誤り（ローカルdiarizer自体の
+過分割、清書グループ単位のクラスタリングが実話者数より多くの
+クラスタを作ってしまう）はconfusionの2番目に大きい要因
+（ES2011a 24-39%、§14 T1）と特定済みだが、対策は未着手のまま
+残課題に挙がっていた。`SpeakerLabeler`はセッション全体を通じて
+確信済み（`PROVISIONAL_CONFIRM_HITS`回以上マッチ済み）のグローバル
+話者数を追跡している——この数を各清書グループのローカル
+クラスタリングへ「このグループにいる話者は多くてもこれくらい」
+というヒントとして渡せば、過分割を抑制できるのではないか。
+
+Round 5（§15）の教訓（「間違った数を強制するのは有害」）を踏まえ、
+（a）ヒントを渡すかどうかを`off`/`confirmed`/`confirmed-capped`の
+3モードで切り替え可能にする、（b）グループの発話時間が短すぎる
+場合はヒントを適用しない（"soft variant"、`--num-clusters-hint-min-s`
+でスイープ可能）という2つの安全弁を設計に含めた。
+
+### 実装
+
+`scripts/diarize.GroupDiarizer`に`process(samples, sample_rate,
+num_clusters=None)`という新しい呼び出しごとのオーバーライド引数を
+追加した。sherpa-onnxの`OfflineSpeakerDiarization.set_config()`
+（モデル再ロードなしの軽量な設定差し替え、直接`dir()`/`help()`で
+確認済み）を使い、要求された`num_clusters`が現在ライブな値と
+異なるときだけ設定を更新する（同じ値が連続する呼び出しでは
+コストゼロ）。
+
+`scripts/speaker_id.SpeakerLabeler`に`num_confirmed_speakers()`を
+追加: `_alias`されていない（マージで消えていない）かつ
+`_counts[i] >= PROVISIONAL_CONFIRM_HITS`の生存centroid数を返す
+——`len(self._centroids)`ではなく確信済みの数だけを数えるのは、
+開いたばかりのノイズの多い一発centroidまでヒントに含めて
+水増ししないため。
+
+`scripts/eval_diar.py`の`generate_diarize_hypothesis()`に
+`num_clusters_hint`（"off"/"confirmed"/"confirmed-capped"）・
+`num_clusters_hint_min_s`引数、`--num-clusters-hint`/
+`--num-clusters-hint-min-s`CLIフラグを追加。各グループの
+diarizer呼び出し直前（＝そのグループ自身のremapがまだ走って
+いない時点、＝直前までの全グループのremapは反映済み）に
+`labeler.num_confirmed_speakers()`を読み、グループの
+VAD検出済み発話時間（`sum(e-s for s,e,_ in group)/sr`——
+`g_end-g_start`ではなく、グループ内無音を含まない実発話時間）が
+`num_clusters_hint_min_s`以上のときだけヒントを適用する。
+`confirmed`は確信済み数をそのまま、`confirmed-capped`はさらに
+`min(confirmed, len(group))`（グループの生VADセグメント数、
+diarization前に分かる安価な上限）でクランプする。確信済み数が
+0（セッション最初のグループなど）のときはヒントなし（`off`と
+同じ）にフォールバックする。`scripts/realtime_transcribe.py`の
+`Refiner`にも同名のコンストラクタ引数／`--speaker-num-clusters-hint`/
+`--speaker-num-clusters-hint-min-s`CLIフラグとして同じロジックを
+配線（`maybe_refine()`が`self.spans`をクリアする直前に計算し、
+`_emit_turns()`へ渡す）。デフォルトは両方とも"off"／0.0で、
+既存の全ラウンドの挙動と完全に同じ（フラグoffリグレッション、
+`pytest`全211件通過で確認済み）。
+
+### 測定
+
+AMI 5会議、collar=0.25s、`--method refine_diarize --breakdown`。
+baselineは§16以降と同じ13.9%（run間ノイズ±0.2pt級は既知）。
+
+| 設定 | 平均DER | ES2011a | IS1008a | ES2004a | IS1009a | TS3003a |
+|---|---|---|---|---|---|---|
+| baseline（off） | 13.9% | 16.8% | 4.0% | 17.8% | 16.9% | 14.1% |
+| confirmed, min_s=0 | 14.6%（+0.7pt） | 18.0%（+1.2pt） | 3.9% | 20.5%（**+2.7pt**） | 16.4% | 14.0% |
+| confirmed-capped, min_s=0 | 16.0%（+2.1pt） | 17.9%（+1.1pt） | 7.1%（+3.1pt） | 22.1%（**+4.3pt**） | 19.9%（**+3.0pt**） | 13.1% |
+| confirmed, min_s=8 | 14.8%（+0.9pt） | 18.9%（+2.1pt） | 3.9% | 20.8%（**+3.0pt**） | 16.4% | 14.0% |
+| confirmed, min_s=15 | 13.9%（±0.0pt） | 19.4%（**+2.6pt**） | 3.9% | 16.9%（-0.9pt） | 16.4% | 13.1%（-1.0pt） |
+| confirmed, min_s=20 | 13.9%（±0.0pt） | 19.3%（**+2.5pt**） | 3.9% | 16.9%（-0.9pt） | 16.9% | 12.8%（-1.3pt） |
+| confirmed-capped, min_s=15 | 16.1%（+2.2pt） | 19.1%（**+2.3pt**） | 7.1%（+3.1pt） | 21.5%（**+3.7pt**） | 19.9%（**+3.0pt**） | 12.7%（-1.4pt） |
+
+**`confirmed-capped`は全設定で`confirmed`より一貫して悪い**
+（`min(confirmed, len(group))`のクランプが逆効果——グループの
+生VADセグメント数は実際のローカル話者数の上限としてはきつすぎる
+ことが多く、正しい話者数より小さい値へさらに強制してしまう）。
+`--num-clusters-hint-min-s`のsoft variant（短いグループにヒントを
+適用しない安全弁）は効果があり、min_s=0→8→15と上げるにつれて
+平均DERはbaseline水準（13.9%）まで戻る——だが**これは平均が
+tieになっているだけで、会議別には収束していない**。min_s=15/20
+どちらも、ES2004a・TS3003aは明確に改善する一方（それぞれ
+最大-0.9pt/-1.4pt）、**ES2011aは一貫して+2.5〜2.6pt悪化し続ける**
+——採用基準の「どの会議も0.5pt超の悪化なし」に大きく抵触する。
+min_sをさらに上げてもES2011aの悪化幅は縮まらなかった（8: +2.1pt、
+15: +2.6pt、20: +2.5pt——単調な関係ですらない）。
+
+**判定: 全設定で不採用**。平均で見て唯一baselineに並んだ
+`confirmed, min_s=15`/`min_s=20`も、単一会議の悪化上限
+（0.5pt）を5倍以上外れるES2011aの回帰があるため、採用基準の
+2条件目で機械的に却下される。
+
+### なぜ悪化したか（attribution）
+
+Round 4（§14）が確立したLOCAL/REMAP/FAST-PATH内訳診断
+（Hungarian最適置換を要する専用インストルメント）は、本実験の
+時間予算では再構築しなかった——代わりに、`--breakdown`が
+標準出力する Miss/FalseAlarm/Confusion の内訳を比較する、より
+軽量なattributionを行った。この選択の理由は診断結果自体から
+判明する: **本施策はconfusionだけでなくmissも動かしている**、
+つまりRound 4のREMAP誤り（純粋にラベル付け替えだけの問題）とは
+異なるメカニズムで効いており、Hungarian置換ベースの
+confusion内訳診断はそもそもこの効果の主要因を捉えられない。
+
+`confirmed, min_s=0`のES2011aをbaselineと比較すると:
+
+| 設定 | miss | fa | confusion |
+|---|---|---|---|
+| baseline | 11.3% | 3.5% | 5.9% |
+| confirmed, min_s=0 | **13.0%（+1.7pt）** | 3.3%（-0.2pt） | 5.4%（-0.5pt） |
+
+confusionはむしろ改善している（5.9→5.4）のに、missが+1.7pt
+悪化したことで全体は悪化している。`num_clusters`ヒントは
+発話区間の開始・終了時刻を一切変えないので（§17でconfusionのみが
+動いたglobal_reclusterの場合と対照的に）、理屈の上ではmissも
+false alarmも不変のはずだが、**実際には両方とも動いている**。
+原因はFastClusteringの挙動そのものにある: `num_clusters`を
+強制すると、クラスタの切り方（どのローカルセグメントがどの
+クラスタに属すか）自体が変わり、それが後続の`turns`フィルタ
+（`e-s>=0.3`)や単一話者フォールバック判定（`len({lid...})<2`）の
+分岐結果を変えてしまう——ヒントがラベルだけでなく**どのセグメントが
+最終的に出力されるか**自体を変えるため、confusion以外の
+カテゴリにも波及する。この波及経路はRound 4のconfusion限定
+diagnosisが想定していない範囲であり、今回observedされた
+「miss/fa/confusionが会議ごとにバラバラに動く」という不規則な
+パターン（例えばconfirmed, min_s=15ではES2004a/TS3003aは改善、
+ES2011aは悪化）と整合する。
+
+### 残課題
+
+- 会議依存の悪化（特にES2011aで一貫して悪化）の根本原因は
+  「確信済み話者数のヒントがそのグループの実際のローカル話者数と
+  食い違うケース」だと推測されるが、Round 4スタイルの完全な
+  Hungarian内訳診断でこれを確定させる作業は本ラウンドでは
+  行っていない。
+- min_sをさらに上げる（25s＝GROUP_MAX_S近辺、つまり事実上
+  「フルサイズのグループにしかヒントを適用しない」）方向は
+  試していない——ただしmin_s=20時点でES2011aの悪化がほぼ
+  横ばい（+2.5pt）なことから、この方向でさらに改善する見込みは
+  薄いと判断し、優先度を下げた。
+- `--num-clusters-hint`/`--num-clusters-hint-min-s`
+  （`eval_diar.py`）と`--speaker-num-clusters-hint`/
+  `--speaker-num-clusters-hint-min-s`（`realtime_transcribe.py`）
+  フラグはコードとして残す（デフォルトoff、機能追加のみで本番
+  非影響。flag-offリグレッションはpytest全211件通過で確認済み）が、
+  有効化は推奨しない。
+
+## 20. Round 9 Experiment B: OSD（Overlapped Speech Detection）ゲート付きoverlap出力 — 不採用（信頼度ゲートを上げるほど悪化、文献の逆方向）
+
+### 背景
+
+§16（Round 6）のoverlap対応diarizationプロトタイプ
+（`scripts/eval_diar_overlap.py`、powerset直接デコード）は、
+overlap出力そのものの正味の寄与を平均-0.6pt（pyannote DER、
+閾値0.65時点、overlap-stripped 15.2%→overlap-on 14.6%）と
+測定していた——DERが下がるという意味では小さな正の寄与だが、
+「回収したmissが5pt級なのに正味0.6ptしか残らない」（§16）
+というほど小さい。文献（Bredin et al. 2019/2021）はAMIで
+overlap対応により17-20%相対のDER改善を報告しており、この差の
+説明として§16プロトタイプが「argmaxを無条件に採用しており、
+low-overlap区間でfalse-alarm overlapを出している」ことを
+挙げていた。文献はoverlap割当を専用の信頼度ゲート（OSD:
+Overlapped Speech Detection）の背後に置く設計を使っている。
+本ラウンドはこのゲートを§16のプロトタイプに retrofit し、
+-0.6ptが文献の言う「clearly positive」な水準まで動くかを測る。
+
+### 実装
+
+`scripts/eval_diar_overlap.py`の`powerset_decode()`に`pair_gate`
+引数を追加。モデルの出力はpowerset 7クラスに対するlog-softmax
+なので、`exp(logits)`でそのまま各クラスのsoftmax事後確率が
+得られる（argmaxが選ぶクラス自体はlogitでもprobでも同じ——
+`exp`は単調変換のため）。`pair_gate`が指定されているとき:
+argmaxが選んだクラスがペアクラス（`(0,1)`/`(0,2)`/`(1,2)`）で、
+かつそのクラス自身の事後確率が`pair_gate`未満のフレームだけを
+対象に、空集合・単独話者クラス（`()`, `(0,)`, `(1,)`, `(2,)`の
+4クラス）に制限したargmaxで再判定する——タスクが求める
+「信頼度が閾値を下回るときはdominant single speakerを出す」を
+そのまま実装した形。argmaxが元から単独・空集合クラスを選んだ
+フレームは無条件で不変（ゲートはペア判定を降格させることしか
+しない）。`segment_windows()`/`diarize_overlap()`に配線し、
+`--pair-gate`CLIフラグを追加（デフォルト`None`＝§16の無条件
+argmaxのまま、既存の`tests/test_diar_overlap.py`14件は無改修で
+通過）。
+
+**このゲートは`--thresholds`（クラスタリング閾値）のように
+無料でスイープできない**——segmentation+embeddingの段階
+（overlapフレームの定義そのもの）を変えるため、`pair_gate`の
+値ごとにセグメンテーション・埋め込み抽出をやり直す必要がある
+（クラスタリング閾値だけを変えるRound 6のスイープとは異なる
+コスト構造。それでも600秒音声1本あたりRTF 0.011〜0.015と
+安価なので、5会議×4条件でも数分で済んだ）。
+
+### 測定
+
+AMI 5会議、collar=0.25s、クラスタリング閾値0.65（§16で最良と
+確認済みの値に固定、`--reliable-s`等その他は§16のデフォルトのまま）。
+`pair_gate=None`でまず§16のbaselineを再現できることを確認した
+うえで、タスク指定どおり0.7/0.8/0.9をスイープした。
+
+| pair_gate | overlap-on DER (pyannote/simple) | overlap-stripped DER (pyannote/simple) | 正味寄与（on-stripped、pyannote/simple） |
+|---|---|---|---|
+| なし（§16再現） | 14.6%/12.1% | 15.2%/12.5% | **-0.6pt/-0.4pt** |
+| 0.7 | 14.8%/12.3% | 14.9%/12.2% | -0.1pt/+0.1pt |
+| 0.8 | 15.1%/12.6% | 15.0%/12.2% | +0.1pt/+0.4pt |
+| 0.9 | 15.4%/12.8% | 14.9%/12.2% | +0.5pt/+0.6pt |
+
+（§16のbaseline再現は`pyannote/simpleder`とも§16実測値と
+完全一致——`pair_gate=None`経路は既存の`powerset_decode()`呼び出しと
+バイト同一であることをこの再現で確認済み。）
+
+**文献の予測（ゲートを入れるとoverlap出力の正味寄与が伸びる）とは
+正反対に、ゲートの閾値を上げるほど正味寄与は単調に悪化した**
+（-0.6pt → -0.1pt → +0.1pt → +0.5pt、pyannote基準。プラスは
+overlap出力がSTRIPPEDより悪いことを意味する）。0.7の時点で
+既にゲートなしを下回り、0.8・0.9では**overlap出力がむしろ
+有害**（overlap-onがoverlap-strippedより悪い）という、§16では
+一部の低overlap会議（IS1008a）でしか起きていなかった逆転が
+全体の正味寄与でも起きた。
+
+### なぜ逆方向に効いたか（診断）
+
+overlap-onのMiss/False Alarm内訳を`pair_gate`ごとに5会議平均で
+比較すると:
+
+| pair_gate | 平均miss | 平均fa |
+|---|---|---|
+| なし | 5.92% | 5.54% |
+| 0.7 | 6.92%（+1.00pt） | 4.88%（-0.66pt） |
+| 0.8 | 7.34%（+1.42pt） | 4.76%（-0.78pt） |
+| 0.9 | 7.86%（+1.94pt） | 4.68%（-0.86pt） |
+
+**ゲートは狙いどおりfalse alarmを減らしている**（5.54%→4.68%、
+-0.86pt、閾値を上げるほど単調に減る——「low-overlap区間の
+false-alarm overlap」という§16の見立て通り、自信のないペア
+判定を間引けている）。しかし**missの悪化がfa改善を常に上回る**
+（+1.00〜+1.94pt、fa改善の絶対値の1.5〜2.3倍）。これは、
+モデルが「ペアクラスを選んだフレーム」の事後確率が、**false
+positiveのときだけでなく、真のoverlapフレームでも十分高くない**
+ことを意味する——2人が同時に喋っている音声そのものが単一話者の
+音声よりモデルにとって本質的に曖昧（マイクで混ざった音声からは
+どちらの話者かの手がかりが弱まる）なため、真のoverlapフレームの
+事後確率分布も低め・拡散気味になりやすく、信頼度ゲートは
+false positiveとtrue positiveを区別できずに両方を間引いてしまう。
+文献（Bredin et al.）のOSDモジュールは本実験のような「同じ
+powersetヘッドの事後確率をそのまま閾値化する」のではなく、
+**専用に学習されたOSD特化モデル/ヘッド**を使っている点が
+決定的に異なると考えられる——同じ7クラスpowersetヘッドの生の
+確信度は、overlap検出の閾値化に転用できるほど「自信度＝正しさ」
+という関係になっていない、というのが本実験の結論。
+
+### 判定
+
+**不採用（3閾値すべて）**。`--pair-gate`はコードとして残す
+（デフォルト`None`、既存の`tests/test_diar_overlap.py`は無改修で
+通過——機能追加のみで、`eval_diar_overlap.py`自体が本番経路と
+無関係なため「本番非影響」の確認は不要）。§16のプロトタイプの
+「本番投入は保留」という判断は変わらない——文献が示唆する
+gatingによる改善は、この実装・このモデルでは再現しなかった。
+
+### 残課題
+
+- 本実験は§16と同じクラスタリング閾値0.65に固定してゲートだけを
+  スイープした。ゲート適用後の埋め込み集合はゲートなしとは
+  異なる（overlap扱いされるフレーム数が変わるため exclusive
+  embedding の中身も変わる）ので、ゲートごとにクラスタリング
+  閾値も振り直せば多少の余地が残っている可能性はあるが、
+  fa/missのトレードオフの方向自体（ゲートを上げるほど悪化）が
+  閾値でひっくり返るとは考えにくく、優先度は低いと判断した。
+- 「専用OSDモデル/ヘッドを使う」という診断で示唆した代替
+  アプローチ（pyannote-audioが公開しているOSD専用モデルを
+  別途ロードする、または同じsegmentationモデルの中間表現から
+  OSD用の追加ヘッドを学習する）は、モデル追加・学習を要する
+  スコープの大きい作業であり、今回は調査・実装ともに行っていない。
+- pair_gateを0.7未満（0.5、0.6等）に下げる方向は試していない
+  ——ゲートなし(実質的にはpair_gate=0相当)が既に最良という
+  単調な傾向から、0.5〜0.6がなし〜0.7の間に収まるであろうことは
+  推測できるが、確認はしていない。
+
+### 総括（Round 1〜9、本ループの最終まとめ）
 
 | Round | 施策 | 効果 | 判定 |
 |---|---|---|---|
@@ -2725,15 +3014,17 @@ pytest: 163 passed, 1 skipped（§17の159 passed, 1 skippedに、本ラウン�
 | 5（§15） | joint remap（Hungarian割当）、provisional centroid除外 | joint remap +3.7pt悪化、provisional除外 +0.9pt悪化 | 両方**不採用**（機能はデフォルトoffで温存） |
 | 6（§16） | overlap対応diarizationプロトタイプ（powerset直接デコード） | pyannote -3.6pt、うち-3.0ptはoverlap非依存の一括クラスタリング由来、overlap正味は-0.6pt | プロトタイプ**成功**、本番投入は**保留**（清書グループ単位での純利得が未測定） |
 | 7（§17） | セッション終了時グローバル再クラスタリング（§16の手法をライブ出力非改変で後乗せ） | simpleder平均+22.5pt悪化、5会議全て悪化、閾値非依存。根本原因は「対象漏れ」（1話者判定グループがプールに入らず旧ラベルのまま孤立）と特定 | **不採用** |
-| 8（本ラウンド、§18） | Round 7の「対象漏れ」をプール完全化で修正、再測定 | 悪化幅を半減（simpleder +22.5pt→+11.1pt、pyannote +20.8pt→+9.8pt）したがbaseline未達。診断により原因を「清書グループ粒度の埋め込みの話者分離能力不足」と特定（対象漏れとは独立の別floor） | **不採用**。全ファイル一括クラスタリング方向性を**この粒度では終了** |
+| 8（§18） | Round 7の「対象漏れ」をプール完全化で修正、再測定 | 悪化幅を半減（simpleder +22.5pt→+11.1pt、pyannote +20.8pt→+9.8pt）したがbaseline未達。診断により原因を「清書グループ粒度の埋め込みの話者分離能力不足」と特定（対象漏れとは独立の別floor） | **不採用**。全ファイル一括クラスタリング方向性を**この粒度では終了** |
+| 9-A（本ラウンド、§19） | FastClusteringへのnum_clustersヒント（確信済みグローバル話者数、soft variant付き） | soft variant（min_s=15/20）で平均DERはbaseline並みに戻るが、ES2011aが一貫して+2.5〜2.6pt悪化。confusionだけでなくmissも動くため、Round 4のconfusion限定diagnosisでは説明しきれない波及 | **不採用**（全設定） |
+| 9-B（本ラウンド、§20） | overlap対応diarizationプロトタイプにOSD信頼度ゲートをretrofit（pair-classの事後確率が閾値未満ならdominant single speakerへ降格） | ゲート閾値を上げるほど正味寄与が単調悪化（-0.6pt→+0.5pt、pyannote）。false alarmは狙い通り減るが、真のoverlapフレームでも事後確率が低いためmissの悪化がそれを上回る | **不採用**（3閾値すべて、文献の逆方向） |
 
-**採用に至った本番動作変更は、この8ラウンドを通じて実質ゼロ**
+**採用に至った本番動作変更は、この9ラウンドを通じて実質ゼロ**
 （採用済みなのは評価スクリプトの機能や診断手法であって、`realtime_transcribe.py`
 のデフォルト挙動そのものを動かしたものではない）。baseline
-（pyannote 18.2% / simpleder 14.1%、§16実測）は Round 1〜8の
+（pyannote 18.2% / simpleder 14.1%、§16実測）は Round 1〜9の
 どの実験にも更新されていない。
 
-**現在の床（何が動かせないと分かったか、Round 8時点）**:
+**現在の床（何が動かせないと分かったか、Round 9時点）**:
 
 - **overlap floor**（§16）: AMI 5会議平均で参照発話時間の約8.2%
   （ES2004a 14.2%〜TS3003a 2.1%）が、hayamimiの「1瞬間1話者」設計
@@ -2756,7 +3047,23 @@ pytest: 163 passed, 1 skipped（§17の159 passed, 1 skippedに、本ラウン�
   後付けのラベル書き換えとして回収しようとした2ラウンド（§17: 対象漏れ
   で失敗、§18: 対象漏れを塞いでも埋め込みの分離能力不足で失敗）とも
   baselineに届かなかった。この利得はこの粒度・このアーキテクチャでは
-  もう狙わない、という結論が本ループの最終到達点。
+  もう狙わない、という結論。
+- **num_clustersヒントによる過分割抑制**（§19で新たに確定）:
+  確信済みグローバル話者数をFastClusteringへヒントとして渡す方式は、
+  soft variant（短いグループを除外）を最大限効かせても会議依存の
+  悪化（ES2011a一貫して+2.5pt級）を消せなかった。ヒントは
+  ラベル付け替えだけでなくクラスタの切り方自体を変えるため、
+  confusionだけでなくmissにも波及する——Round 4のREMAP誤り
+  （純粋な付け替え問題）とは異なる、より予測しにくいメカニズム。
+- **overlap信頼度ゲート（OSD）の逆効果**（§20で新たに確定）:
+  §16のpowerset直接デコードにBredin et al.型の信頼度ゲートを
+  足すと、文献の予測（改善が伸びる）とは逆に正味寄与が単調に
+  悪化した。同じpowersetヘッドの生の事後確率は、真のoverlap
+  フレームでも十分に高くない（音声が混ざること自体がモデルに
+  とって本質的に曖昧）ため、ゲートはfalse positiveと一緒に
+  true positiveも間引いてしまう。専用OSDモデルなしにこの
+  ヘッドを閾値化するアプローチ自体に限界がある、というのが
+  Round 9の結論。
 
 **明示的に据え置きの2項目**:
 
@@ -2784,7 +3091,13 @@ pytest: 163 passed, 1 skipped（§17の159 passed, 1 skippedに、本ラウン�
 - [VoxConverse (joonson/voxconverse)](https://github.com/joonson/voxconverse)
 - [pyannote.metrics (GitHub)](https://github.com/pyannote/pyannote-metrics) / [pyannote-metrics (PyPI)](https://pypi.org/project/pyannote-metrics/) (導入・実測: 本イテレーション⑤)
 - [simpleder (PyPI)](https://pypi.org/project/simpleder/)
-- `.venv` 内 `sherpa_onnx` 1.13.6 実体の `dir()`/`help()` 出力（本調査で直接確認）
+- `.venv` 内 `sherpa_onnx` 1.13.6 実体の `dir()`/`help()` 出力（本調査で直接確認、
+  Round 9では`OfflineSpeakerDiarization.set_config()`/`process()`のシグネチャも
+  同様に直接確認）
+- H. Bredin, A. Laurent, "End-to-end speaker segmentation for overlap-aware
+  resegmentation" (2021) / H. Bredin et al., "pyannote.audio: neural building
+  blocks for speaker diarization" (2019) — Round 9 Experiment B（§20）が
+  retrofitしたOSD信頼度ゲート設計の文献根拠
 - [k2-fsa/sherpa-onnx `offline-speaker-diarization-pyannote-impl.h`](https://github.com/k2-fsa/sherpa-onnx/blob/master/sherpa-onnx/csrc/offline-speaker-diarization-pyannote-impl.h)（Round 4 T3、`gh api`で取得して直接確認: `ExcludeOverlap()`/`ToMultiLabel()`/`InitPowersetMapping()`）
 - [pyannote-audio `utils/powerset.py`](https://github.com/pyannote/pyannote-audio/blob/develop/pyannote/audio/utils/powerset.py)（上記C++コード内で直接参照されているpowersetデコードの元アルゴリズム）
 - `models/sherpa-onnx-pyannote-segmentation-3-0/model.onnx` のONNXメタデータ（Round 6で直接読み出し: `window_size`=160000, `receptive_field_shift`=270, `num_classes`=7, `powerset_max_classes`=2）
