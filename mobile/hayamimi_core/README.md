@@ -289,6 +289,7 @@ than silently misbehaving later:
 | `autoRefineSilenceSeconds` | 4.0s | yes | Silence gap that fires an auto-refine, when `autoRefineEnabled` is on. |
 | `autoRefineMaxBufferedSeconds` | 20.0s | yes | Buffered-duration ceiling that fires an auto-refine even without a silence gap. |
 | `refineBufferMaxSeconds` | 60.0s | yes | Hard cap on how much audio the refine buffer holds before it starts dropping the oldest segment. |
+| `prerollSeconds` | 1.0s | yes | How much audio from *before* a speech segment's detected onset is decoded along with it. The only knob here where `0` is a valid value — it means "no pre-roll". |
 
 ```dart
 final live = HayamimiLive(autoRefineSilenceSeconds: 2.0); // shorter pauses trigger refine
@@ -296,10 +297,24 @@ final live = HayamimiLive(autoRefineSilenceSeconds: 2.0); // shorter pauses trig
 live.draftWindowSeconds = 4.0; // shrink the draft window on an older/hotter phone
 ```
 
-These defaults were exercised as-is in the on-device session recorded in
-["Platform status"](#platform-status) below — see
+**Why `prerollSeconds` is there.** Silero VAD notices speech a moment after
+it starts, so the samples it hands over can begin partway into the first
+word — and the recognizer transcribes what it is given. On an Android
+emulator this package returned `昨日は昨日送りました` for `資料は昨日送りました`,
+and lost `あしたの` off the front of another sentence. Pre-roll prepends the
+audio recorded just before the onset, which is what the desktop pipeline
+has always done (`AudioHistory` / `PREROLL_S` in
+`scripts/realtime_transcribe.py`), clamped so two consecutive segments never
+both contain the gap between them. The prepended audio is part of the
+segment from then on: it is what gets decoded, what `audio_s` counts, and
+what the refine buffer stores. Set it to `0` to decode exactly what the VAD
+delimited.
+
+The first six knobs were exercised as-is in the on-device session recorded
+in ["Platform status"](#platform-status) below — see
 [`docs/MOBILE.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/MOBILE.md)
-for the full measurement conditions.
+for the full measurement conditions. `prerollSeconds` came later, from the
+Android emulator run described in the same section.
 
 #### Decoding method
 
@@ -321,9 +336,8 @@ at its own defaults, with no way to adjust for a noisy room or a soft
 speaker. `VadSensitivity` exposes its four knobs — `threshold` (speech-
 probability cutoff, higher = less sensitive), `minSilenceSeconds` (how long
 a pause has to last before a segment finalizes), `minSpeechSeconds`
-(shorter blips are discarded before decoding), and `maxSpeechSeconds` (hard
-cap on one segment's length) — each defaulting to sherpa-onnx's own value,
-so `VadSensitivity()` reproduces the unconfigurable behavior exactly:
+(shorter blips are discarded before decoding), and `maxSpeechSeconds`
+(roughly how long one segment may run before the VAD closes it mid-speech):
 
 ```dart
 await live.start(
@@ -335,6 +349,28 @@ await live.start(
 // ...later, mid-session, without restarting:
 await live.setVadSensitivity(VadSensitivity(threshold: 0.4));
 ```
+
+**The defaults are the desktop pipeline's, not sherpa-onnx's.**
+`minSilenceSeconds` is **0.35s** and `maxSpeechSeconds` is **12.0s**,
+matching `scripts/realtime_transcribe.py`; `threshold` (0.5) and
+`minSpeechSeconds` (0.25s) are sherpa-onnx's own, which the desktop leaves
+alone too. This changed because of what sherpa-onnx's stock 0.5s silence
+default did on an Android emulator: on a three-sentence Japanese recording
+whose pauses fall just under half a second, it merged all three sentences
+into one 6.13s segment, and this repo's ja recognizer, handed that segment,
+returned only the last sentence. Two sentences disappeared with nothing in
+the output to say so. At 0.35s the same audio split into three segments and
+all three came out. The desktop's own comment records that 0.35s measured
+no worse for accuracy than 0.5s on real broadcast Japanese while finalizing
+150ms sooner.
+
+`maxSpeechSeconds` is worth reading as a nudge rather than a guarantee: on
+the same run, a session configured with 5.0s emitted a 6.134s segment.
+sherpa-onnx's `max_speech_duration` influences when the VAD force-closes a
+segment; it does not bound what the VAD can hand over, so don't size a
+buffer or a timeout on it. Passing
+`VadSensitivity(minSilenceSeconds: 0.5, maxSpeechSeconds: 5.0)` restores the
+values this package shipped before.
 
 `setVadSensitivity` rebuilds Silero VAD off-isolate (same background-isolate
 technique `start` uses for the initial VAD load — see
@@ -511,7 +547,7 @@ Two pieces of the reference implementation had no Dart equivalent:
 | Platform | Status |
 |---|---|
 | Windows (host, `flutter test`) | **Verified** — parity with the Python reference on 51 recorded cases. |
-| Android | Expected to work: `libonnxruntime.so` is what `sherpa_onnx` loads there. **Not run on a device in this change.** |
+| Android | **Verified on an x86_64 emulator** (API 35): `libonnxruntime.so` resolved to the single copy `sherpa_onnx` ships, `OrtGetApiBase` was found, and the runtime served C API version 11 (ONNX Runtime 1.27.1 — the same version this host records). The 181.8 MB float16 model loaded inside the decode worker and punctuated ja refines. **No physical ARM device.** See ["Measured on an Android emulator"](#measured-on-an-android-emulator). |
 | iOS | **Unverified, and refused by default.** `sherpa_onnx` links ONNX Runtime as an xcframework and it has not been confirmed that `OrtGetApiBase` stays exported from the app binary, so `PunctuatorJa.load` throws rather than guess. Pass `libraryPath: OrtLibrary.processSymbols` to try it. |
 | macOS / Linux | Pass `libraryPath`; nothing puts the library on a desktop host's loader search path. |
 
@@ -854,9 +890,69 @@ and
 | Platform | ASR bench / live mic | Multi-language routing | Remote mode | Japanese punctuation |
 |---|---|---|---|---|
 | **iOS** (real iPhone 15) | **Verified.** Bench RTF 0.013 (ja int8, `modified_beam_search`, single run); Live tab transcribed real mic input end-to-end with no reported heat or UI stutter. | Ran live on-device with real speech switching ja/en; badge-switch accuracy was mixed because the session had multiple people talking in the room, so treat it as "it works," not a clean accuracy number — see `docs/IOS_VERIFY.md` for a cleaner single-speaker retest plan. | **Not attempted** — ruled out of scope by the repo owner for this verification session (the Mac's Wi-Fi IP was outside normal private-LAN ranges); not a known failure. | **Unverified, and refused by default** — see ["Punctuation platform status"](#punctuation-platform-status). |
-| **Android** | **Emulator only.** Load/accuracy validated on an AVD via `sherpa_onnx.dart` (CER 6.19% vs. the PC's 5.50% on the same 15-clip ja set, a +0.69pp gap attributed to onnxruntime kernel differences); RTF from an emulator reflects the *host PC's* CPU under virtualization, not a phone, so it isn't a real-device number. **A real Android device has not been used for this package.** | Validated via manifest batch eval on the emulator only; the live-mic path has not been run on Android at all (only on iOS — see the iOS column). | Not covered by an Android-specific verification pass. | Expected to work (`libonnxruntime.so` is what `sherpa_onnx` loads on Android) but **not run on a device**. |
+| **Android** | **Emulator only.** Load/accuracy validated on an AVD via `sherpa_onnx.dart` (CER 6.19% vs. the PC's 5.50% on the same 15-clip ja set, a +0.69pp gap attributed to onnxruntime kernel differences); RTF from an emulator reflects the *host PC's* CPU under virtualization, not a phone, so it isn't a real-device number. The **decode worker isolate** is verified on an x86_64 emulator (API 35): it spawned, initialized the sherpa-onnx bindings and built every model inside itself, decoded across the isolate boundary for a whole session, and was torn down and rebuilt three times in one process without a crash. **A real Android device has not been used for this package.** | Validated via manifest batch eval on the emulator only; the live-mic path has not been run on Android at all (only on iOS — see the iOS column). `RoutingProfile.jaSenseVoice` was **not exercised** in the emulator run below, which ran `jaOnly`. | Not covered by an Android-specific verification pass. | **Verified on an x86_64 emulator** (API 35): ja refines came back `punctuated: true` with 。 at the same sentence ends as the Python reference, and a control run without a punctuation model gave `punctuated: false`. **Not run on a physical ARM device**; see ["Punctuation platform status"](#punctuation-platform-status). |
 | **Windows** (desktop host) | Not a supported target platform for this package (see `pubspec.yaml`'s `platforms:`) — used only to run this repo's own `flutter analyze`/`flutter test` gates and the punctuation parity test below. | n/a | n/a | **Verified** — parity with the Python reference on 51 recorded cases (`flutter test`). |
 | **macOS / Linux** | Not a supported target platform for this package. | n/a | n/a | Would need an explicit `libraryPath`; not exercised. |
+
+### Measured on an Android emulator
+
+**Android emulator x86_64, API 35, host Ryzen 5 5600 — not a phone.** These
+are emulated x86_64 timings on a desktop CPU, so they say what the code
+does, not what a handset does. The float16 punctuation figures are the
+least transferable of all: ONNX Runtime's CPU provider has no float16
+compute path on x86 and casts to float32 and back on every operator, which
+an ARM chip with a float16 vector unit does not do. Full write-up, including
+how the models were placed and what was and wasn't exercised, in
+[`docs/MOBILE.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/MOBILE.md).
+
+| what | conditions | ms |
+|---|---|---|
+| `model_load` `recognizer` | ReazonSpeech ja zipformer int8, 2 threads, `modified_beam_search`, n=8 | 3223 (median) |
+| `model_load` `punct` | `punct_bert.fp16.onnx` (181.8 MB), 2 intra-op threads, n=7 | 1072 (median) |
+| `model_load` `vad` | `silero_vad.onnx` (0.64 MB), n=8 | 33.9 (median) |
+| final, decode only | segments of 1.5–2.0 s | 53–66 |
+| refine, re-decode + punctuation | the same 1.5–2.0 s of audio | 80–96 |
+| refine, re-decode + punctuation | one merged group of 6.13 s | 218–833 |
+
+The first load of each model in a fresh process sits at the slow end of its
+range (cold page cache), and 833 ms is the first refine of a run for the
+same reason. **Punctuation was not timed directly.** A refine's
+`latency_ms` covers the re-decode and the punctuation pass together, so the
+cost quoted for `restore()` on this run — roughly **26–33 ms per ~10
+characters**, warm, two intra-op threads — is a refine minus the final over
+the identical samples. That is an inference from the difference of two
+timers, not a measurement.
+
+### Known limitation: a refine over a long group can lose its leading sentences
+
+A refine ("清書") re-decodes a group of segments as one utterance, and when
+that group is long the result can come back containing only its last
+sentence. On the emulator, a 6.13 s group of three Japanese sentences
+refined to the third sentence alone.
+
+This is a property of the ReazonSpeech transducer, not of this package and
+not of Android. Handed the same 6.26 s file with no VAD at all, on the
+Windows host, the same int8 model returns that same single sentence under
+both `greedy_search` and `modified_beam_search`; split into its three
+sentences, it transcribes all three. Given multi-utterance audio, this
+model keeps the last utterance.
+
+What this package does about it today, and what it doesn't:
+
+- The VAD defaults now split on shorter pauses (see
+  ["VAD sensitivity"](#vad-sensitivity)), so a group is far less likely to
+  contain several sentences in the first place. Segmentation is load-bearing
+  for correctness here, not just for latency.
+- When a refine comes back much shorter than the fast finals it is replacing,
+  the finals' combined text is emitted instead (`isRefineTextTooShort`). That
+  catches the case where a group of several good finals refines to one
+  sentence — but not the case where a single over-long *segment* was already
+  truncated on the fast path, because then there is no better text to fall
+  back to.
+- The desktop pipeline goes further: it splits a suspicious result in half
+  and retries each half (`_looks_truncated` / `_split_retry` in
+  `scripts/asr_engine.py`, v0.3.1). **That is not ported to this package
+  yet.**
 
 ## API reference
 
@@ -888,7 +984,9 @@ browsing it.
   (is-this-segment-worth-decoding),
   `refine_pass.dart` (the two-pass "清書" buffer/merge/due-check logic —
   mirrors the desktop pipeline's `Refiner` with phone-tuned defaults),
-  `draft_pass.dart` (the "発話中の暫定字幕" pacing logic), `vad_sensitivity.dart`
+  `draft_pass.dart` (the "発話中の暫定字幕" pacing logic), `preroll.dart`
+  (`PrerollHistory`, the rolling buffer a segment's pre-onset context comes
+  from), `vad_sensitivity.dart`
   (`VadSensitivity` and the VAD-swap-timing pure function
   `shouldSwapVadNow`), `model_load_event.dart` (`ModelLoadEvent`, what
   `LiveTranscriber.modelLoads` emits), `ja_punctuation.dart`
