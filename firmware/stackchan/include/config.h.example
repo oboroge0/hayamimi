@@ -1,0 +1,15 @@
+// Copy this file to config.h (same directory) and fill in your own values.
+// config.h is gitignored -- never commit real Wi-Fi credentials.
+#pragma once
+
+// --- Wi-Fi ---
+#define WIFI_SSID "your-ssid"
+#define WIFI_PASSWORD "your-password"
+
+// --- hayamimi /ingest endpoint ---
+// Run hayamimi with:  python scripts/realtime_transcribe.py --input ws --serve
+// The ws /ingest server listens on --ws-port (default 8766), separate from
+// the --serve dashboard port (default 8833). Point this at --ws-port.
+#define HAYAMIMI_HOST "192.168.1.100"
+#define HAYAMIMI_PORT 8766
+#define HAYAMIMI_PATH "/ingest"
