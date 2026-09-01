@@ -61,10 +61,22 @@
   (the worker message types and their encoding), `decode_scheduler.dart`
   (`DecodeScheduler`, the pure queue policy), `decode_session.dart`
   (`DecodeSession`, the caller's-isolate half) and `decode_worker.dart`
-  (`DecodeWorker`/`IsolateDecodeWorker`). `LiveTranscriber`'s constructor
-  gained a `decodeWorkerFactory` parameter, and `RoutedRecognizerSet.build`
-  a `loadOffIsolate` one — both exist so the decode path can be exercised
-  without a device, and both default to production behaviour.
+  (`DecodeWorker`/`IsolateDecodeWorker`), and `live_vad.dart` (`LiveVad`,
+  the voice-activity detector a session feeds, plus the
+  Silero-via-sherpa-onnx implementation). `LiveTranscriber`'s constructor
+  gained `decodeWorkerFactory` and `vadFactory` parameters, and
+  `RoutedRecognizerSet.build` a `loadOffIsolate` one — all three exist so a
+  whole session can be exercised without a device, and all three default to
+  production behaviour.
+* `isSegmentWorthDecoding` now takes the segment's `Float32List` samples
+  rather than a `sherpa_onnx.SpeechSegment`, so neither it nor
+  `LiveTranscriber`'s segment handling depends on the FFI-backed package's
+  types any more.
+* `startDebugWavStream` reads its wav file with this package's own
+  pure-Dart PCM16 parser instead of sherpa-onnx's `readWave`. The accepted
+  format is unchanged (16-bit PCM), a wrong channel count is now reported
+  explicitly rather than as a generic read failure, and the debug streaming
+  path no longer touches FFI outside the models themselves.
 * `LiveTranscriptEntry`/`FinalSubtitleEvent`/`RefineSubtitleEvent` gained
   `audioSeconds` (wire: `audio_s`) — the segment's or refined group's audio
   duration — and `FinalSubtitleEvent` gained `switched` — whether this
