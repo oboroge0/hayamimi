@@ -192,8 +192,10 @@ Notes on the choice:
   **4 s** of silence or **20 s** of buffered speech, with the buffer capped
   at **60 s** (`defaultAutoRefineSilenceSeconds` /
   `defaultAutoRefineMaxBufferedSeconds` / `defaultRefineBufferMaxSeconds`
-  in `lib/live/refine_pass.dart`). They're constructor parameters if your
-  app wants different pacing.
+  in `lib/live/refine_pass.dart`). See "Runtime configuration and session
+  control" below if your app wants different pacing — every one of these
+  (plus the draft pass's own three) is both a constructor parameter and a
+  mid-session-settable property now.
 - Punctuation restoration for ja (the desktop pipeline's BERT-char model,
   ~182 MB as fp16) is **not** part of either profile yet — mobile
   integration is tracked in
@@ -280,6 +282,114 @@ insertion point, not an implementation: CJK inverse-text-normalization
 and user find/replace dictionaries are not ported to Dart yet, so a host app
 that wants them today supplies its own `textTransform`.
 
+## Runtime configuration and session control
+
+The pacing/VAD/decoding defaults above were chosen for a phone running the
+"Recommended configurations" above, but an embedding app doesn't always
+match that shape — a noisy venue needs a less trigger-happy VAD, a
+lecture-style app might want a longer draft window, and a host that already
+has its own hotword list wants to plug it straight into the recognizer
+instead of post-processing text after the fact. All of this used to be
+hardcoded constants with no way in; issue
+[#29](https://github.com/oboroge0/hayamimi/issues/29) opened it up.
+
+### Pacing knobs
+
+The draft ("発話中の暫定字幕") and refine ("清書") passes are each governed by a
+handful of `default*` constants in `lib/live/draft_pass.dart` and
+`lib/live/refine_pass.dart` (see "Recommended configurations" above for the
+values and why they're phone-tuned). All six are now both `LiveTranscriber`/
+`HayamimiLive` constructor parameters and same-named properties that can be
+reassigned mid-session — a setter takes effect from the next due-check or
+buffer write onward, without touching any native model, and an invalid
+(non-positive or non-finite) value throws `ArgumentError` immediately rather
+than silently misbehaving later:
+
+| knob | default | runtime-settable | what it does |
+|---|---|---|---|
+| `draftIntervalSeconds` | 1.0s | yes | How often a draft re-decode fires while a VAD segment is still in progress. |
+| `draftWindowSeconds` | 8.0s | yes | Trailing-audio window a draft decode re-processes, so a long utterance doesn't make every draft slower. |
+| `minDraftAudioSeconds` | 0.25s | yes | Minimum accumulated audio before a draft decode is worth running at all. |
+| `autoRefineSilenceSeconds` | 4.0s | yes | Silence gap that fires an auto-refine, when `autoRefineEnabled` is on. |
+| `autoRefineMaxBufferedSeconds` | 20.0s | yes | Buffered-duration ceiling that fires an auto-refine even without a silence gap. |
+| `refineBufferMaxSeconds` | 60.0s | yes | Hard cap on how much audio the refine buffer holds before it starts dropping the oldest segment. |
+
+```dart
+final live = HayamimiLive(autoRefineSilenceSeconds: 2.0); // shorter pauses trigger refine
+// ...later, mid-session:
+live.draftWindowSeconds = 4.0; // shrink the draft window on an older/hotter phone
+```
+
+### Decoding method
+
+sherpa-onnx's offline recognizer supports more than one search algorithm
+(`'greedy_search'` is fast; `'modified_beam_search'` costs more CPU for
+generally better accuracy). Before this parameter existed, the plain
+(single-model) path was pinned to sherpa-onnx's own `'greedy_search'`
+default and the `RoutingProfile.jaSenseVoice` profile's ja tier was
+hardcoded to `'modified_beam_search'` (matching desktop production) with no
+way to change either. `start`/`startDebugWavStream`'s `decodingMethod`
+parameter overrides whichever of those applies; leave it `null` (the
+default) to keep that existing behavior unchanged. SenseVoice's own decode
+doesn't use this parameter.
+
+### VAD sensitivity
+
+Silero VAD (the model deciding "is this speech or silence") shipped pinned
+at its own defaults, with no way to adjust for a noisy room or a soft
+speaker. `VadSensitivity` exposes its four knobs — `threshold` (speech-
+probability cutoff, higher = less sensitive), `minSilenceSeconds` (how long
+a pause has to last before a segment finalizes), `minSpeechSeconds`
+(shorter blips are discarded before decoding), and `maxSpeechSeconds` (hard
+cap on one segment's length) — each defaulting to sherpa-onnx's own value,
+so `VadSensitivity()` reproduces the unconfigurable behavior exactly:
+
+```dart
+await live.start(
+  modelDir: modelDir,
+  vadModelPath: vadPath,
+  vadSensitivity: VadSensitivity(threshold: 0.65, minSilenceSeconds: 0.8),
+);
+
+// ...later, mid-session, without restarting:
+await live.setVadSensitivity(VadSensitivity(threshold: 0.4));
+```
+
+`setVadSensitivity` rebuilds Silero VAD off-isolate (same background-isolate
+technique `start` uses for the initial load — see "Threading / known
+limitations" below) and swaps it in at the next safe point: never
+mid-segment, so a speaker's in-progress utterance is never silently
+truncated by the swap. If no session is running yet, the value is just
+remembered for the next `start`. Calling it again before an earlier call has
+finished replaces the pending target rather than queueing both, so only the
+most recently requested sensitivity ever actually gets installed.
+
+### Hotwords
+
+`start`/`startDebugWavStream` also accept `hotwordsFile`/`hotwordsScore`,
+sherpa-onnx's own recognizer-level hotword biasing, applied to the plain
+path and the routed `RoutingProfile.jaSenseVoice` profile's ja tier (not
+SenseVoice). Unlike the pacing knobs and VAD sensitivity, hotwords have no
+runtime setter — they're compiled into the recognizer when it's built, so
+changing them means a fresh `start` (or `stop` + `start`).
+
+### Starting a new "conversation" without reloading models
+
+Loading `RoutingProfile.jaSenseVoice`'s three models back-to-back is the
+multi-second cost `native_model_loader.dart` moves off the UI isolate — not
+something a host app wants to pay again just because the user tapped "new
+session." `resetSession()` clears everything about the *current*
+conversation instead: the refine buffer, in-progress draft state, and (for
+a routed session) which language it's currently locked to, all without
+touching a single loaded native model. If a decode is in flight when it's
+called, it waits for that decode to finish first, so the reset can't race a
+final/refine/draft write into the buffers it's about to clear. It's a no-op
+(nothing cleared, no event emitted) when no session is running.
+
+```dart
+await live.resetSession(); // fresh conversation, same loaded models
+```
+
 ## Minimal example: remote subtitles (PC does the recognition)
 
 ```dart
@@ -322,6 +432,55 @@ live.events.listen(broadcast.broadcast); // events are already SubtitleEvent
 // GET http://<lan ip>:8833/events   -> SSE feed of the same events
 ```
 
+`SubtitleBroadcastServer({port, bindAddress, allowOrigin})` binds
+[`InternetAddress.anyIPv4`](https://api.dart.dev/dart-io/InternetAddress/anyIPv4-constant.html)
+(`0.0.0.0`, all interfaces) by default, deliberately, rather than loopback:
+the whole point of this class is reachability from *other* devices on the
+LAN — that's what makes it useful for OBS or a browser running on a
+different machine. Pass a narrower `bindAddress` (e.g.
+`InternetAddress.loopbackIPv4`) only if a host app wants to restrict this to
+same-device consumers, which defeats the LAN-broadcast use case this class
+exists for. `allowOrigin` (default `'*'`) controls the `/events` response's
+`Access-Control-Allow-Origin` header, matching the desktop
+`subtitle_server.py`'s permissive default so a browser-based OBS source or a
+web dashboard on a different origin works without extra configuration;
+narrow it if a host app needs to restrict which origins may read its
+transcript.
+
+## Events
+
+Every `SubtitleEvent` this package emits — from `HayamimiLive.events`,
+`HayamimiRemote.events`, and re-broadcast verbatim by
+`SubtitleBroadcastServer` — carries a `type` discriminator and is
+wire-compatible with the desktop `scripts/subtitle_server.py`, so the same
+OBS browser source or web client that already works against the desktop app
+works unmodified against this package. A type this package's own overlay
+page (`lib/server/overlay_html.dart`) doesn't recognize is simply ignored by
+its JS, so adding new event types here (`model_load`, `session_reset`)
+never broke it — but a *custom* consumer written against an earlier version
+of this package should still switch on `type` defensively for the same
+reason.
+
+| type | JSON shape | emitted when |
+|---|---|---|
+| `partial` | `{"type":"partial","text":...}` | A draft ("発話中の暫定字幕") re-decode fires while a VAD segment is still in progress. |
+| `final` | `{"type":"final","text":...,"lang":...,"speaker":...,"latency_ms":...,"audio_s":...,"switched":...}` | A VAD segment finalized. `audio_s` is the segment's duration in seconds; `switched` is `true` only when this segment is the reason a `RoutingProfile.jaSenseVoice` session's language changed. `speaker` is always empty (no diarization yet). |
+| `translation` | `{"type":"translation","lang":...,"text":...}` | Reserved for wire compatibility with the desktop pipeline's machine translation — not emitted by this package today. |
+| `refine` | `{"type":"refine","text":...,"lang":...,"speaker":...,"latency_ms":...,"audio_s":...}` | A refine ("清書") pass completed. `audio_s` is the total duration of the buffered group that was re-decoded. |
+| `error` | `{"type":"error","message":...}` | A session failure not attributable to a call the caller made — e.g. the OS revoking mic access mid-session. |
+| `model_load` | `{"type":"model_load","model":...,"phase":"start"\|"done","ms":...}` | Right before and right after each native model finishes loading (`model` is `"vad"`, `"recognizer"`, or for `RoutingProfile.jaSenseVoice`: `"ja"`/`"sensevoice"`/`"lid"`), including a `setVadSensitivity` rebuild. `ms` is the elapsed build time, only set on `"done"`. |
+| `session_reset` | `{"type":"session_reset"}` | `resetSession()` finished clearing the current conversation's state. |
+
+`HayamimiRemote` speaks the same table — its underlying `RemoteEvent` parser
+(`lib/remote/remote_event.dart`) understands all seven types above (with the
+same field names) coming back from a desktop `--input ws --serve` server,
+in addition to its own connection-lifecycle frames (`ready`,
+`session_start`). The desktop pipeline also emits a few event types this
+package doesn't have a typed `RemoteEvent` for yet — `model_fallback`,
+`warning`, `session_summary`, `recluster` — which arrive as
+`RemoteUnknownEvent` on `HayamimiRemote.rawEvents` and are silently dropped
+from `HayamimiRemote.events` rather than raising an error.
+
 ## Package layout
 
 - `lib/hayamimi_core.dart` — the public export surface; start here.
@@ -334,8 +493,13 @@ live.events.listen(broadcast.broadcast); // events are already SubtitleEvent
   its pure building blocks: `pcm_frame_buffer.dart` (PCM16→float, frame
   re-slicing), `speech_segment_filter.dart` (is-this-segment-worth-decoding),
   `refine_pass.dart` (the two-pass "清書" buffer/merge/due-check logic —
-  mirrors the desktop pipeline's `Refiner` with phone-tuned defaults), and
-  `live_transcript_entry.dart` (one finalized line).
+  mirrors the desktop pipeline's `Refiner` with phone-tuned defaults),
+  `draft_pass.dart` (the "発話中の暫定字幕" pacing logic), `vad_sensitivity.dart`
+  (`VadSensitivity` and the VAD-swap-timing pure function
+  `shouldSwapVadNow`), `model_load_event.dart` (`ModelLoadEvent`, what
+  `LiveTranscriber.modelLoads` emits), and `live_transcript_entry.dart` (one
+  finalized/refine/draft line, including its `audioSeconds`/`switched`
+  fields).
 - `lib/remote/` — `RemoteTranscriber` (mic → `/ingest` WebSocket
   orchestration, auto-reconnect, debug wav sender) and its pure pieces:
   `remote_event.dart` (JSON→typed event parsing), `remote_handshake.dart`
@@ -343,7 +507,8 @@ live.events.listen(broadcast.broadcast); // events are already SubtitleEvent
   parsing), `remote_connection_state.dart` (the connection lifecycle enum).
 - `lib/server/` — `SubtitleBroadcastServer` (the `dart:io` `HttpServer`),
   `subtitle_event.dart` (the `SubtitleEvent` hierarchy: partial/final/
-  translation/refine/error, all with wire-compatible JSON encoding), and
+  translation/refine/error/model_load/session_reset, all with
+  wire-compatible JSON encoding — see "Events" above), and
   `overlay_html.dart` (the OBS-ready transparent overlay page).
 - `lib/setup/model_downloader.dart` — `downloadProfile`/`downloadModelSource`
   (fetch → verify sha256 → extract → place) and `modelManifest` (the two

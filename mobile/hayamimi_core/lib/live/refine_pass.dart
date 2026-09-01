@@ -50,7 +50,12 @@ class RefineBuffer {
   });
 
   final int sampleRate;
-  final double maxDurationSeconds;
+
+  /// Mutable (unlike [sampleRate]) so [LiveTranscriber.refineBufferMaxSeconds]
+  /// can change it at runtime without rebuilding this buffer or touching any
+  /// native model -- the new cap simply applies from the next [add] call
+  /// onward.
+  double maxDurationSeconds;
   final List<RefineSegment> _segments = <RefineSegment>[];
 
   bool get isEmpty => _segments.isEmpty;

@@ -36,6 +36,8 @@ class FinalSubtitleEvent extends SubtitleEvent {
     this.lang = '',
     this.speaker = '',
     this.latencyMs,
+    this.audioSeconds,
+    this.switched = false,
   });
 
   final String text;
@@ -52,6 +54,16 @@ class FinalSubtitleEvent extends SubtitleEvent {
   /// Wall-clock decode time for this segment, in milliseconds.
   final double? latencyMs;
 
+  /// How much audio this segment covers, in seconds (its VAD-detected
+  /// sample count / 16000). `null` when the producing session doesn't
+  /// report it.
+  final double? audioSeconds;
+
+  /// `true` when this segment is the reason a multilingual routed session
+  /// changed language (see `RoutedRecognizerSet`'s dual-LID switch policy).
+  /// Always `false` for a single-model session.
+  final bool switched;
+
   @override
   Map<String, dynamic> toJson() => {
     'type': 'final',
@@ -59,6 +71,8 @@ class FinalSubtitleEvent extends SubtitleEvent {
     'lang': lang,
     'speaker': speaker,
     'latency_ms': latencyMs,
+    'audio_s': audioSeconds,
+    'switched': switched,
   };
 }
 
@@ -85,12 +99,17 @@ class RefineSubtitleEvent extends SubtitleEvent {
     this.lang = '',
     this.speaker = '',
     this.latencyMs,
+    this.audioSeconds,
   });
 
   final String text;
   final String lang;
   final String speaker;
   final double? latencyMs;
+
+  /// Total duration (seconds) of the buffered group this refine re-decoded.
+  /// `null` when the producing session doesn't report it.
+  final double? audioSeconds;
 
   @override
   Map<String, dynamic> toJson() => {
@@ -99,6 +118,7 @@ class RefineSubtitleEvent extends SubtitleEvent {
     'lang': lang,
     'speaker': speaker,
     'latency_ms': latencyMs,
+    'audio_s': audioSeconds,
   };
 }
 
@@ -110,4 +130,45 @@ class ErrorSubtitleEvent extends SubtitleEvent {
 
   @override
   Map<String, dynamic> toJson() => {'type': 'error', 'message': message};
+}
+
+/// One phase of loading a native model on the producing session — see
+/// `LiveTranscriber.modelLoads`/`ModelLoadEvent` for the mobile-side
+/// producer. Lets a host UI show e.g. "loading SenseVoice..." instead of
+/// treating model loading as one opaque wait.
+class ModelLoadSubtitleEvent extends SubtitleEvent {
+  const ModelLoadSubtitleEvent({
+    required this.model,
+    required this.phase,
+    this.ms,
+  });
+
+  /// Which native model this phase is about (e.g. `"vad"`, `"recognizer"`,
+  /// `"ja"`, `"sensevoice"`, `"lid"` — see `ModelLoadEvent.model`).
+  final String model;
+
+  /// `"start"` or `"done"`.
+  final String phase;
+
+  /// Wall-clock milliseconds the build took. `null` on `"start"`.
+  final double? ms;
+
+  @override
+  Map<String, dynamic> toJson() => {
+    'type': 'model_load',
+    'model': model,
+    'phase': phase,
+    'ms': ms,
+  };
+}
+
+/// The producing session's "conversation" state (refine buffer, draft
+/// state, routed-session language) was just cleared by a
+/// `resetSession()`/`HayamimiLive.resetSession()` call, without reloading
+/// any native model.
+class SessionResetSubtitleEvent extends SubtitleEvent {
+  const SessionResetSubtitleEvent();
+
+  @override
+  Map<String, dynamic> toJson() => {'type': 'session_reset'};
 }
