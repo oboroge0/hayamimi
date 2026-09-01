@@ -80,13 +80,21 @@ class RoutedRecognizerSet {
   /// existed.
   ///
   /// [onModelLoad], if given, is called `('ja'|'sensevoice'|'lid', 'start',
-  /// null)` right before each of the three background-isolate builds below
-  /// and `(..., 'done', elapsedMs)` right after — see
+  /// null)` right before each of the three builds below and
+  /// `(..., 'done', elapsedMs)` right after — see
   /// `LiveTranscriber.modelLoads`, which is what actually consumes this.
   /// Kept as a plain callback (rather than this class depending on a
   /// `SubtitleEvent`/event-type from another layer) so this file stays free
   /// of any dependency beyond sherpa-onnx and its own model-resolving
   /// helpers.
+  ///
+  /// [loadOffIsolate] controls *where* the three models are built. It
+  /// defaults to true, which loads each one on a short-lived background
+  /// isolate (see `native_model_loader.dart`) so a caller running on
+  /// Flutter's UI isolate is not frozen for the seconds that takes. The
+  /// decode worker passes false: it is already a background isolate, and
+  /// the models it builds never leave it, so building them in place there
+  /// saves a nested spawn and a pointer handoff per model.
   static Future<RoutedRecognizerSet> build({
     required String reazonModelDir,
     required String senseVoiceModelDir,
@@ -96,8 +104,21 @@ class RoutedRecognizerSet {
     String decodingMethod = 'modified_beam_search',
     String? hotwordsFile,
     double hotwordsScore = 1.5,
+    bool loadOffIsolate = true,
     void Function(String model, String phase, double? ms)? onModelLoad,
   }) async {
+    Future<sherpa_onnx.OfflineRecognizer> buildRecognizer(
+      sherpa_onnx.OfflineRecognizerConfig config,
+    ) async => loadOffIsolate
+        ? buildOfflineRecognizerOffIsolate(config)
+        : sherpa_onnx.OfflineRecognizer(config);
+
+    Future<sherpa_onnx.SpokenLanguageIdentification> buildLid(
+      sherpa_onnx.SpokenLanguageIdentificationConfig config,
+    ) async => loadOffIsolate
+        ? buildSpokenLanguageIdentificationOffIsolate(config)
+        : sherpa_onnx.SpokenLanguageIdentification(config);
+
     final reazonDir = Directory(reazonModelDir);
     if (!await reazonDir.exists()) {
       throw RoutedRecognizerException(
@@ -118,7 +139,7 @@ class RoutedRecognizerSet {
     final sep = Platform.pathSeparator;
     onModelLoad?.call('ja', 'start', null);
     final reazonStopwatch = Stopwatch()..start();
-    final reazon = await buildOfflineRecognizerOffIsolate(
+    final reazon = await buildRecognizer(
       sherpa_onnx.OfflineRecognizerConfig(
         model: sherpa_onnx.OfflineModelConfig(
           transducer: sherpa_onnx.OfflineTransducerModelConfig(
@@ -172,7 +193,7 @@ class RoutedRecognizerSet {
     }
     onModelLoad?.call('sensevoice', 'start', null);
     final svStopwatch = Stopwatch()..start();
-    final senseVoice = await buildOfflineRecognizerOffIsolate(
+    final senseVoice = await buildRecognizer(
       sherpa_onnx.OfflineRecognizerConfig(
         model: sherpa_onnx.OfflineModelConfig(
           senseVoice: sherpa_onnx.OfflineSenseVoiceModelConfig(
@@ -223,7 +244,7 @@ class RoutedRecognizerSet {
     }
     onModelLoad?.call('lid', 'start', null);
     final lidStopwatch = Stopwatch()..start();
-    final lid = await buildSpokenLanguageIdentificationOffIsolate(
+    final lid = await buildLid(
       sherpa_onnx.SpokenLanguageIdentificationConfig(
         whisper: sherpa_onnx.SpokenLanguageIdentificationWhisperConfig(
           encoder: '$lidModelDir$sep${lidFiles.first}',
