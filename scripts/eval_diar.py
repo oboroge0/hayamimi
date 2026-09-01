@@ -210,6 +210,8 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
                                 global_recluster: bool = False,
                                 global_recluster_threshold: float = DEFAULT_GLOBAL_RECLUSTER_THRESHOLD,
                                 global_recluster_reliable_s: float = DEFAULT_GLOBAL_RECLUSTER_RELIABLE_S,
+                                num_clusters_hint: str = "off",
+                                num_clusters_hint_min_s: float = 0.0,
                                 ) -> tuple[list[tuple[str, float, float]], dict]:
     """Score the new method: same VAD + fast SpeakerLabeler as the baseline,
     but grouped exactly the way production's Refiner groups utterances
@@ -310,6 +312,35 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     turn timing, never changes which VAD/diarization spans exist, and
     never touches the fast path -- only which S{n} string a refine-group
     turn ends up with.
+
+    num_clusters_hint (Round 9 Experiment A, docs/DIARIZATION_PLAN.md
+    section 19): "off" (default) is a no-op -- diarizer.process() is
+    called with no override, exactly every prior round's behavior
+    (FastClustering picks the cluster count itself, diarize.
+    DEFAULT_THRESHOLD/-1). "confirmed" passes
+    labeler.num_confirmed_speakers() (the session's confirmed-so-far
+    global speaker count, as of just BEFORE this group's own remap --
+    i.e. every earlier group's remap has already run) as this group's
+    diarize.GroupDiarizer.process(num_clusters=) hint, but only when the
+    hint is >= 1 (a session with zero confirmed speakers yet -- e.g. the
+    very first group -- falls back to "off" for that one call; there is
+    no informative hint to give). "confirmed-capped" additionally clamps
+    that hint to min(confirmed, len(group)) -- len(group) (the number of
+    fast-path VAD segments this refine group accumulated, known BEFORE
+    diarization runs) is a cheap upper bound on how many distinct local
+    turns pyannote segmentation could plausibly split this group into;
+    this guards against forcing a hint larger than the group could ever
+    contain. num_clusters_hint_min_s (default 0.0, i.e. no gate) is the
+    "soft variant" the task asked for: the hint is only applied when this
+    group's total VAD-detected speech duration (sum of (end-start) over
+    its fast-path segments, in seconds -- NOT len(buf)/sr, which also
+    counts preroll and internal silence gaps) is >= this many seconds.
+    Below it, the group falls back to "off" for that call. This exists
+    because a short group is unlikely to contain every session speaker
+    yet, so forcing FastClustering toward the session's full confirmed
+    count on a short group risks forcing a WRONG count -- the harmful
+    failure mode Round 5 (section 15) already demonstrated for a related
+    knob (see that section's caution against "forcing a wrong count").
     """
     import numpy as np
     from realtime_transcribe import GROUP_GAP_S, GROUP_MAX_S, SAMPLE_RATE, AudioHistory, build_vad, read_wave, wav_chunks
@@ -394,9 +425,23 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
         fast_labels = [lbl for _, _, lbl in group]
         majority = max(set(fast_labels), key=fast_labels.count) if fast_labels else ""
 
+        hint = None
+        if num_clusters_hint != "off":
+            # group entries are (seg_start, seg_end, label) sample indices;
+            # sum of per-segment durations (not g_end-g_start, which also
+            # counts internal silence gaps) is this group's actual
+            # VAD-detected speech time -- see the docstring above.
+            group_speech_s = sum(e - s for s, e, _ in group) / sr
+            if group_speech_s >= num_clusters_hint_min_s:
+                confirmed = labeler.num_confirmed_speakers()
+                if confirmed >= 1:
+                    hint = confirmed
+                    if num_clusters_hint == "confirmed-capped":
+                        hint = min(hint, len(group))
+
         t0 = time.time()
         try:
-            raw = diarizer.process(buf, sr)
+            raw = diarizer.process(buf, sr, num_clusters=hint)
         except Exception:
             raw = []
         diar_time += time.time() - t0
@@ -595,7 +640,9 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
                   vad_threshold: float = 0.5, min_remap_update_s: float = 0.0,
                   joint_remap: bool = False, exclude_provisional_remap: bool = False,
                   global_recluster: bool = False,
-                  global_recluster_threshold: float = DEFAULT_GLOBAL_RECLUSTER_THRESHOLD) -> dict:
+                  global_recluster_threshold: float = DEFAULT_GLOBAL_RECLUSTER_THRESHOLD,
+                  num_clusters_hint: str = "off",
+                  num_clusters_hint_min_s: float = 0.0) -> dict:
     import simpleder
 
     ref = segments_to_der_tuples(parse_rttm(rttm_path))
@@ -606,7 +653,8 @@ def score_meeting(wav_path: str, rttm_path: str, collar: float,
             wav_path, min_silence, max_speech, diar_threshold, sim_threshold, remap_threshold,
             merge_enabled, merge_threshold, hysteresis_enabled, hysteresis_min_hits,
             min_duration_on, min_duration_off, vad_threshold, min_remap_update_s, joint_remap,
-            exclude_provisional_remap, global_recluster, global_recluster_threshold)
+            exclude_provisional_remap, global_recluster, global_recluster_threshold,
+            DEFAULT_GLOBAL_RECLUSTER_RELIABLE_S, num_clusters_hint, num_clusters_hint_min_s)
     else:
         hyp_raw = generate_speaker_hypothesis(
             wav_path, min_silence, max_speech, hysteresis_enabled, hysteresis_min_hits,
@@ -755,6 +803,22 @@ def main():
                          "with >=2 concurrent speakers from DER scoring (pyannote.metrics "
                          "skip_overlap=True). Only affects --breakdown's der_breakdown; "
                          "the primary simpleder DER is unaffected.")
+    ap.add_argument("--num-clusters-hint", choices=["off", "confirmed", "confirmed-capped"],
+                    default="off",
+                    help="Round 9 (docs/DIARIZATION_PLAN.md section 19) Experiment A: pass a "
+                         "num_clusters hint to diarize.GroupDiarizer's FastClustering, derived "
+                         "from speaker_id.SpeakerLabeler.num_confirmed_speakers() at the moment "
+                         "each refine group closes. 'off' (default) is a no-op. 'confirmed' uses "
+                         "the confirmed count directly; 'confirmed-capped' additionally clamps it "
+                         "to min(confirmed, len(group)) (the group's own fast-path VAD segment "
+                         "count). Only meaningful with --method refine_diarize. See "
+                         "generate_diarize_hypothesis()'s num_clusters_hint docstring.")
+    ap.add_argument("--num-clusters-hint-min-s", type=float, default=0.0, metavar="S",
+                    help="Only apply --num-clusters-hint when this refine group's total "
+                         "VAD-detected speech duration (seconds) is >= this value; below it, "
+                         "the group falls back to no hint. 0.0 (default) applies the hint to "
+                         "every group. Guards against forcing a confirmed-speaker-count hint "
+                         "onto a short group that plausibly doesn't contain every speaker yet.")
     args = ap.parse_args()
 
     if not os.path.exists(args.manifest):
@@ -789,7 +853,9 @@ def main():
                                joint_remap=args.joint_remap,
                                exclude_provisional_remap=args.exclude_provisional_remap,
                                global_recluster=args.global_recluster,
-                               global_recluster_threshold=args.global_recluster_threshold)
+                               global_recluster_threshold=args.global_recluster_threshold,
+                               num_clusters_hint=args.num_clusters_hint,
+                               num_clusters_hint_min_s=args.num_clusters_hint_min_s)
         extra = ""
         if "diar_time_s" in result and result.get("audio_s"):
             rtf = result["diar_time_s"] / result["audio_s"]

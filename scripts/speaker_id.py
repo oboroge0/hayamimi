@@ -387,6 +387,21 @@ class SpeakerLabeler:
         emb = self.embed(samples, sample_rate)
         return self.match_embedding(emb, update=True, source=source)
 
+    def num_confirmed_speakers(self) -> int:
+        """Count of live (not merged-away) global centroids that have been
+        matched at least PROVISIONAL_CONFIRM_HITS times so far -- i.e.
+        is_provisional() would return False for them (real recurring
+        voices, not still-untested one-off centroids).
+
+        Round 9 Experiment A (docs/DIARIZATION_PLAN.md section 19) uses
+        this as the num_clusters hint for diarize.GroupDiarizer's
+        FastClustering: a CONFIRMED count is a deliberately more
+        conservative estimate than len(self._centroids) (which would also
+        count noisy provisional one-offs the moment they open, inflating
+        the hint exactly when it's least trustworthy)."""
+        return sum(1 for i in range(len(self._centroids))
+                   if i not in self._alias and self._counts[i] >= PROVISIONAL_CONFIRM_HITS)
+
     def centroid_open_counts(self) -> dict[str, int]:
         """{source: count} of how many currently-open centroids were first
         opened by each caller-supplied `source` tag (see match_embedding()),

@@ -68,32 +68,62 @@ class GroupDiarizer:
                 "speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
                 " && tar xjf /tmp/seg.tar.bz2 -C models/`"
             )
-        cfg = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+        self._threads = threads
+        self._threshold = threshold
+        self._min_duration_on = min_duration_on
+        self._min_duration_off = min_duration_off
+        self._default_num_clusters = num_clusters
+        self._sd = sherpa_onnx.OfflineSpeakerDiarization(self._build_config(num_clusters))
+        self.sample_rate = self._sd.sample_rate
+        # Round 9 Experiment A (docs/DIARIZATION_PLAN.md section 19): tracks
+        # whichever num_clusters value is CURRENTLY live in self._sd's
+        # config, so process() only calls the (cheap but not free) set_config
+        # when a call's requested hint actually differs from what's already
+        # applied -- most calls in a session repeat the same value (or None,
+        # i.e. this constructor's default) back-to-back.
+        self._live_num_clusters = num_clusters
+
+    def _build_config(self, num_clusters: int) -> "sherpa_onnx.OfflineSpeakerDiarizationConfig":
+        return sherpa_onnx.OfflineSpeakerDiarizationConfig(
             segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
                 pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
                     model=SEGMENTATION_MODEL
                 ),
-                num_threads=threads,
+                num_threads=self._threads,
             ),
             embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-                model=EMBED_MODEL, num_threads=threads
+                model=EMBED_MODEL, num_threads=self._threads
             ),
             clustering=sherpa_onnx.FastClusteringConfig(
-                num_clusters=num_clusters, threshold=threshold,
+                num_clusters=num_clusters, threshold=self._threshold,
             ),
-            min_duration_on=min_duration_on,
-            min_duration_off=min_duration_off,
+            min_duration_on=self._min_duration_on,
+            min_duration_off=self._min_duration_off,
         )
-        self._sd = sherpa_onnx.OfflineSpeakerDiarization(cfg)
-        self.sample_rate = self._sd.sample_rate
 
-    def process(self, samples: np.ndarray, sample_rate: int
+    def process(self, samples: np.ndarray, sample_rate: int,
+                num_clusters: int | None = None
                ) -> list[tuple[int, float, float]]:
         """Diarize one buffer. Resamples to the model's expected rate if needed.
 
         Returns [] for audio too short/quiet for the segmentation model to
         find any speech turn (callers should fall back to their existing
         single-label behavior in that case).
+
+        num_clusters (Round 9 Experiment A, docs/DIARIZATION_PLAN.md section
+        19): None (default) is a no-op -- this call uses whatever
+        FastClusteringConfig.num_clusters the constructor was given (-1 =
+        "let FastClustering pick the count itself", sherpa-onnx's own
+        default and every prior round's behavior). When an int is given, it
+        OVERRIDES the live config for this call via sherpa_onnx's
+        OfflineSpeakerDiarization.set_config() -- a cheap in-place config
+        swap (confirmed via direct inspection of the installed sherpa_onnx
+        1.13.6 API: no model reload) -- so a caller can pass a per-group
+        hint (e.g. the session's confirmed global speaker count) without
+        paying GroupDiarizer's model-loading cost per call. The requested
+        value is only applied when it differs from what's already live, so
+        back-to-back calls with the same hint (or no hint) cost nothing
+        extra.
         """
         if sample_rate != self.sample_rate:
             from audio_utils import resample_linear
@@ -102,6 +132,10 @@ class GroupDiarizer:
         samples = np.asarray(samples, dtype=np.float32)
         if len(samples) < self.sample_rate // 2:  # <0.5s: not worth calling
             return []
+        effective = self._default_num_clusters if num_clusters is None else num_clusters
+        if effective != self._live_num_clusters:
+            self._sd.set_config(self._build_config(effective))
+            self._live_num_clusters = effective
         result = self._sd.process(samples)
         segments = result.sort_by_start_time()
         return [(seg.speaker, seg.start, seg.end) for seg in segments]

@@ -133,15 +133,55 @@ def load_segmentation(num_threads: int = 4):
     return sess
 
 
-def powerset_decode(logits: np.ndarray) -> np.ndarray:
+# Round 9 Experiment B (docs/DIARIZATION_PLAN.md section 20): class indices
+# grouped by how many speakers each powerset entry represents, precomputed
+# once so powerset_decode()'s gate doesn't rebuild these lists every call.
+_PAIR_CLASSES = [i for i, spk in enumerate(POWERSET) if len(spk) == 2]
+_SINGLE_OR_EMPTY_CLASSES = [i for i, spk in enumerate(POWERSET) if len(spk) <= 1]
+
+
+def powerset_decode(logits: np.ndarray, pair_gate: float | None = None) -> np.ndarray:
     """(frames, 7) powerset log-posteriors -> (frames, 3) binary activity.
 
     The model's head is a log-softmax over the 7 powerset classes, so a plain
     argmax picks the single most likely *set* of simultaneously active local
     speakers. That set may contain two speakers -- which is precisely the
     information sherpa-onnx's ExcludeOverlap() throws away (section 14).
+
+    pair_gate (Round 9 Experiment B, docs/DIARIZATION_PLAN.md section 20):
+    None (default) is Round 6's original unconditional behavior -- the plain
+    argmax's pick is used as-is, whether it's a pair class or not. Round 6
+    found this way overlap emission's own net contribution was small and
+    negative (-0.6pt on the AMI subset): a frame the argmax calls a pair
+    class most of the time turned out to be a false alarm in a genuinely
+    single-speaker region, because argmax alone has no notion of "confident"
+    versus "barely more likely than the alternative". The literature
+    (Bredin et al. 2019/2021) gates overlap assignment behind a confidence
+    threshold on the frame's own posterior instead of taking argmax
+    unconditionally. When pair_gate is a float, a frame whose argmax class IS
+    a pair class but whose own softmax posterior probability (exp of the
+    model's log-softmax logit -- monotonic with the logit, so this is exactly
+    the confidence argmax already implicitly used, just checked against a
+    floor before acting on a pair verdict) is below pair_gate is NOT treated
+    as overlap: instead the frame is re-decided by argmax restricted to the
+    empty-set and singleton classes only (index 0, 1, 2, 3) -- "the dominant
+    single speaker" the task calls for, which may be silence (index 0) or
+    exactly one of the three window-local speakers. A frame whose argmax
+    class was already a singleton or the empty set is untouched either way
+    (the gate only ever downgrades a pair verdict, never upgrades one).
     """
     best = np.argmax(logits, axis=-1)
+    if pair_gate is not None:
+        probs = np.exp(logits)  # log-softmax -> softmax; monotonic, so this
+                                # doesn't change which class argmax picked
+        is_pair = np.isin(best, _PAIR_CLASSES)
+        pair_conf = probs[np.arange(len(best)), best]
+        low_conf_pair = is_pair & (pair_conf < pair_gate)
+        if low_conf_pair.any():
+            fallback_classes = np.asarray(_SINGLE_OR_EMPTY_CLASSES)
+            restricted = probs[:, fallback_classes]
+            fallback_best = fallback_classes[np.argmax(restricted, axis=-1)]
+            best = np.where(low_conf_pair, fallback_best, best)
     out = np.zeros((logits.shape[0], 3), dtype=bool)
     for cls, speakers in enumerate(POWERSET):
         if not speakers:
@@ -152,7 +192,8 @@ def powerset_decode(logits: np.ndarray) -> np.ndarray:
     return out
 
 
-def segment_windows(samples: np.ndarray, sess, hop_samples: int, batch: int = 8):
+def segment_windows(samples: np.ndarray, sess, hop_samples: int, batch: int = 8,
+                    pair_gate: float | None = None):
     """Run the segmentation model over sliding windows.
 
     Yields (window_start_sample, activity) where activity is (frames, 3) bool.
@@ -160,6 +201,9 @@ def segment_windows(samples: np.ndarray, sess, hop_samples: int, batch: int = 8)
     onto the meeting-global frame grid by a pure integer offset (no resampling
     or interpolation when the per-frame votes from overlapping windows are
     combined later).
+
+    pair_gate is passed straight through to powerset_decode() -- see its
+    docstring (Round 9 Experiment B, docs/DIARIZATION_PLAN.md section 20).
     """
     assert hop_samples % FRAME_SHIFT == 0, hop_samples
     starts = list(range(0, max(len(samples) - WINDOW_SAMPLES, 0) + 1, hop_samples))
@@ -178,7 +222,7 @@ def segment_windows(samples: np.ndarray, sess, hop_samples: int, batch: int = 8)
             buf[j, 0, :len(piece)] = piece
         logits = sess.run(None, {"x": buf})[0]
         for j, start in enumerate(chunk):
-            yield start, powerset_decode(logits[j])
+            yield start, powerset_decode(logits[j], pair_gate=pair_gate)
 
 
 def window_speaker_audio(samples: np.ndarray, win_start: int, activity: np.ndarray,
@@ -285,12 +329,19 @@ def diarize_overlap(wav_path: str, hop_s: float = DEFAULT_HOP_S,
                     min_on: float = DEFAULT_MIN_DURATION_ON,
                     min_off: float = DEFAULT_MIN_DURATION_OFF,
                     threads: int = 4, method: str = "average",
-                    reliable_s: float = DEFAULT_RELIABLE_S) -> tuple[dict[float, list], dict]:
+                    reliable_s: float = DEFAULT_RELIABLE_S,
+                    pair_gate: float | None = None) -> tuple[dict[float, list], dict]:
     """Full-file overlap-aware diarization. Returns ({threshold: hyp}, stats).
 
     Segmentation and embedding are done once and shared across every
     clustering threshold -- only step 4-5 (cluster + aggregate) is repeated
     per threshold, which is what makes the sweep cheap.
+
+    pair_gate (Round 9 Experiment B, docs/DIARIZATION_PLAN.md section 20):
+    passed straight through to segment_windows()/powerset_decode() -- unlike
+    `thresholds`, this changes step 1-2 (which frames get called "overlap" in
+    the first place), so it is NOT free to sweep: a different pair_gate needs
+    its own segmentation+embedding pass, not just a different clustering cut.
     """
     from realtime_transcribe import read_wave
     from speaker_id import SpeakerLabeler
@@ -313,7 +364,7 @@ def diarize_overlap(wav_path: str, hop_s: float = DEFAULT_HOP_S,
     exclusive_durations: list[float] = []
 
     t0 = time.time()
-    seg_out = list(segment_windows(samples, sess, hop_samples))
+    seg_out = list(segment_windows(samples, sess, hop_samples, pair_gate=pair_gate))
     t_seg += time.time() - t0
 
     n_exclusive_short = 0
@@ -426,6 +477,15 @@ def main():
                          "to the nearest resulting centroid instead")
     ap.add_argument("--linkage", default="average", choices=["average", "complete", "single"],
                     help="scipy linkage method for the cross-window clustering")
+    ap.add_argument("--pair-gate", type=float, default=None, metavar="P",
+                    help="Round 9 (docs/DIARIZATION_PLAN.md section 20) Experiment B: only "
+                         "treat a frame as overlap (2 simultaneous window-local speakers) when "
+                         "the powerset pair-class posterior argmax picked is >= this probability "
+                         "(0-1); below it, the frame is re-decided among the empty-set/single- "
+                         "speaker classes only (the dominant single speaker). None (default) is "
+                         "Round 6's original ungated behavior -- every argmax pair verdict is "
+                         "taken as-is. Unlike --thresholds, this is NOT free to sweep -- each "
+                         "value needs its own segmentation+embedding pass.")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--json-out", default=None, help="write per-meeting rows here")
     args = ap.parse_args()
@@ -452,7 +512,8 @@ def main():
         t0 = time.time()
         hyps, stats = diarize_overlap(wav_path, args.hop_s, thresholds, args.num_clusters,
                                       args.min_duration_on, args.min_duration_off,
-                                      args.threads, args.linkage, args.reliable_s)
+                                      args.threads, args.linkage, args.reliable_s,
+                                      args.pair_gate)
         wall = time.time() - t0
 
         for threshold in thresholds:
