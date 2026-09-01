@@ -324,3 +324,43 @@ def test_pause_free_buffer_has_nothing_to_split():
     assert asr._speech_pieces(short, SR)[0] is None
     # unsupported sample rate: the VAD model is 16k only, decode as before
     assert asr._speech_pieces(np.zeros(int(10.0 * 44100), dtype=np.float32), 44100)[0] is None
+
+
+# --- live path: utterance-initial words survive the VAD's late onset -------
+
+# utterance-INITIAL word of each fixture sentence, with the kana spellings
+# the ja models legitimately emit (a kana head is not a dropped head)
+HEAD_VARIANTS = [("東京", "とうきょう"), ("明日", "あした"), ("資料", "しりょう")]
+
+
+@needs_models
+def test_live_path_preroll_keeps_utterance_initial_words(capsys):
+    """Silero's speech-start detection lags the true onset (measured 198ms
+    behind on this fixture's fast-onset first sentence), so decoding
+    vad.front.samples as-is can lose or garble the utterance's first word --
+    with the preroll forced to 0, this very clip decoded 資料は→昨日は
+    (docs/BENCHMARKS.md 2026-08-31, live-path verification). The live path
+    guards against that by prepending up to PREROLL_S of real context from
+    AudioHistory in drain_segments(); this test pins that end-to-end: every
+    sentence's initial word must survive the full VAD -> preroll -> decode
+    chain."""
+    import realtime_transcribe as rt
+
+    samples, sr = _fixture_samples()
+    asr = _engine()
+    vad = rt.build_vad()
+    stats = rt.SessionStats()
+    printer = rt.PartialPrinter(enabled=False)
+    history = rt.AudioHistory(sr)
+    rt.run_stream(rt.wav_chunks(samples, sr, realtime=False), vad, sr, asr,
+                  stats, printer, refiner=None, history=history)
+    # same finalization the CLI's finish() does for whatever the VAD still holds
+    vad.flush()
+    rt.drain_segments(vad, sr, asr, stats, printer, history)
+
+    out = capsys.readouterr().out
+    assert stats.segments == len(SENTENCES), \
+        f"expected one final per sentence, got {stats.segments}: {out!r}"
+    missing = [v[0] for v in HEAD_VARIANTS if not any(k in out for k in v)]
+    assert not missing, \
+        f"utterance-initial word(s) {missing} dropped on the live path: {out!r}"
