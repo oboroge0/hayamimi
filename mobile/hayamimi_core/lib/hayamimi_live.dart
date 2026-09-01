@@ -172,6 +172,8 @@ class HayamimiLive {
   /// transition, not one per decode; see [LiveTranscriber.decoding].
   Stream<bool> get decoding => _decodingController.stream;
 
+  /// Whether a session is currently active: `start`/`startDebugWavStream`
+  /// has completed and `stop` hasn't been called since.
   bool get isRunning => _transcriber.isRunning;
 
   /// Total audio currently buffered for the next refine pass, in seconds.

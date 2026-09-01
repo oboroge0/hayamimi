@@ -125,6 +125,8 @@ class RemoteUnknownEvent extends RemoteEvent {
   final Map<String, dynamic> raw;
 }
 
+/// Thrown while decoding a server frame into a [RemoteEvent]: malformed
+/// JSON, or JSON that isn't an object.
 class RemoteEventParseException implements Exception {
   RemoteEventParseException(this.message);
   final String message;

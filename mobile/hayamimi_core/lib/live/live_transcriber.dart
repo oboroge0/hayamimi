@@ -46,6 +46,10 @@ const _decodeDrainTimeout = Duration(seconds: 10);
 /// tests (see [LiveTranscriber]'s `decodeWorkerFactory`).
 DecodeWorker _spawnDecodeWorker() => IsolateDecodeWorker();
 
+/// A [LiveTranscriber] failure: thrown by `start`/`startDebugWavStream`
+/// for a bad configuration (e.g. a missing model file), and emitted on
+/// [LiveTranscriber.errors] for a failure mid-session -- e.g. the OS
+/// revoking microphone access, or the decode worker isolate dying.
 class LiveTranscriberException implements Exception {
   LiveTranscriberException(this.message);
   final String message;
@@ -139,6 +143,8 @@ class LiveTranscriber {
        _vadFactory = vadFactory ?? buildSileroLiveVad,
        _recorder = recorder ?? AudioRecorder();
 
+  /// The mic capture / VAD / recognizer sample rate this transcriber uses
+  /// throughout, in Hz. Fixed -- not configurable per session.
   static const int sampleRate = 16000;
 
   static double _requirePositive(double value, String name) {
@@ -353,6 +359,8 @@ class LiveTranscriber {
   /// `events` stream).
   Stream<void> get sessionResets => _sessionResetController.stream;
 
+  /// Whether a session is currently active: microphone capture is running
+  /// and the decode worker is loaded.
   bool get isRunning => _micSubscription != null;
 
   /// Whether [startDebugWavStream] is currently paced-streaming a wav file
@@ -369,7 +377,7 @@ class LiveTranscriber {
   /// Total audio currently buffered for the next refine pass, in seconds.
   double get refineBufferedSeconds => _refineBuffer.totalDurationSeconds;
 
-  /// Whether auto-refine (silence-triggered, see [refine_pass.dart]) is on.
+  /// Whether auto-refine (silence-triggered, see `refine_pass.dart`) is on.
   /// Defaults to off: on a phone every refine is a full re-decode burning
   /// battery and generating heat, so firing it automatically is opt-in —
   /// the manual "清書" button always works regardless of this setting.

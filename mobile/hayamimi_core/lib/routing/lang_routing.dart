@@ -111,7 +111,7 @@ class StickyLangResult {
 /// `docs/MOBILE.md`), so [RoutedRecognizerSet] never reaches this path.
 /// It's kept, not deleted, as a faithful, tested port so a future
 /// non-SenseVoice language tier can reuse it without re-deriving the
-/// hysteresis rules from the desktop pipeline. Only [lang_routing_test.dart]
+/// hysteresis rules from the desktop pipeline. Only `lang_routing_test.dart`
 /// exercises it for now.
 ///
 /// A single new-language detection can be a babble-noise misfire or a
