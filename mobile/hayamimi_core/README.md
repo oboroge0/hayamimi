@@ -282,6 +282,121 @@ insertion point, not an implementation: CJK inverse-text-normalization
 and user find/replace dictionaries are not ported to Dart yet, so a host app
 that wants them today supplies its own `textTransform`.
 
+## Japanese punctuation restoration (phase 1 of #15)
+
+On the desktop pipeline, the refine ("清書") pass hands its text through
+`scripts/punct_ja.py` before anything sees it, so desktop captions read as
+sentences. This package had no equivalent, so its refine output arrived as
+an unbroken run of characters — the same words, no 、 and no 。. Issue
+[#15](https://github.com/oboroge0/hayamimi/issues/15) is about closing that
+gap; this is its first half.
+
+**What this adds:** `PunctuatorJa`, a Dart port of that script.
+`restore(String) -> String` inserts 、 and 。 into unpunctuated Japanese, and
+turns a sentence-final 。 into ？ after a recognised question ending.
+
+```dart
+final punctuator = await PunctuatorJa.load(
+  modelPath: '<...>/punct_bert.fp16.onnx',
+  vocabPath: '<...>/vocab.txt',
+);
+punctuator.restore('明日の会議は午後三時から始まります資料の準備をお願いします');
+// -> 明日の会議は午後三時から始まります。資料の準備をお願いします。
+punctuator.dispose();   // the session is native; nothing frees it for you
+```
+
+**What it does not do yet.** It is not wired into `HayamimiLive` or the
+refine pass — that is phase 2, and until then a host app has to call
+`PunctuatorJa` itself (the `textTransform` hook above is one place to do
+it). And the model is not downloadable: `ModelDownloader` has no entry for
+it, because the file this port runs, `punct_bert.fp16.onnx` (181.8 MB), is
+still only a local artifact of `python scripts/quantize_punct.py --variant
+fp16`. Where to host a 182 MB file, and whether to ship the float16 build
+or something smaller, is undecided — see `docs/MOBILE.md`, which records
+that float16 was the only size reduction that did not cost accuracy
+(identical predictions to the full-size model on a 250-sentence FLEURS ja
+check; dynamic and static INT8 both lost recall).
+
+### How it reaches ONNX Runtime, and why that way
+
+The model runs on ONNX Runtime, the inference engine `sherpa_onnx` already
+bundles for speech recognition. The obvious move — adding the `onnxruntime`
+or `flutter_onnxruntime` package — is the wrong one: each ships its own
+`libonnxruntime.so`, and two copies of that library in one Android process
+is a known crash
+([sherpa-onnx#3261](https://github.com/k2-fsa/sherpa-onnx/issues/3261)).
+
+So this package ships no runtime at all. It calls ONNX Runtime's C API
+directly through `dart:ffi` (Dart's foreign-function interface, which lets
+Dart call C functions in a shared library) against the library
+`sherpa_onnx` has already loaded: look up `OrtGetApiBase`, ask it for a
+function table, call through it. That table only ever grows at the end
+across ONNX Runtime releases, so bindings written against an older version
+keep working when `sherpa_onnx` bumps the runtime it bundles — this package
+asks for API version 11 (ONNX Runtime 1.10's) and got 1.27.1 in testing.
+
+The session is created from the model's *file path*, not from bytes, so the
+182 MB never passes through the Dart heap. Every native object it makes —
+environment, session, tensors, the strings ONNX Runtime allocates for graph
+names — is freed explicitly; `dispose()` releases the rest.
+
+Two pieces of the reference implementation had no Dart equivalent:
+
+- **NFKC** (a Unicode normalization that folds full-width ASCII to ASCII and
+  half-width katakana to full-width) is not in `dart:core`. This package
+  depends on [`unorm_dart`](https://pub.dev/packages/unorm_dart) (MIT, no
+  dependencies, Unicode 17.0) for it.
+- **MeCab**, the Japanese morphological analyzer the reference tokenizer
+  runs, has no pure-Dart port worth carrying — and it turns out not to
+  matter: the pipeline splits every morpheme back into single characters a
+  line later, so MeCab's only observable effect is that it drops
+  whitespace. The Dart tokenizer therefore does "NFKC, drop whitespace,
+  split into code points". That is not an assumption:
+  `scripts/make_punct_fixture.py` compares the two on every FLEURS ja
+  sentence and refuses to write its fixture if they ever disagree.
+
+### Platform status
+
+| Platform | Status |
+|---|---|
+| Windows (host, `flutter test`) | **Verified** — parity with the Python reference on 51 recorded cases. |
+| Android | Expected to work: `libonnxruntime.so` is what `sherpa_onnx` loads there. **Not run on a device in this change.** |
+| iOS | **Unverified, and refused by default.** `sherpa_onnx` links ONNX Runtime as an xcframework and it has not been confirmed that `OrtGetApiBase` stays exported from the app binary, so `PunctuatorJa.load` throws rather than guess. Pass `libraryPath: OrtLibrary.processSymbols` to try it. |
+| macOS / Linux | Pass `libraryPath`; nothing puts the library on a desktop host's loader search path. |
+
+### Running the parity test
+
+`test/punct/punct_ja_parity_test.dart` replays
+`test/fixtures/punct_ja_parity.json` — 40 sentences from the FLEURS ja
+benchmark set with their punctuation stripped, plus 11 synthetic edge cases
+— and asserts the Dart output equals the recorded Python output character
+for character. Regenerate the fixture with
+`python scripts/make_punct_fixture.py`.
+
+It needs the float16 model and an ONNX Runtime library, and **skips with a
+reason naming whichever is missing** rather than failing, so a checkout
+without them stays green. On Windows it finds the library by reading the
+resolved path of `sherpa_onnx_windows` out of
+`.dart_tool/package_config.json` and using the `onnxruntime.dll` that
+package ships; elsewhere, point `HAYAMIMI_ORT_LIBRARY` at one. A companion
+test, `punct_ja_fixture_tokens_test.dart`, checks the token ids from the
+same fixture and needs only the 28 KB `vocab.txt`, so tokenizer drift is
+caught even without the model.
+
+The test prints what it measured while running: **66–71 ms mean
+`restore()`** over the 51 cases (55 characters on average) across three
+runs, on this Windows x86 host, ONNX Runtime 1.27.1 from
+`sherpa_onnx_windows`, two intra-op threads. **This says
+nothing about a phone.** ONNX Runtime's CPU provider has no float16 compute
+path on x86, so float16 tensors are cast to float32 and back on every
+operator; an ARM chip with a float16 vector unit is a different machine
+entirely. For scale only: the Python reference (`scripts/punct_ja.py`,
+ONNX Runtime 1.29.0, four intra-op threads, MeCab tokenization inside the
+timed call) averaged 366.3 ms on the same 51 inputs and the same model on
+this host. The two measurements differ in runtime build, thread count and
+what the timed call includes, so the gap has not been attributed to
+anything — it is recorded here, not explained.
+
 ## Runtime configuration and session control
 
 The pacing/VAD/decoding defaults above were chosen for a phone running the
@@ -510,6 +625,14 @@ from `HayamimiRemote.events` rather than raising an error.
   translation/refine/error/model_load/session_reset, all with
   wire-compatible JSON encoding — see "Events" above), and
   `overlay_html.dart` (the OBS-ready transparent overlay page).
+- `lib/punct/` — Japanese punctuation restoration (see the section above).
+  `punctuator_ja.dart` is the whole public surface (`PunctuatorJa.restore`);
+  `punct_ja_tokenizer.dart` (NFKC + character split + vocabulary) and
+  `punct_ja_text.dart` (where a mark goes, and the ？ heuristic) are pure
+  Dart and unit tested without a model; `punct_ort_session.dart` and
+  `ort_library.dart` are the only FFI in the package, and
+  `ort_bindings.dart` is a trimmed copy of ONNX Runtime's C API bindings
+  (see `THIRD_PARTY_NOTICES.md`).
 - `lib/setup/model_downloader.dart` — `downloadProfile`/`downloadModelSource`
   (fetch → verify sha256 → extract → place) and `modelManifest` (the two
   profiles' exact sherpa-onnx release URLs, checksums, and on-disk layout).
