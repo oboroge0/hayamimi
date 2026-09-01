@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -528,6 +529,116 @@ void main() {
       expect(h.transcriber.isDebugStreaming, isFalse);
       expect(h.worker.shutdownCount, 1);
       expect(h.vad.freed, isTrue);
+    });
+
+    test('ends with a refine over what it transcribed', () async {
+      // The session is torn down before this future completes, so a caller
+      // cannot ask for a refine afterwards -- refineNow() would find no
+      // worker. Without a closing pass, the method that exists to show
+      // punctuated refine output on a device with no microphone would
+      // never produce one.
+      h.workerSetUp = (worker) => worker.autoReplyText = 'flushed line';
+      h.vads.setUp = (vad) => vad.flushSegment = FakeLiveVad.segment(1.0);
+      final wavPath = h.writeWav(sampleCount: 4096);
+
+      await h.transcriber.startDebugWavStream(
+        modelKind: ModelKind.zipformerTransducer,
+        modelDir: h.modelDir.path,
+        vadModelPath: h.vadModelPath,
+        wavPath: wavPath,
+        realtime: false,
+      );
+
+      expect(
+        h.worker.decodeRequests.map((r) => r.kind),
+        contains(DecodeRequestKind.refine),
+      );
+      expect(h.refines.single.text, 'flushed line');
+      expect(h.refines.single.audioSeconds, closeTo(1.0, 1e-9));
+      // And it landed before the session went away, not after.
+      expect(h.transcriber.isDebugStreaming, isFalse);
+      expect(h.worker.shutdownCount, 1);
+    });
+
+    test('a stream that transcribed nothing ends with no refine', () async {
+      // Nothing buffered means nothing for a refine to cover; asking for
+      // one anyway would cost a decode of silence.
+      h.workerSetUp = (worker) => worker.autoReplyText = 'never asked for';
+      final wavPath = h.writeWav(sampleCount: 4096);
+
+      await h.transcriber.startDebugWavStream(
+        modelKind: ModelKind.zipformerTransducer,
+        modelDir: h.modelDir.path,
+        vadModelPath: h.vadModelPath,
+        wavPath: wavPath,
+        realtime: false,
+      );
+
+      expect(h.worker.decodeRequests, isEmpty);
+      expect(h.refines, isEmpty);
+    });
+
+    test('auto-refine set before the stream fires during it', () async {
+      // The autoRefineEnabled setter only started its timer for a
+      // microphone session; a debug stream got one only because
+      // _resetSessionState starts it when the flag is already set. Both
+      // paths now work, and this pins the documented one: set it, stream,
+      // and refines arrive as the audio goes by rather than only at the
+      // end.
+      h.workerSetUp = (worker) => worker.autoReplyText = 'a line';
+      h.vads.setUp = (vad) =>
+          vad.segmentsPerFrame.add(FakeLiveVad.segment(1.0));
+      // Any silence at all is enough; the due check itself runs once a
+      // second, which is what paces this test.
+      h.transcriber.autoRefineSilenceSeconds = 0.001;
+      h.transcriber.autoRefineEnabled = true;
+      // ~2.6s of audio at 16kHz, streamed at its own pace, so the
+      // once-a-second due check runs at least twice while it plays.
+      final wavPath = h.writeWav(sampleCount: 41600);
+
+      // A second segment, timed to arrive after the first due check has
+      // already refined the first one.
+      Timer(const Duration(milliseconds: 1700), () {
+        h.vad.segmentsPerFrame.add(FakeLiveVad.segment(1.0));
+      });
+
+      await h.transcriber.startDebugWavStream(
+        modelKind: ModelKind.zipformerTransducer,
+        modelDir: h.modelDir.path,
+        vadModelPath: h.vadModelPath,
+        wavPath: wavPath,
+      );
+
+      // Two refines, not one: a single closing pass would have covered both
+      // segments at once, so the first one covering 1.0s on its own is the
+      // evidence that a refine fired while the stream was still playing.
+      expect(h.refines.length, greaterThanOrEqualTo(2));
+      expect(h.refines.first.audioSeconds, closeTo(1.0, 1e-9));
+    });
+
+    test('auto-refine turned on mid-stream starts firing too', () async {
+      h.workerSetUp = (worker) => worker.autoReplyText = 'a line';
+      h.vads.setUp = (vad) =>
+          vad.segmentsPerFrame.add(FakeLiveVad.segment(1.0));
+      h.transcriber.autoRefineSilenceSeconds = 0.001;
+      final wavPath = h.writeWav(sampleCount: 41600);
+
+      Timer(const Duration(milliseconds: 300), () {
+        h.transcriber.autoRefineEnabled = true;
+      });
+      Timer(const Duration(milliseconds: 1700), () {
+        h.vad.segmentsPerFrame.add(FakeLiveVad.segment(1.0));
+      });
+
+      await h.transcriber.startDebugWavStream(
+        modelKind: ModelKind.zipformerTransducer,
+        modelDir: h.modelDir.path,
+        vadModelPath: h.vadModelPath,
+        wavPath: wavPath,
+      );
+
+      expect(h.refines.length, greaterThanOrEqualTo(2));
+      expect(h.refines.first.audioSeconds, closeTo(1.0, 1e-9));
     });
 
     test('a wav at the wrong sample rate is rejected and leaves nothing running', () async {

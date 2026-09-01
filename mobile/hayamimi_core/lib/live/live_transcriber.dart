@@ -43,6 +43,13 @@ const _autoRefineCheckInterval = Duration(seconds: 1);
 /// close.
 const _decodeDrainTimeout = Duration(seconds: 10);
 
+/// The least audio a refine ("清書") pass is worth running over, in
+/// seconds. Mirrors the desktop `Refiner`'s own `len(buf) < sr // 2`
+/// guard: re-decoding a fraction of a second of speech as a "group" costs
+/// a full decode and cannot produce a better result than the final that
+/// already covered it.
+const _minRefineAudioSeconds = 0.5;
+
 /// Builds the real, isolate-backed decode worker. Swapped out only by
 /// tests (see [LiveTranscriber]'s `decodeWorkerFactory`).
 DecodeWorker _spawnDecodeWorker() => IsolateDecodeWorker();
@@ -445,7 +452,7 @@ class LiveTranscriber {
     if (!value) {
       _autoRefineTimer?.cancel();
       _autoRefineTimer = null;
-    } else if (isRunning) {
+    } else if (isRunning || _debugStreaming) {
       _startAutoRefineTimer();
     }
   }
@@ -1069,7 +1076,7 @@ class LiveTranscriber {
     }
     final segments = _refineBuffer.takeAll();
     final combined = combineSegmentSamples(segments);
-    if (combined.length < sampleRate ~/ 2) {
+    if (combined.length < sampleRate * _minRefineAudioSeconds) {
       return null;
     }
     return RefineRequestPayload(
@@ -1475,9 +1482,28 @@ class LiveTranscriber {
   /// [realtime] paces delivery to roughly the wav's own duration (one VAD
   /// window's worth of audio every ~32ms at 16kHz); pass `false` to stream
   /// as fast as decoding allows instead, e.g. for a quick smoke test.
-  /// Awaits until the whole file has been fed through and any in-progress
-  /// segment has been flushed and decoded -- same shutdown behavior [stop]
-  /// gives a live session.
+  ///
+  /// **What "awaits until done" covers.** The whole file is fed through,
+  /// any in-progress segment is flushed and decoded, and then -- unlike
+  /// [stop], which drops whatever was buffered -- one last refine ("清書")
+  /// pass runs over the finals this stream produced, provided they add up
+  /// to at least half a second of audio. That refine is awaited before the
+  /// session is torn down, so by the time this future completes,
+  /// [refineEntries] has already carried it.
+  ///
+  /// That closing refine is deliberate, and it is the difference between
+  /// this method and [start]. The session is gone before the future
+  /// resolves (the same teardown [stop] performs), so a caller who awaits
+  /// this and *then* calls [refineNow] gets nothing: there is no longer a
+  /// worker to run it. Without the closing pass, a default-configured debug
+  /// stream would produce no refine at all -- which is the one thing this
+  /// method exists to demonstrate on a device with no usable microphone.
+  ///
+  /// [autoRefineEnabled] also works here, not only for microphone
+  /// sessions: set it to `true` before calling this and refines fire on
+  /// silence gaps during the stream, the same way they would live. Setting
+  /// it while a stream is already running works too.
+  ///
   /// See [start] for what [decodingMethod]/[vadSensitivity]/[hotwordsFile]/
   /// [hotwordsScore]/[punctuation] do -- identical meaning and defaults
   /// here, which is what makes this the way to see punctuated refine output
@@ -1609,10 +1635,28 @@ class LiveTranscriber {
       if (!_debugStreamCancelRequested) {
         _vad?.flush();
         _drainReadySegments();
+        await _waitForDecodesToDrain();
+        // The whole point of this method is to show what a live session
+        // produces, and on a device without a microphone it is the only
+        // way to see a punctuated refine at all. Teardown below ends the
+        // session before this future completes, so a caller cannot ask for
+        // one afterwards -- refineNow() would find no worker and silently
+        // do nothing. So run the last one here, while there is still a
+        // session to run it in, over everything the finals just buffered.
+        if (_refineBuffer.totalDurationSeconds >= _minRefineAudioSeconds) {
+          await refineNow();
+        }
+      } else {
+        await _waitForDecodesToDrain();
       }
-      await _waitForDecodesToDrain();
     } finally {
       _debugStreaming = false;
+      // Started by _resetSessionState above when autoRefineEnabled was
+      // already on. Nothing else cancels it on this path -- stop() only
+      // ends a microphone session -- so without this it would keep ticking
+      // against a torn-down session for the life of the object.
+      _autoRefineTimer?.cancel();
+      _autoRefineTimer = null;
       await _teardownNativeState();
     }
   }

@@ -319,9 +319,16 @@ class HayamimiLive {
   ///
   /// Exists so this facade can be exercised end to end without a real
   /// microphone -- e.g. on an Android emulator, which has none. Awaits
-  /// until the whole file has been fed through and any in-progress segment
-  /// has been flushed and decoded. See [start] for [decodingMethod]/
-  /// [vadSensitivity]/[hotwordsFile]/[hotwordsScore]/[punctuation].
+  /// until the whole file has been fed through, any in-progress segment has
+  /// been flushed and decoded, and one closing refine ("清書") pass over
+  /// what those finals buffered has been emitted as a [RefineSubtitleEvent]
+  /// -- so a punctuated refine is visible from a single awaited call. The
+  /// session is torn down before this future completes, so [refineNow]
+  /// afterwards has nothing left to refine; see
+  /// [LiveTranscriber.startDebugWavStream] for the full behavior, including
+  /// how [autoRefineEnabled] applies here too. See [start] for
+  /// [decodingMethod]/[vadSensitivity]/[hotwordsFile]/[hotwordsScore]/
+  /// [punctuation].
   Future<void> startDebugWavStream({
     required String modelDir,
     required String vadModelPath,
