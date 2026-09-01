@@ -2,24 +2,15 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hayamimi_core/live/speech_segment_filter.dart';
-import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa_onnx;
 
-sherpa_onnx.SpeechSegment _segmentOfDuration(
-  double seconds, {
-  int sampleRate = 16000,
-}) {
-  final sampleCount = (seconds * sampleRate).round();
-  return sherpa_onnx.SpeechSegment(samples: Float32List(sampleCount), start: 0);
+Float32List _segmentOfDuration(double seconds, {int sampleRate = 16000}) {
+  return Float32List((seconds * sampleRate).round());
 }
 
 void main() {
   group('isSegmentWorthDecoding', () {
     test('rejects an empty segment', () {
-      final segment = sherpa_onnx.SpeechSegment(
-        samples: Float32List(0),
-        start: 0,
-      );
-      expect(isSegmentWorthDecoding(segment), isFalse);
+      expect(isSegmentWorthDecoding(Float32List(0)), isFalse);
     });
 
     test('rejects a segment shorter than the minimum duration', () {
@@ -52,10 +43,7 @@ void main() {
 
     test('respects a custom sample rate when computing duration', () {
       // 1600 samples at 8kHz is 0.2s, but at 16kHz it's only 0.1s.
-      final segment = sherpa_onnx.SpeechSegment(
-        samples: Float32List(1600),
-        start: 0,
-      );
+      final segment = Float32List(1600);
 
       expect(
         isSegmentWorthDecoding(

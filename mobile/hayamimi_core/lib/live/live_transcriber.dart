@@ -7,6 +7,7 @@ import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa_onnx;
 
 import '../bench/model_file_resolver.dart';
 import '../bench/model_kind.dart';
+import '../remote/wav_pcm_reader.dart';
 import '../routing/routed_recognizer.dart';
 import '../routing/routing_profile.dart';
 import 'decode_protocol.dart';
@@ -14,6 +15,7 @@ import 'decode_session.dart';
 import 'decode_worker.dart';
 import 'draft_pass.dart';
 import 'live_transcript_entry.dart';
+import 'live_vad.dart';
 import 'model_load_event.dart';
 import 'native_model_loader.dart';
 import 'pcm_frame_buffer.dart';
@@ -87,15 +89,17 @@ class LiveTranscriber {
   /// knob value gets a clean, synchronous [ArgumentError] instead of also
   /// leaking that half-started platform call.
   ///
-  /// [decodeWorkerFactory] decides what a session's decodes are sent to.
-  /// Leave it unset in an app: the default spawns the real isolate-backed
-  /// worker. It exists because the sherpa-onnx native libraries cannot be
-  /// loaded in a plain `flutter test` run, so without it none of the
-  /// queueing, staleness and lifecycle behaviour around decoding could be
-  /// exercised by a test at all.
+  /// [decodeWorkerFactory] decides what a session's decodes are sent to,
+  /// and [vadFactory] what its speech detection runs on. Leave both unset
+  /// in an app: the defaults spawn the real decode worker isolate and load
+  /// Silero VAD through sherpa-onnx. They exist because the sherpa-onnx
+  /// native libraries cannot be loaded in a plain `flutter test` run, and
+  /// between them they are what lets a whole session -- microphone to
+  /// transcript line -- be driven without a device.
   LiveTranscriber({
     AudioRecorder? recorder,
     DecodeWorker Function()? decodeWorkerFactory,
+    LiveVadFactory? vadFactory,
     double draftIntervalSeconds = defaultDraftIntervalSeconds,
     double draftWindowSeconds = defaultDraftWindowSeconds,
     double minDraftAudioSeconds = defaultMinDraftAudioSeconds,
@@ -130,6 +134,7 @@ class LiveTranscriber {
          ),
        ),
        _decodeWorkerFactory = decodeWorkerFactory ?? _spawnDecodeWorker,
+       _vadFactory = vadFactory ?? buildSileroLiveVad,
        _recorder = recorder ?? AudioRecorder();
 
   static const int sampleRate = 16000;
@@ -143,6 +148,7 @@ class LiveTranscriber {
 
   final AudioRecorder _recorder;
   final DecodeWorker Function() _decodeWorkerFactory;
+  final LiveVadFactory _vadFactory;
   final _entriesController = StreamController<LiveTranscriptEntry>.broadcast();
   final _decodingController = StreamController<bool>.broadcast();
   final _refineEntriesController =
@@ -153,7 +159,7 @@ class LiveTranscriber {
   final _modelLoadController = StreamController<ModelLoadEvent>.broadcast();
   final _sessionResetController = StreamController<void>.broadcast();
 
-  sherpa_onnx.VoiceActivityDetector? _vad;
+  LiveVad? _vad;
   // The worker isolate that owns this session's recognizer(s), and the
   // queue in front of it. Null between sessions; built by
   // _buildNativeState, shut down by _teardownNativeState.
@@ -175,7 +181,7 @@ class LiveTranscriber {
   // installing it -- checked once per processed frame (_maybeSwapPendingVad,
   // called from _processFrame) so the swap happens as soon as it's safe
   // without polling on a timer.
-  sherpa_onnx.VoiceActivityDetector? _pendingVadInstall;
+  LiveVad? _pendingVadInstall;
   // Bumped by _buildNativeState and _teardownNativeState -- lets a
   // long-running background rebuild (setVadSensitivity's VAD rebuild) tell,
   // once its await resolves, whether the native state it was building
@@ -647,36 +653,21 @@ class LiveTranscriber {
 
     _vadModelPath = vadModelPath;
     _vadSensitivity = vadSensitivity;
-    final vadConfig = _vadConfigFor(vadSensitivity, vadModelPath);
     _emitModelLoad(model: 'vad', phase: 'start');
     final vadStopwatch = Stopwatch()..start();
-    _vad = await buildVadOffIsolate(
-      config: vadConfig,
-      bufferSizeInSeconds: 30,
+    final vad = await _vadFactory(
+      modelPath: vadModelPath,
+      sensitivity: vadSensitivity,
+      sampleRate: sampleRate,
     );
     vadStopwatch.stop();
+    _vad = vad;
     _emitModelLoad(
       model: 'vad',
       phase: 'done',
       ms: vadStopwatch.elapsedMicroseconds / 1000,
     );
-    _frameBuffer = PcmFrameBuffer(frameSize: vadConfig.sileroVad.windowSize);
-  }
-
-  sherpa_onnx.VadModelConfig _vadConfigFor(
-    VadSensitivity sensitivity,
-    String vadModelPath,
-  ) {
-    return sherpa_onnx.VadModelConfig(
-      sileroVad: sherpa_onnx.SileroVadModelConfig(
-        model: vadModelPath,
-        threshold: sensitivity.threshold,
-        minSilenceDuration: sensitivity.minSilenceSeconds,
-        minSpeechDuration: sensitivity.minSpeechSeconds,
-        maxSpeechDuration: sensitivity.maxSpeechSeconds,
-      ),
-      sampleRate: sampleRate,
-    );
+    _frameBuffer = PcmFrameBuffer(frameSize: vad.frameSize);
   }
 
   void _emitModelLoad({
@@ -752,7 +743,7 @@ class LiveTranscriber {
     // the Dart bindings (unlike the desktop's `vad.current_segment.samples`
     // -- see draft_pass.dart's doc comment), so this buffer is built by
     // hand from the same frames already being fed to the VAD.
-    final detected = vad.isDetected();
+    final detected = vad.isSpeechDetected;
     if (detected && !_draftSegmentActive) {
       // Just started a new segment: drop anything left over from before
       // (shouldn't normally happen, since a finalized segment clears this
@@ -790,26 +781,25 @@ class LiveTranscriber {
     if (vad == null) {
       return;
     }
-    while (!vad.isEmpty()) {
-      final segment = vad.front();
-      vad.pop();
-      // The segment just popped supersedes whatever the draft pass had
+    while (vad.hasSegment) {
+      final samples = vad.takeSegment();
+      // The segment just taken supersedes whatever the draft pass had
       // accumulated for it -- the real (properly routed/decoded) final is
       // about to replace any draft the UI was showing.
       _clearDraftFrames();
       _draftSegmentActive = false;
-      _decodeSegment(segment);
+      _decodeSegment(samples);
     }
   }
 
-  void _decodeSegment(sherpa_onnx.SpeechSegment segment) {
-    if (!isSegmentWorthDecoding(segment, sampleRate: sampleRate)) {
+  void _decodeSegment(Float32List samples) {
+    if (!isSegmentWorthDecoding(samples, sampleRate: sampleRate)) {
       return;
     }
     // Queued at the worker, never dropped, and answered in the order the
     // segments closed -- so the transcript keeps the order the speaker
     // said things in even when several segments finish back to back.
-    _decode?.submitFinal(segment.samples);
+    _decode?.submitFinal(samples);
   }
 
   /// Turns one finished segment's decode into a transcript line and files
@@ -1216,9 +1206,10 @@ class LiveTranscriber {
 
         _emitModelLoad(model: 'vad', phase: 'start');
         final stopwatch = Stopwatch()..start();
-        final built = await buildVadOffIsolate(
-          config: _vadConfigFor(target, vadModelPath),
-          bufferSizeInSeconds: 30,
+        final built = await _vadFactory(
+          modelPath: vadModelPath,
+          sensitivity: target,
+          sampleRate: sampleRate,
         );
         stopwatch.stop();
         _emitModelLoad(
@@ -1398,37 +1389,20 @@ class LiveTranscriber {
     _debugStreaming = true;
     _debugStreamCancelRequested = false;
     try {
-      final wave = sherpa_onnx.readWave(wavPath);
-      if (wave.samples.isEmpty) {
-        throw LiveTranscriberException(
-          'Failed to read WAV file (unsupported format or empty): $wavPath',
-        );
-      }
-      if (wave.sampleRate != sampleRate) {
-        // Unlike runDebugWavRefineTest (which just decodes at the wav's own
-        // rate, no VAD involved), this path feeds the wav through the VAD,
-        // which is configured for a fixed 16kHz -- a mismatched wav would
-        // silently desync the VAD's speech/silence timing from real time.
-        throw LiveTranscriberException(
-          'WAV sample rate ${wave.sampleRate}Hz != required ${sampleRate}Hz '
-          '(resample the test wav to 16kHz mono first): $wavPath',
-        );
-      }
-      // wave.samples is already mono float32 (sherpa-onnx's reader decodes
-      // straight to that), so no pcm16BytesToFloat32 step is needed here
-      // (unlike the mic path) -- feed it straight into the same
-      // PcmFrameBuffer to get fixed-size VAD windows.
+      final samples = await _readDebugWavSamples(wavFile, wavPath);
+      // Feed it into the same PcmFrameBuffer the mic path uses, to get the
+      // fixed-size windows the VAD requires.
       final frameSize = frameBuffer.frameSize;
       final samplesPerFrameDuration = Duration(
         microseconds: (frameSize / sampleRate * 1000000).round(),
       );
       var offset = 0;
-      while (offset < wave.samples.length) {
+      while (offset < samples.length) {
         if (_debugStreamCancelRequested) {
           break;
         }
-        final end = (offset + frameSize).clamp(0, wave.samples.length);
-        final chunk = Float32List.sublistView(wave.samples, offset, end);
+        final end = (offset + frameSize).clamp(0, samples.length);
+        final chunk = Float32List.sublistView(samples, offset, end);
         frameBuffer.add(chunk);
         for (final frame in frameBuffer.drainFrames()) {
           _processFrame(frame);
@@ -1454,6 +1428,48 @@ class LiveTranscriber {
       _debugStreaming = false;
       await _teardownNativeState();
     }
+  }
+
+  /// Reads [wavFile] as the 16 kHz mono 16-bit PCM audio this path
+  /// requires.
+  ///
+  /// Uses this package's own pure-Dart wav parser rather than sherpa-onnx's
+  /// `readWave`. The accepted format is the same -- both handle 16-bit PCM
+  /// only -- but parsing in Dart keeps the streaming debug path free of FFI
+  /// entirely, which is what lets a test push a wav through the whole
+  /// VAD/draft/final/refine pipeline with no native library present.
+  Future<Float32List> _readDebugWavSamples(File wavFile, String wavPath) async {
+    final WavPcm16 wav;
+    try {
+      wav = parseWavPcm16(await wavFile.readAsBytes());
+    } on WavParseException catch (e) {
+      throw LiveTranscriberException(
+        'Failed to read WAV file (${e.message}): $wavPath',
+      );
+    }
+    if (wav.channels != 1) {
+      throw LiveTranscriberException(
+        'WAV has ${wav.channels} channels != required mono '
+        '(resample the test wav to 16kHz mono first): $wavPath',
+      );
+    }
+    if (wav.sampleRate != sampleRate) {
+      // Unlike runDebugWavRefineTest (which just decodes at the wav's own
+      // rate, no VAD involved), this path feeds the wav through the VAD,
+      // which is configured for a fixed 16kHz -- a mismatched wav would
+      // silently desync the VAD's speech/silence timing from real time.
+      throw LiveTranscriberException(
+        'WAV sample rate ${wav.sampleRate}Hz != required ${sampleRate}Hz '
+        '(resample the test wav to 16kHz mono first): $wavPath',
+      );
+    }
+    final samples = pcm16BytesToFloat32(wav.pcmBytes);
+    if (samples.isEmpty) {
+      throw LiveTranscriberException(
+        'Failed to read WAV file (unsupported format or empty): $wavPath',
+      );
+    }
+    return samples;
   }
 
   /// Stops an in-progress [startDebugWavStream] early, mid-file. A no-op if
