@@ -577,3 +577,26 @@ class SpeakerLabeler:
         """Cumulative {old_label: surviving_label} map from every
         merge_centroids() call so far, for a session summary."""
         return dict(self._merge_history)
+
+    def reset(self) -> None:
+        """Forget every speaker this labeler has ever seen: centroids,
+        counts, aliases, merge history, confirmation state, and the
+        open-source diagnostic log all go back to empty, as if a fresh
+        SpeakerLabeler had just been constructed. The CAM++ embedding
+        extractor (self._extractor) is NOT rebuilt -- it carries no
+        per-session state, and reloading it would pay its model-load cost
+        for nothing.
+
+        For an app embedding this module (GitHub issue #29): call this
+        when a live session restarts (new recording, unrelated speakers)
+        so S1/S2/... labels start over instead of continuing to accumulate
+        against speakers from a conversation that has already ended.
+        realtime_transcribe.reset_live_session() calls this as part of its
+        session-reset sequence.
+        """
+        self._centroids = []
+        self._counts = []
+        self._alias = {}
+        self._merge_history = {}
+        self._confirmed = []
+        self._open_log = []
