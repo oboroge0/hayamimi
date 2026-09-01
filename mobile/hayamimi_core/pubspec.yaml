@@ -24,6 +24,8 @@ dependencies:
   record: ^6.0.0
   archive: ^4.2.0
   crypto: ^3.0.7
+  unorm_dart: ^0.3.2
+  ffi: ^2.2.0
 
 dev_dependencies:
   flutter_test:
