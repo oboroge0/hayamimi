@@ -513,9 +513,11 @@ nobody said, and one per clause is enough to lift a genuinely truncated
 re-decode back over the threshold.
 
 The cost is one run of the punctuation model per utterance rather than per
-refine, on the same isolate the recognizer is on: about **25–35 ms per
-11–14 character line** on the emulator measured below, added to a final's
-`latency_ms`. `JaPunctuation(..., applyToFinals: false)` declines it —
+refine, on the same isolate the recognizer is on: about **40–50 ms per
+11–14 character line** on the emulator measured below — a direct A/B on the
+same audio with the flag on and off, not a subtraction between two timers —
+added to a final's `latency_ms`. `JaPunctuation(..., applyToFinals: false)`
+declines it —
 finals then arrive exactly as the recognizer produced them, refines are
 still punctuated, and a refine that falls back to the finals reports
 `punctuated: false`, since the text that survived is theirs.
@@ -940,7 +942,8 @@ how the models were placed and what was and wasn't exercised, in
 
 These are the **second** emulator run (two processes, ten sessions,
 `modified_beam_search`, `numThreads` 2), on the VAD and pre-roll defaults
-this package ships now:
+this package ships now, plus two rows from the **third** run (below) where
+noted:
 
 | what | conditions | ms |
 |---|---|---|
@@ -950,19 +953,34 @@ this package ships now:
 | final, decode only | a 1.762 s / 2.400 s / 2.144 s segment, n=6 each | 61.8 / 80.4 / 71.5 (medians) |
 | refine, re-decode + punctuation | those same segments, warm | 97–114 |
 | refine, re-decode + punctuation | the first refine in a fresh process | 407.9 / 412.7 |
+| final, decode + punctuation (run 3, `applyToFinals: true`, warm) | those same three segments | 109.5 / 115.4 / 117.3 (medians) |
+| final, decode + punctuation (run 3, first final in a fresh process) | the cold-start now lands on the first final, not the first refine | 402.1 / 410.8 |
 
 The first load of each model in a fresh process sits at the slow end of its
-range (cold page cache), and the first refine of a process costs ~310 ms
-more than the rest — a one-time warm-up inside the fp16 punctuation model,
-paid once per process and not once per session. The recognizer median moved
-up ~660 ms against the first run while `punct` and `vad` stayed flat, which
-reads as load noise on a shared desktop rather than a change in the code.
+range (cold page cache), and the first punctuation-model run of a process
+costs ~300-310 ms more than the rest — a one-time warm-up inside the fp16
+model, paid once per process and not once per session. Run 2 saw that cost
+on the first *refine* (407.9 / 412.7); run 3, with finals punctuated by
+default, saw it move to the first *final* instead (402.1 / 410.8) — same
+mechanism, different first caller. This package now pays it during the
+punctuation model's own load phase (`loadWorkerPunctuator`), so neither
+path should see it going forward. The recognizer median moved up ~660 ms
+against run 1 while `punct` and `vad` stayed flat, which reads as load
+noise on a shared desktop rather than a change in the code.
 
-**Punctuation was not timed directly.** A `latency_ms` covers the decode and
-the punctuation pass together, so the cost quoted for `restore()` on this
-run — roughly **25–35 ms per 11–14 character line**, warm, two intra-op
-threads — is a refine minus the final over the identical samples. That is an
-inference from the difference of two timers, not a measurement.
+**Run 3 measured the punctuation cost directly**, decoding the same audio
+with `applyToFinals` on and off instead of subtracting two timers: finals
+went from 61.7/77.6/68.8 ms to 109.5/115.4/117.3 ms, i.e. **+38 to +49 ms
+per 11–14 character line** (warm, two intra-op threads) — the run-2 figure
+just below, "25–35 ms", was an inference from a different subtraction and
+reads low against this direct measurement.
+
+Run 2's own paragraph, kept for the record: **punctuation was not timed
+directly.** A `latency_ms` covers the decode and the punctuation pass
+together, so the cost quoted for `restore()` on that run — roughly
+**25–35 ms per 11–14 character line**, warm, two intra-op threads — was a
+refine minus the final over the identical samples. That was an inference
+from the difference of two timers, not a measurement.
 
 ### Known limitation: a refine over a long group can lose its leading sentences
 

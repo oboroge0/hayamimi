@@ -240,6 +240,15 @@ into a standalone package a third-party Flutter app can embed.
   refine-only behaviour, fallback included. Not yet seen on a device: both
   emulator runs predate this.
 
+  A third emulator run confirmed the fix and found two smaller issues in it,
+  both now fixed: the fallback joined its now-punctuated finals with a
+  space after every 。 (not how Japanese is set), so the join now uses no
+  separator when the whole group is punctuated; and the punctuation
+  model's one-time ~300 ms first-`restore()` cost had moved from a
+  process's first refine onto its first final, so `loadWorkerPunctuator`
+  now pays it during the model's own load phase instead, with a throwaway
+  `restore('あ')`.
+
 * **Bench and eval utilities.** `BenchRunner` measures offline WAV→RTF for a
   single zipformer-transducer model; `ManifestEvalRunner` batch-decodes a
   manifest of labeled clips (plain or through `RoutingProfile.jaSenseVoice`

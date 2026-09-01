@@ -1409,6 +1409,226 @@ still not timed directly, and no release build and no iOS — so
 `OrtLibrary.processSymbols` on iOS remains unverified. New to this run: the
 punctuated-finals fix above.
 
+## Android emulator verification, run 3 — the punctuation fix confirmed, and two small follow-ups (2026-09-01)
+
+Run 2 ended with a fix for its third defect (the fallback refine going out
+unpunctuated) that had not itself been run on the emulator. This is that
+check, on the same AVD, the same models, and the same 6.26 s three-sentence
+Japanese fixture, plus a fourth pass that reproduces run 2's own control
+(`applyToFinals: false`) on this build. **Verdict: fixed.** On package
+defaults the closing refine over the three-sentence group is now
+`punctuated=true` and carries 。 between the sentences; run 2's behaviour
+is still reachable, exactly, via `JaPunctuation(applyToFinals: false)`. Two
+small new issues turned up alongside the fix, both addressed by this
+change — see below.
+
+Same setup as runs 1 and 2 (emulator `hayamimi_test`,
+`ro.product.cpu.abi=x86_64`, API 35, host Windows 11 26H2 / Ryzen 5 5600,
+Flutter 3.47.1 / Dart 3.13.1, ReazonSpeech ja zipformer int8 with
+`decodingMethod: 'modified_beam_search'` and `numThreads` 2, the fp16
+punctuation model, package-default VAD (0.35 / 12.0) and pre-roll (1.0),
+input through `startDebugWavStream`). Models and the padded wav were
+already on the device from run 1 (328,418 B, byte-identical); nothing was
+pushed again. ONNX Runtime reported itself as 1.27.1, C API 11, unchanged.
+
+The harness ran four passes, twice, in two fresh processes — eight sessions
+in total. **Every text, every `chars`, and every `audio_s` is identical
+between the two processes.** No `ErrorSubtitleEvent`, no `DecodeWorkerDied`,
+no crash.
+
+| tag | `applyToFinals` | `autoRefineEnabled` | explicit `refineNow` | what it shows |
+|---|---|---|---|---|
+| `r1-perseg` | true (default) | true (0.3 / 0.6) | yes | one refine per segment |
+| `r1-closing` | true (default) | false (package default) | no | the closing refine over the group — the fix |
+| `r2-perseg-nofinalpunct` | false | true (0.3 / 0.6) | yes | finals raw, refines still punctuated |
+| `r2-closing-nofinalpunct` | false | false | no | the control: reproduces run 2's `[r3-closing]` |
+
+### The fix confirmed, side by side
+
+Run 2, package defaults, the line this run existed to re-check:
+
+```
+[r3-closing] refine lang= punctuated=false audio_s=6.306 latency_ms=214.19 chars=35 text=東京の天気は晴れです あしたの会議は十時からです 資料は昨日送りました
+```
+
+Run 3, same configuration, same fixture, package defaults:
+
+```
+[r1-closing] final  lang= punctuated=true audio_s=1.762 latency_ms=100.068 chars=11 text=東京の天気は晴れです。
+[r1-closing] final  lang= punctuated=true audio_s=2.4   latency_ms=115.527 chars=14 text=あしたの会議は十時からです。
+[r1-closing] final  lang= punctuated=true audio_s=2.144 latency_ms=100.563 chars=11 text=資料は昨日送りました。
+[r1-closing] refine lang= punctuated=true audio_s=6.306 latency_ms=217.18  chars=38 text=東京の天気は晴れです。 あしたの会議は十時からです。 資料は昨日送りました。
+```
+
+`audio_s=6.306` is still `1.762 + 2.4 + 2.144` (the whole group), and
+`chars=38` is the three punctuated finals (11 + 14 + 11 characters) joined
+with one space each — this is the run before this change's join fix below,
+the shape "New defect 1" describes. The mechanism is exactly run 2's: the
+merged re-decode is still `資料は昨日送りました。` (confirmed again through
+public API alone, `[diag] merged_decode whole_file chars=10`), which strips
+to 10 characters against a fast-joined text that strips to 35, so
+`10 < 0.7 × 35` fires the guard and the text falls back to the joined
+finals — now punctuated, so `isCombinedFastTextPunctuated` reports the
+fallback honestly as `punctuated: true`.
+
+Turning only `applyToFinals` off, on the same build, reproduces run 2's
+line character for character:
+
+```
+[r2-closing-nofinalpunct] refine lang= punctuated=false audio_s=6.306 latency_ms=243.517 chars=35 text=東京の天気は晴れです あしたの会議は十時からです 資料は昨日送りました
+```
+
+`chars=35`, `punctuated=false`, same text as run 2's `[r3-closing]` — the
+flag is the whole difference, and the escape hatch its doc comment promises
+works. Per-segment refines (`r1-perseg` / `r2-perseg-nofinalpunct`) are
+unaffected either way: the group is a single segment there, so the guard
+never fires and both configurations end at the same refine text.
+
+### Timings
+
+**Android emulator x86_64, API 35, host Ryzen 5 5600 — not a phone.** Two
+processes, eight sessions, `modified_beam_search`, `numThreads` 2.
+
+`model_load` events, in ms:
+
+| model | n | median | run 2 median | run 1 median |
+|---|---:|---:|---:|---:|
+| `recognizer` | 8 | **3586.2** | 3883.7 | 3223 |
+| `punct` | 8 | **1317.6** | 1140.2 | 1072 |
+| `vad` | 8 | **37.9** | 32.9 | 33.9 |
+
+Every model's median moved within its own run-to-run spread across the
+three runs and nothing in these commits touches model building, so this
+reads as host-load noise on a shared desktop, same as run 2's recognizer
+jump.
+
+Finals (decode, plus `restore()` when `applyToFinals`), in ms:
+
+| segment `audio_s` | `applyToFinals` | n | median | vs. run 2's final median |
+|---:|---|---:|---:|---:|
+| 1.762 | false | 4 | **61.7** | 61.8 |
+| 2.400 | false | 4 | **77.6** | 80.4 |
+| 2.144 | false | 4 | **68.8** | 71.5 |
+| 1.762 | true (warm) | 2 | **109.5** | — |
+| 2.400 | true | 4 | **115.4** | — |
+| 2.144 | true | 4 | **117.3** | — |
+| 1.762 | true, **cold** (first final of the process) | 2 | **406.4** | — |
+
+`applyToFinals: false` reproduces run 2's final medians within 3 ms, as
+expected — punctuating finals has no effect on a final that stays
+unpunctuated. `applyToFinals: true` costs **+47.7 / +35.0 / +45.8 ms**: a
+final goes from ~62-80 ms to ~110-117 ms warm.
+
+Refines (re-decode + `restore()`), in ms:
+
+| `audio_s` | chars | punctuated | n | median |
+|---:|---:|---|---:|---:|
+| 1.762–2.144 (per-segment) | 11–14 | true | 4 each | 97.8–114.1 |
+| 6.306 (closing, `r1-closing`) | 38 | true (fallback) | 2 | **211.3** |
+| 6.306 (closing, `r2-closing-nofinalpunct`) | 35 | false (fallback) | 2 | **231.2** |
+
+Run 2's equivalent fallback samples were 214.2 / 245.9 ms at `chars=35` —
+consistent. No refine in this run paid a cold-start: with `applyToFinals`
+on, the first final absorbed it, and by the time the `applyToFinals: false`
+passes ran the process was already warm.
+
+**The cold-start moved from the refine path to the fast path.** Run 2 found
+the fp16 punctuation model's first `restore()` in a process costs ~300 ms
+more than every later one, and it landed on that process's first *refine*
+(407.9 / 412.7 ms there). With finals punctuated by default, this run found
+the same cost now lands on the first *final* instead (402.1 / 410.8 ms,
+against a warm 100–119 ms) — same one-time cost, moved onto the first
+caption line a user actually sees, because that is now whichever call
+happens first in a fresh process. Net work was unchanged; only where the
+latency was visible changed. See "New defect 2" (now fixed) below.
+
+### Two follow-ups, and what this change did about them
+
+**New defect 1 — the punctuated fallback kept the space that used to be the
+only separator.** `combineSegmentFastText` (`lib/live/refine_pass.dart`)
+joined every group's fast finals with `join(' ')`, mirroring the desktop
+joiner (`scripts/realtime_transcribe.py`'s `" ".join(...)`) for
+unpunctuated text. That was fine while the space was the only thing
+separating one sentence from the next in a fallback caption; now that every
+sentence already ends in 。, the space is a second, redundant separator, and
+`。 ` is not how Japanese is set — the desktop's own `[refine/ja]` reference
+line for this fixture has no spaces
+(`東京の天気は晴れです。あしたの会議は十時からです。資料は昨日送りました。`).
+Severity was cosmetic but user-visible, and the default path for any group
+of two or more ja segments on this recognizer.
+
+**Fixed in this change:** `combineSegmentFastText` now joins with `''`
+when `isCombinedFastTextPunctuated` says every contributing segment was
+punctuated, and keeps `' '` otherwise (the condition both functions already
+compute). The guard comparison is unaffected — `isRefineTextTooShort`
+compares lengths after `withoutRestoredMarks`, and dropping the redundant
+spaces only makes the fast side slightly shorter, i.e. the guard slightly
+less eager. Run 3's `[r1-closing]` line above (`chars=38`, with spaces) is
+what this branch produced *before* the join fix; after it, the same group
+now emits `東京の天気は晴れです。あしたの会議は十時からです。資料は昨日送りました。`
+with no spaces, matching the desktop reference exactly.
+
+**New defect 2 — the punctuation model's one-time warm-up moved onto the
+fast path.** Described in the cold-start paragraph above: the ~300 ms first
+`restore()` of a process, previously absorbed by the first refine, was now
+paid by the first final — the first caption line a user sees, not a 清書
+pass that arrives seconds later.
+
+**Fixed in this change:** `loadWorkerPunctuator`
+(`lib/live/decode_worker.dart`) now calls `punctuator.restore('あ')` once,
+right after `PunctuatorJa.load(...)` succeeds and before the `model_load`
+`punct`/`done` event is sent, discarding the result. The ~300 ms then lands
+inside the `model_load model=punct` number instead — already ~0.9-1.8 s and
+already understood as startup cost — rather than on the first final or
+refine. Cost: `model_load punct` reports ~300 ms higher; benefit: no
+400 ms spike on the first caption.
+
+### Doc-accuracy: the punctuation cost is higher than the earlier estimate
+
+`ja_punctuation.dart`'s `applyToFinals` doc and the README's punctuation
+section previously said "~25–35 ms per ~11–14 characters", inferred in run
+2 by subtracting two timers (warm refine median minus final median, over
+different audio paths). This run measured it directly instead — same
+audio, same code path, punctuation on vs. off:
+
+| segment | final median, `applyToFinals: false` | final median, `applyToFinals: true` (warm) | difference |
+|---:|---:|---:|---:|
+| 1.762 s (11 chars out) | 61.7 | 109.5 | **+47.8** |
+| 2.400 s (14 chars out) | 77.6 | 115.4 | **+37.7** |
+| 2.144 s (11 chars out) | 68.8 | 117.3 | **+48.5** |
+
+**≈38-49 ms per 11-14 character line**, warm, two intra-op threads, on this
+emulator — not 25-35. `ja_punctuation.dart` and the README have been
+updated to "~40-50 ms per ~11-14 characters" and now say it is a direct A/B
+measurement rather than a subtraction.
+
+### A known small waste, left alone
+
+`decode_worker.dart` punctuates a refine's merged re-decode unconditionally,
+and `live_transcriber.dart`'s shrink guard may then throw that text away
+entirely in favour of `payload.fastText`. On every group refine that hits
+the guard — the default outcome for ≥2 ja segments on this recognizer —
+one `restore()` (~40-50 ms) is spent on text nobody sees; the worker has
+`payload.fastText`/`payload.fastTextPunctuated` in hand already and could
+check `isRefineTextTooShort` before punctuating, skipping the call. **Not
+fixed here** — it costs only time, and the closing refine's measured
+latency did not get worse (211.3 ms punctuated vs. 231.2 ms unpunctuated,
+noise at n=2).
+
+### What remains unverified after run 3
+
+Unchanged from runs 1 and 2: no physical ARM device (everything here is
+emulated x86_64, and the fp16 punctuation model is the figure most likely
+to move on a real phone), `RoutingProfile.jaSenseVoice` still not
+exercised (every pass here went through the plain-session
+`punctuatePlainSession` branch, not the routed `lang == 'ja'` branch of
+`shouldPunctuate`), `restore()` still not timed directly inside the package
+(the ~38-49 ms above is a difference between two configurations, not an
+instrumented number), the real-microphone grouping was not exercised (the
+closing refine ran through `startDebugWavStream`, not a mic, though it is
+the same code path a real `defaultAutoRefineSilenceSeconds = 4.0` pause
+would take), and no release build, no iOS.
+
 ## Next steps for a mobile profile
 
 - Load + accuracy validated on an Android emulator via `sherpa_onnx.dart`
