@@ -92,6 +92,7 @@ class HayamimiRemote {
         :final latencyMs,
         :final audioSeconds,
         :final switched,
+        :final punctuated,
       ) =>
         FinalSubtitleEvent(
           text: text,
@@ -100,6 +101,7 @@ class HayamimiRemote {
           latencyMs: latencyMs,
           audioSeconds: audioSeconds,
           switched: switched,
+          punctuated: punctuated,
         ),
       RemoteTranslationEvent(:final lang, :final text) =>
         TranslationSubtitleEvent(lang: lang, text: text),

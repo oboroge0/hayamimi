@@ -69,6 +69,7 @@ class HayamimiLive {
           latencyMs: entry.latencyMs,
           audioSeconds: entry.audioSeconds,
           switched: entry.switched,
+          punctuated: entry.punctuated,
         ),
       );
     });
@@ -247,14 +248,15 @@ class HayamimiLive {
   /// -- forwarded through unchanged.
   ///
   /// [punctuation] turns on Japanese punctuation restoration: refine
-  /// ("清書") results then arrive with 、 and 。 in them instead of as an
-  /// unbroken run of characters, and their [RefineSubtitleEvent] says so
-  /// through `punctuated` (also `"punctuated"` in `toJson`, so a LAN
-  /// consumer can see it too). Nothing else changes -- [FinalSubtitleEvent]
-  /// and [PartialSubtitleEvent] carry the recognizer's text as before. The
-  /// model is loaded in the decode worker and costs 181.8 MB of memory for
-  /// the session; failing to load it fails this call. [textTransform], if
-  /// set, still runs last, on the punctuated text.
+  /// ("清書") results and finalized lines then arrive with 、 and 。 in
+  /// them instead of as an unbroken run of characters, and their
+  /// [RefineSubtitleEvent]/[FinalSubtitleEvent] say so through `punctuated`
+  /// (also `"punctuated"` in `toJson`, so a LAN consumer can see it too).
+  /// [PartialSubtitleEvent] still carries the recognizer's text as before,
+  /// and `JaPunctuation.applyToFinals: false` puts [FinalSubtitleEvent] back
+  /// that way too. The model is loaded in the decode worker and costs
+  /// 181.8 MB of memory for the session; failing to load it fails this call.
+  /// [textTransform], if set, still runs last, on the punctuated text.
   Future<void> start({
     required String modelDir,
     required String vadModelPath,
