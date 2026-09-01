@@ -3,12 +3,18 @@ import 'package:hayamimi_core/live/vad_sensitivity.dart';
 
 void main() {
   group('VadSensitivity', () {
-    test('default constructor reproduces sherpa-onnx\'s own VAD defaults', () {
+    test('the default constructor matches the desktop pipeline\'s tuned values', () {
+      // minSilenceSeconds/maxSpeechSeconds are the desktop's
+      // (scripts/realtime_transcribe.py), not sherpa-onnx's 0.5/5.0: the
+      // stock silence default merged three spoken sentences into one
+      // segment on an Android emulator and the recognizer then returned
+      // only the last of them. threshold/minSpeechSeconds are
+      // sherpa-onnx's own, which the desktop also leaves alone.
       final sensitivity = VadSensitivity();
       expect(sensitivity.threshold, 0.5);
-      expect(sensitivity.minSilenceSeconds, 0.5);
+      expect(sensitivity.minSilenceSeconds, 0.35);
       expect(sensitivity.minSpeechSeconds, 0.25);
-      expect(sensitivity.maxSpeechSeconds, 5.0);
+      expect(sensitivity.maxSpeechSeconds, 12.0);
     });
 
     test('accepts and reads back custom values', () {
