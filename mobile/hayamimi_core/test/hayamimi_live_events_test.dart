@@ -68,12 +68,14 @@ LiveTranscriptEntry _entry(
   String? lang,
   double? audioSeconds,
   bool switched = false,
+  bool punctuated = false,
 }) => LiveTranscriptEntry(
   text: text,
   timestamp: DateTime.now(),
   lang: lang,
   audioSeconds: audioSeconds,
   switched: switched,
+  punctuated: punctuated,
 );
 
 void main() {
@@ -91,7 +93,7 @@ void main() {
   });
 
   test(
-    'a final entry\'s audioSeconds/switched propagate onto FinalSubtitleEvent',
+    'a final entry\'s audioSeconds/switched/punctuated propagate onto FinalSubtitleEvent',
     () async {
       final fake = _FakeLiveTranscriber();
       final live = HayamimiLive(transcriber: fake);
@@ -101,13 +103,20 @@ void main() {
       live.events.listen(events.add);
 
       fake.emitFinal(
-        _entry('hello', lang: 'en', audioSeconds: 1.75, switched: true),
+        _entry(
+          'hello',
+          lang: 'en',
+          audioSeconds: 1.75,
+          switched: true,
+          punctuated: true,
+        ),
       );
       await Future<void>.delayed(Duration.zero);
 
       final finalEvent = events.whereType<FinalSubtitleEvent>().single;
       expect(finalEvent.audioSeconds, 1.75);
       expect(finalEvent.switched, isTrue);
+      expect(finalEvent.punctuated, isTrue);
     },
   );
 

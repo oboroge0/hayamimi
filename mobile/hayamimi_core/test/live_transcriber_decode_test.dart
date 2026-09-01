@@ -118,6 +118,200 @@ void main() {
     });
   });
 
+  group('Japanese punctuation', () {
+    late File punctModelFile;
+    late File punctVocabFile;
+
+    setUp(() {
+      // Stand-ins for the 181.8 MB model and its vocabulary: start() only
+      // checks that both files exist, and the fake worker never loads them.
+      final sep = Platform.pathSeparator;
+      punctModelFile = File('${modelDir.path}${sep}punct.onnx')
+        ..writeAsBytesSync(<int>[0]);
+      punctVocabFile = File('${modelDir.path}${sep}vocab.txt')
+        ..writeAsStringSync('[PAD]\n');
+    });
+
+    JaPunctuation punctuation({
+      String? libraryPath,
+      int numThreads = 2,
+      bool applyToFinals = true,
+    }) => JaPunctuation(
+      modelPath: punctModelFile.path,
+      vocabPath: punctVocabFile.path,
+      libraryPath: libraryPath,
+      numThreads: numThreads,
+      applyToFinals: applyToFinals,
+    );
+
+    test('reaches the worker as part of its config', () async {
+      worker.buildFailure = 'stop here';
+      final transcriber = newTranscriber();
+      addTearDown(transcriber.dispose);
+
+      await expectLater(
+        transcriber.start(
+          modelKind: ModelKind.zipformerTransducer,
+          modelDir: modelDir.path,
+          vadModelPath: vadModelFile.path,
+          punctuation: punctuation(
+            libraryPath: '/lib/onnxruntime.dll',
+            numThreads: 3,
+          ),
+        ),
+        throwsA(isA<LiveTranscriberException>()),
+      );
+
+      final config = worker.config!;
+      expect(config.punctModelPath, punctModelFile.path);
+      expect(config.punctVocabPath, punctVocabFile.path);
+      expect(config.punctLibraryPath, '/lib/onnxruntime.dll');
+      expect(config.punctNumThreads, 3);
+      // A plain session says its own language is Japanese by being given a
+      // Japanese punctuation model at all.
+      expect(config.punctuatePlainSession, isTrue);
+      expect(config.punctuateFinals, isTrue);
+      expect(config.shouldPunctuate(kind: DecodeRequestKind.refine), isTrue);
+      expect(
+        config.shouldPunctuate(kind: DecodeRequestKind.finalSegment),
+        isTrue,
+      );
+    });
+
+    test('applyToFinals: false reaches the worker as punctuateFinals', () async {
+      worker.buildFailure = 'stop here';
+      final transcriber = newTranscriber();
+      addTearDown(transcriber.dispose);
+
+      await expectLater(
+        transcriber.start(
+          modelKind: ModelKind.zipformerTransducer,
+          modelDir: modelDir.path,
+          vadModelPath: vadModelFile.path,
+          punctuation: punctuation(applyToFinals: false),
+        ),
+        throwsA(isA<LiveTranscriberException>()),
+      );
+
+      final config = worker.config!;
+      expect(config.punctuateFinals, isFalse);
+      // The refine pass is untouched by the switch: it is the fast line the
+      // caller asked to leave alone.
+      expect(config.shouldPunctuate(kind: DecodeRequestKind.refine), isTrue);
+      expect(
+        config.shouldPunctuate(kind: DecodeRequestKind.finalSegment),
+        isFalse,
+      );
+    });
+
+    test('a session started without it asks the worker for none', () async {
+      worker.buildFailure = 'stop here';
+      final transcriber = newTranscriber();
+      addTearDown(transcriber.dispose);
+
+      await expectLater(
+        transcriber.start(
+          modelKind: ModelKind.zipformerTransducer,
+          modelDir: modelDir.path,
+          vadModelPath: vadModelFile.path,
+        ),
+        throwsA(isA<LiveTranscriberException>()),
+      );
+
+      expect(worker.config!.hasPunctuation, isFalse);
+    });
+
+    test('a model that will not load fails start(), naming it', () async {
+      // No silent degradation: a missing or unreadable 182 MB file is a
+      // configuration error, and a session that came up quietly producing
+      // unpunctuated text would hide it.
+      worker.buildFailure =
+          'Could not load the Japanese punctuation model '
+          '"${punctModelFile.path}" (vocabulary "${punctVocabFile.path}"): '
+          'OrtLibraryException: Could not load "libonnxruntime.so"';
+      final transcriber = newTranscriber();
+      addTearDown(transcriber.dispose);
+
+      await expectLater(
+        transcriber.start(
+          modelKind: ModelKind.zipformerTransducer,
+          modelDir: modelDir.path,
+          vadModelPath: vadModelFile.path,
+          punctuation: punctuation(),
+        ),
+        throwsA(
+          isA<LiveTranscriberException>().having(
+            (e) => e.message,
+            'message',
+            allOf(
+              contains('Japanese punctuation model'),
+              contains(punctModelFile.path),
+            ),
+          ),
+        ),
+      );
+
+      expect(transcriber.isRunning, isFalse);
+      expect(worker.shutdownCount, 1);
+    });
+
+    test('a missing file is reported before any worker is spawned', () async {
+      final transcriber = newTranscriber();
+      addTearDown(transcriber.dispose);
+      final missing = '${modelDir.path}${Platform.pathSeparator}absent.onnx';
+
+      await expectLater(
+        transcriber.start(
+          modelKind: ModelKind.zipformerTransducer,
+          modelDir: modelDir.path,
+          vadModelPath: vadModelFile.path,
+          punctuation: JaPunctuation(
+            modelPath: missing,
+            vocabPath: punctVocabFile.path,
+          ),
+        ),
+        throwsA(
+          isA<LiveTranscriberException>().having(
+            (e) => e.message,
+            'message',
+            'Japanese punctuation model not found: $missing',
+          ),
+        ),
+      );
+
+      // Nothing was spawned and no recognizer weights were loaded for a
+      // session that could not have worked.
+      expect(worker.startCount, 0);
+    });
+
+    test('a missing vocabulary is reported the same way', () async {
+      final transcriber = newTranscriber();
+      addTearDown(transcriber.dispose);
+      final missing = '${modelDir.path}${Platform.pathSeparator}absent.txt';
+
+      await expectLater(
+        transcriber.start(
+          modelKind: ModelKind.zipformerTransducer,
+          modelDir: modelDir.path,
+          vadModelPath: vadModelFile.path,
+          punctuation: JaPunctuation(
+            modelPath: punctModelFile.path,
+            vocabPath: missing,
+          ),
+        ),
+        throwsA(
+          isA<LiveTranscriberException>().having(
+            (e) => e.message,
+            'message',
+            'Japanese punctuation vocabulary not found: $missing',
+          ),
+        ),
+      );
+
+      expect(worker.startCount, 0);
+    });
+  });
+
   group('a model that will not load', () {
     test('surfaces the worker message verbatim and stays retryable', () async {
       worker.buildFailure =

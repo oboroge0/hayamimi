@@ -4,12 +4,13 @@ import 'dart:typed_data';
 /// over several already-finalized VAD segments' audio, run together instead
 /// of one at a time, the same "re-decode with more context" trick the
 /// desktop pipeline's `Refiner` class uses (see
-/// `scripts/realtime_transcribe.py`, `GROUP_GAP_S`/`GROUP_MAX_S`). No
-/// punctuation-restoration model is added here — this is re-decode only.
+/// `scripts/realtime_transcribe.py`, `GROUP_GAP_S`/`GROUP_MAX_S`).
 ///
 /// Everything in this file is plain data/logic with no FFI or platform
 /// dependency, so it's unit tested directly. The FFI glue (actually running
-/// the recognizer over the combined audio) lives in `live_transcriber.dart`.
+/// the recognizer over the combined audio, and restoring Japanese
+/// punctuation into the result when the session asked for it) lives in
+/// `decode_worker.dart`; `live_transcriber.dart` drives both.
 
 /// Hard cap on how much audio [RefineBuffer] holds at once, in seconds.
 ///
@@ -27,11 +28,19 @@ class RefineSegment {
     required this.samples,
     required this.text,
     required this.capturedAt,
+    this.punctuated = false,
   });
 
   final Float32List samples;
   final String text;
   final DateTime capturedAt;
+
+  /// Whether [text] already had Japanese punctuation restored into it when
+  /// the final was produced (see `JaPunctuation.applyToFinals`). It matters
+  /// here because [text] is what a refine falls back to when its merged
+  /// re-decode is rejected, and the fallback can only claim to be
+  /// punctuated if the text it is made of was.
+  final bool punctuated;
 
   double durationSeconds(int sampleRate) => samples.length / sampleRate;
 }
@@ -105,15 +114,39 @@ Float32List combineSegmentSamples(List<RefineSegment> segments) {
   return combined;
 }
 
-/// Joins segments' fast (per-segment) text with single spaces, skipping any
-/// blank ones. Used both as the refine's fallback text (see
-/// [isRefineTextTooShort]) and to show what fell out of the fast path for
-/// comparison.
+/// Joins segments' fast (per-segment) text, skipping any blank ones. Used
+/// both as the refine's fallback text (see [isRefineTextTooShort]) and to
+/// show what fell out of the fast path for comparison.
+///
+/// When every contributing segment was punctuated
+/// ([isCombinedFastTextPunctuated]), the join uses `''`: each sentence
+/// already ends in a mark like 。, and a following space is not how Japanese
+/// is set (the desktop's own refine output for the same text has none).
+/// Otherwise the join falls back to a single space, mirroring the desktop
+/// joiner for unpunctuated text (`scripts/realtime_transcribe.py`'s
+/// `" ".join(...)`), which is still the only separator available when there
+/// is no punctuation to lean on.
 String combineSegmentFastText(List<RefineSegment> segments) {
+  final separator = isCombinedFastTextPunctuated(segments) ? '' : ' ';
   return segments
       .map((s) => s.text.trim())
       .where((t) => t.isNotEmpty)
-      .join(' ');
+      .join(separator);
+}
+
+/// Whether [combineSegmentFastText]'s output over [segments] is punctuated
+/// throughout — i.e. every segment that contributes a word to it was itself
+/// punctuated ([RefineSegment.punctuated]).
+///
+/// A refine that falls back to that joined text reports this as its
+/// `punctuated`. All or nothing is the honest answer for one flag over one
+/// line: a group where only some finals went through the punctuation model
+/// produces a line that is partly punctuated, which is not a line a consumer
+/// can treat as punctuated. Empty (nothing contributed any text) is `false`
+/// for the same reason.
+bool isCombinedFastTextPunctuated(List<RefineSegment> segments) {
+  final contributing = segments.where((s) => s.text.trim().isNotEmpty);
+  return contributing.isNotEmpty && contributing.every((s) => s.punctuated);
 }
 
 /// Whether a merged re-decode came back suspiciously short compared to the
@@ -122,6 +155,14 @@ String combineSegmentFastText(List<RefineSegment> segments) {
 /// than the fast finals combined, trust those" (scripts/realtime_transcribe.py).
 /// Length is compared in UTF-16 code units, which is good enough for the
 /// relative-shrink check this guards (not meant as a linguistic measure).
+///
+/// Both arguments must be equally punctuated, or the comparison is unfair:
+/// restoring 、 and 。 adds characters nobody said, and one per clause is
+/// enough to lift a genuinely truncated re-decode back over the threshold.
+/// Either side can arrive punctuated — refines always could, and finals can
+/// too (see `JaPunctuation.applyToFinals`) — so the caller strips the marks
+/// off whichever side has them before calling this; see
+/// `withoutRestoredMarks` in `punct/punct_ja_text.dart`.
 bool isRefineTextTooShort(
   String refineText,
   String fastJoinedText, {

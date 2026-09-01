@@ -2,7 +2,9 @@ import 'dart:async';
 
 import 'bench/model_kind.dart';
 import 'live/draft_pass.dart';
+import 'live/ja_punctuation.dart';
 import 'live/live_transcriber.dart';
+import 'live/preroll.dart';
 import 'live/refine_pass.dart';
 import 'live/vad_sensitivity.dart';
 import 'routing/routing_profile.dart';
@@ -29,8 +31,8 @@ import 'server/subtitle_event.dart';
 /// await live.dispose();
 /// ```
 class HayamimiLive {
-  /// If [transcriber] is omitted, the six pacing-knob parameters
-  /// ([draftIntervalSeconds] through [refineBufferMaxSeconds]) seed the
+  /// If [transcriber] is omitted, the seven pacing-knob parameters
+  /// ([draftIntervalSeconds] through [prerollSeconds]) seed the
   /// [LiveTranscriber] this facade creates for itself -- see that class's
   /// constructor for what each one does and its `default*` constant
   /// (`draft_pass.dart`/`refine_pass.dart`) for the value a caller who
@@ -46,6 +48,7 @@ class HayamimiLive {
     double autoRefineSilenceSeconds = defaultAutoRefineSilenceSeconds,
     double autoRefineMaxBufferedSeconds = defaultAutoRefineMaxBufferedSeconds,
     double refineBufferMaxSeconds = defaultRefineBufferMaxSeconds,
+    double prerollSeconds = defaultPrerollSeconds,
   }) : _transcriber =
            transcriber ??
            LiveTranscriber(
@@ -55,6 +58,7 @@ class HayamimiLive {
              autoRefineSilenceSeconds: autoRefineSilenceSeconds,
              autoRefineMaxBufferedSeconds: autoRefineMaxBufferedSeconds,
              refineBufferMaxSeconds: refineBufferMaxSeconds,
+             prerollSeconds: prerollSeconds,
            ) {
     _entriesSubscription = _transcriber.entries.listen((entry) {
       final entryLang = entry.lang ?? lang;
@@ -65,6 +69,7 @@ class HayamimiLive {
           latencyMs: entry.latencyMs,
           audioSeconds: entry.audioSeconds,
           switched: entry.switched,
+          punctuated: entry.punctuated,
         ),
       );
     });
@@ -76,6 +81,7 @@ class HayamimiLive {
           lang: entryLang,
           latencyMs: entry.latencyMs,
           audioSeconds: entry.audioSeconds,
+          punctuated: entry.punctuated,
         ),
       );
     });
@@ -122,7 +128,9 @@ class HayamimiLive {
   /// the text to actually publish.
   ///
   /// Settable at any time, including mid-session: the next entry to arrive
-  /// picks up the new transform. `null` (the default) is a no-op. This is
+  /// picks up the new transform. It runs last, after Japanese punctuation
+  /// restoration if the session has it on, so a refine's text reaches it
+  /// with 、 and 。 already in place. `null` (the default) is a no-op. This is
   /// deliberately just an insertion point -- e.g. for CJK ITN
   /// (`scripts/itn_cjk.py` on the desktop side) or a user find/replace
   /// dictionary -- and does not itself implement any postprocessing.
@@ -168,6 +176,8 @@ class HayamimiLive {
   /// transition, not one per decode; see [LiveTranscriber.decoding].
   Stream<bool> get decoding => _decodingController.stream;
 
+  /// Whether a session is currently active: `start`/`startDebugWavStream`
+  /// has completed and `stop` hasn't been called since.
   bool get isRunning => _transcriber.isRunning;
 
   /// Total audio currently buffered for the next refine pass, in seconds.
@@ -218,6 +228,15 @@ class HayamimiLive {
   set refineBufferMaxSeconds(double value) =>
       _transcriber.refineBufferMaxSeconds = value;
 
+  /// How much audio from before a speech segment's detected onset is
+  /// prepended to it before decoding, in seconds. Silero VAD notices speech
+  /// slightly late, so without this the first word of an utterance can be
+  /// clipped and transcribed wrong. See [LiveTranscriber.prerollSeconds] --
+  /// same default, same runtime-settable behavior, and `0` (unlike the
+  /// other knobs) is a valid value meaning "no pre-roll".
+  double get prerollSeconds => _transcriber.prerollSeconds;
+  set prerollSeconds(double value) => _transcriber.prerollSeconds = value;
+
   /// Starts capturing mic audio and transcribing it.
   ///
   /// [modelDir] must contain a zipformer transducer model.
@@ -227,6 +246,17 @@ class HayamimiLive {
   /// See [LiveTranscriber.start] for what [decodingMethod]/
   /// [vadSensitivity]/[hotwordsFile]/[hotwordsScore] do and their defaults
   /// -- forwarded through unchanged.
+  ///
+  /// [punctuation] turns on Japanese punctuation restoration: refine
+  /// ("清書") results and finalized lines then arrive with 、 and 。 in
+  /// them instead of as an unbroken run of characters, and their
+  /// [RefineSubtitleEvent]/[FinalSubtitleEvent] say so through `punctuated`
+  /// (also `"punctuated"` in `toJson`, so a LAN consumer can see it too).
+  /// [PartialSubtitleEvent] still carries the recognizer's text as before,
+  /// and `JaPunctuation.applyToFinals: false` puts [FinalSubtitleEvent] back
+  /// that way too. The model is loaded in the decode worker and costs
+  /// 181.8 MB of memory for the session; failing to load it fails this call.
+  /// [textTransform], if set, still runs last, on the punctuated text.
   Future<void> start({
     required String modelDir,
     required String vadModelPath,
@@ -238,6 +268,7 @@ class HayamimiLive {
     VadSensitivity? vadSensitivity,
     String? hotwordsFile,
     double hotwordsScore = 1.5,
+    JaPunctuation? punctuation,
   }) {
     return _transcriber.start(
       modelKind: modelKind,
@@ -250,6 +281,7 @@ class HayamimiLive {
       vadSensitivity: vadSensitivity,
       hotwordsFile: hotwordsFile,
       hotwordsScore: hotwordsScore,
+      punctuation: punctuation,
     );
   }
 
@@ -289,9 +321,16 @@ class HayamimiLive {
   ///
   /// Exists so this facade can be exercised end to end without a real
   /// microphone -- e.g. on an Android emulator, which has none. Awaits
-  /// until the whole file has been fed through and any in-progress segment
-  /// has been flushed and decoded. See [start] for [decodingMethod]/
-  /// [vadSensitivity]/[hotwordsFile]/[hotwordsScore].
+  /// until the whole file has been fed through, any in-progress segment has
+  /// been flushed and decoded, and one closing refine ("清書") pass over
+  /// what those finals buffered has been emitted as a [RefineSubtitleEvent]
+  /// -- so a punctuated refine is visible from a single awaited call. The
+  /// session is torn down before this future completes, so [refineNow]
+  /// afterwards has nothing left to refine; see
+  /// [LiveTranscriber.startDebugWavStream] for the full behavior, including
+  /// how [autoRefineEnabled] applies here too. See [start] for
+  /// [decodingMethod]/[vadSensitivity]/[hotwordsFile]/[hotwordsScore]/
+  /// [punctuation].
   Future<void> startDebugWavStream({
     required String modelDir,
     required String vadModelPath,
@@ -305,6 +344,7 @@ class HayamimiLive {
     VadSensitivity? vadSensitivity,
     String? hotwordsFile,
     double hotwordsScore = 1.5,
+    JaPunctuation? punctuation,
   }) {
     return _transcriber.startDebugWavStream(
       modelKind: modelKind,
@@ -319,6 +359,7 @@ class HayamimiLive {
       vadSensitivity: vadSensitivity,
       hotwordsFile: hotwordsFile,
       hotwordsScore: hotwordsScore,
+      punctuation: punctuation,
     );
   }
 
