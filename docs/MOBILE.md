@@ -1,5 +1,11 @@
 # Mobile-Sized ja Model — INT8 Quantization of ReazonSpeech Zipformer
 
+This is an investigation log (model sizing, quantization, and on-device
+measurements), not the package guide. To embed live subtitles in a Flutter
+app, or to read the model-placement/platform-status reference this log's
+measurements feed into, see
+[`mobile/hayamimi_core/README.md`](https://github.com/oboroge0/hayamimi/blob/main/mobile/hayamimi_core/README.md).
+
 First step toward a "スマホ搭載プロファイル" (phone-deployable profile): shrink
 the ja-tier model (ReazonSpeech k2 zipformer transducer, `model_type=zipformer`,
 `sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17/`) with dynamic INT8
