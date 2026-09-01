@@ -21,8 +21,9 @@ language, all running as quantized (INT8) ONNX models via
 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) -- no PyTorch, no CUDA.
 
 On real broadcast Japanese audio (see `docs/SCORECARD.md`), that routing
-gets **5.8% CER**, less than half of `whisper-large-v3-turbo`'s 13.8% on the
-same clips, while running at 10-50x realtime on a 6-core desktop CPU.
+gets **3.8% CER** (remeasured 2026-09-01 with the head-dropout fix and CJK
+number normalization in the pipeline), vs `whisper-large-v3-turbo`'s 13.8%
+on the same clips, while running at 10-50x realtime on a 6-core desktop CPU.
 A full comparison against Whisper variants, cloud STT APIs, and other local
 models -- including the languages where hayamimi loses -- is in
 `docs/COMPARISON.md`.
@@ -196,11 +197,11 @@ t2s-normalized). Full methodology in `docs/SCORECARD.md`.
 
 | Language | Clips | LID accuracy | Route | Mean error | Mean RTF |
 |---|---|---|---|---|---|
-| ja | 15 | 15/15 | ReazonSpeech | 7.5% | 0.071 |
-| en | 15 | 15/15 | Parakeet v3 | 2.3% | 0.109 |
-| zh | 12 | 12/12 | Paraformer-zh | 5.3% | 0.102 |
-| ko | 12 | 12/12 | SenseVoice | 8.1% | 0.062 |
-| yue | 12 | 12/12 | SenseVoice | 6.1% | 0.061 |
+| ja | 15 | 15/15 | ReazonSpeech | 3.8% | 0.090 |
+| en | 15 | 15/15 | Parakeet v3 | 2.3% | 0.102 |
+| zh | 12 | 12/12 | Paraformer-zh | 6.6%* | 0.084 |
+| ko | 12 | 12/12 | SenseVoice | 8.1% | 0.060 |
+| yue | 12 | 12/12 | SenseVoice | 6.1% | 0.043 |
 
 RTF (real-time factor) well under 0.2 across every route means each route
 runs 9-16x faster than realtime on CPU alone -- see `docs/GOALS.md` for the
@@ -210,8 +211,13 @@ made or rejected).
 
 Headline numbers from that log:
 
-- **Japanese CER 5.8%** (beam search) on real broadcast audio, vs. 13.8% for
-  `whisper-large-v3-turbo` on the same clips -- less than half the error rate.
+- **Japanese CER 3.8%** on real broadcast audio, vs. 13.8% for
+  `whisper-large-v3-turbo` on the same clips. The optional refine-time ja
+  second opinion (`--refine-ja-second-opinion`) measured 4.0% on a separate
+  50-minute broadcast set (hayamimi-paper harness).
+- *zh's 6.6% includes ~1.3pt of numeral-notation mismatch: the pipeline now
+  writes arabic numerals ("1000") where some references spell them in kanji
+  ("一千") -- a scoring-convention gap, not misrecognition.
 - **~100ms mean final latency** (ja, punctuated); ~236ms mean / 552ms max
   across a 5-language soak test with every feature enabled.
 - **<2GB RAM** with `--max-resident 3` (1.35GB at `--max-resident 2`).
