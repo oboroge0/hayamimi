@@ -498,3 +498,77 @@ en/ko はモデルが手元に無く経路が成立しないため、ローカ�
 VAD → プリロール → デコードの実経路に通し、各文の冒頭語（仮名表記も正: 「明日」は
 「あした」と出るのが正常で欠落ではない）が全て残ることを要求する。モデル未配置の環境では
 既存の needs_models 規約でスキップされる。
+## 2026-09-01: FLEURS test 5言語×100本 統一head-to-head (v0.3.1 リリースチャート用)
+
+これまでの `docs/SCORECARD.md`（real-speechセット、言語あたり12〜15本）や
+`docs/EVAL_REAL_ZHKO.md` / `docs/EVAL_REAL_YUE.md`（別々のセット・別々の日付で計測）を
+一本化し、**同一クリップ・同一採点・同一CPU**で hayamimi 本番経路 と
+faster-whisper large-v3-turbo を5言語×100本、直接比較した。
+
+### データ
+
+- [google/fleurs](https://huggingface.co/datasets/google/fleurs) **test** split。
+  `datasets-server` の `/rows` API は本データセットで HTTP 500 を返すため、
+  HF の parquet 自動変換ルート
+  (`https://huggingface.co/api/datasets/google/fleurs/parquet/<config>/test/0.parquet`)
+  を `fsspec` + `pyarrow` で直接読む方式に切り替えた
+  (`scripts/make_fleursset.py`)。5言語とも1シャード (`0.parquet`, 382〜945行) に収まった。
+- 設定: `ja_jp` / `en_us` / `cmn_hans_cn` / `ko_kr` / `yue_hant_hk`。
+- 選定規則: 各言語のparquetテーブルを **FLEURS `id` フィールドで安定ソート**し
+  （同一idが複数recording/speakerに紐づき数件重複するが、同順位はparquet内の元の行順で解決）、
+  先頭から空文字起こし・デコード失敗・非16kHzをスキップしつつ **先頭100本**を採用。
+  埋め込み音声はすでに16kHzモノラルのため再サンプリングなし。
+  除外クリップ: **0件**（5言語とも100/100本を初回取得で確保、デコード失敗なし）。
+- 出力: `testdata/fleurs_bench/<lang>/manifest.json` + `<lang>_NNN.wav`（gitではtestdata配下は非追跡）。
+
+### 採点条件
+
+- `scripts/eval_fleurs_bench.py`。en=WER（jiwer）、他=CER（Levenshtein、NFKC正規化＋
+  句読点/空白除去、`scripts/eval_accuracy.py` の `wer_en`/`cer_ja` をそのまま再利用）。
+  yueはopencc t2s正規化後に比較（既存スコアカードと同じ規約）。
+- **hayamimi**: `asr_engine.RoutedASR(threads=6, preload=False)`、`scripts/eval_engine.py` と
+  同じ本番経路（whisper-tiny LID自動判定 → tier振り分け → デコード → ja句読点）。
+  second-opinion は既定値のOFF（`ja_second_opinion=False`）。言語ブロックごとに
+  `reset_session()` を1回呼び、sticky-LIDのヒステリシスが前言語の残響を持ち込まないようにした
+  （`eval_engine.py` と同一の慣習）。
+- **turbo**: `faster-whisper` `large-v3-turbo`、`device=cpu`、`compute_type=int8`、
+  `beam_size=1`、**`language=<正解言語>` を明示指定**（hayamimiは自動判定なので、turbo側に
+  やや有利な非対称条件 — `docs/COMPARISON.md` に記載済みの規約と同じ）。
+- CPU: Ryzen 5 5600 (6C12T, 6スレッド指定) / Windows 11。sherpa-onnx 1.13.6、
+  faster-whisper 1.2.1。ITN（数字正規化）はSenseVoiceの`use_itn=True`が効く経路で有効。
+
+### 結果
+
+| lang | n | hayamimi err | hayamimi RTF | turbo err | turbo RTF |
+|---|---|---|---|---|---|
+| ja | 100 | 0.0649 | 0.0396 | 0.0490 | 0.6440 |
+| en | 100 | 0.1004 | 0.0732 | 0.0561 | 0.8305 |
+| zh | 100 | 0.0744 | 0.0570 | 0.0777 | 0.7175 |
+| ko | 100 | 0.0757 | 0.0371 | 0.0346 | 0.6685 |
+| yue | 100 | 0.1286 | 0.0374 | 0.1227 | 0.7611 |
+
+（err: en=WER、他=CER。yueはt2s正規化後。RTF = 処理時間 / 音声長、小さいほど速い。）
+
+- **速度**: hayamimiがturboの約12〜21倍速い（RTF比較: ja 16x, en 11x, zh 13x, ko 18x, yue 20x）。
+  turboはこのCPUでリアルタイム未達（RTF > 0.6）、hayamimiは全言語RTF < 0.08で大幅にリアルタイム内。
+- **精度**: zh(0.0744 vs 0.0777)のみhayamimiがturboよりわずかに良く、他4言語（ja/en/ko/yue）は
+  turboがhayamimiを上回る——ただし上記の言語指定の非対称（turboに正解言語を渡している）を
+  差し引く必要がある。差は ja +0.0159, en +0.0443, ko +0.0411, yue +0.0059 (turbo優位)、
+  zh -0.0033 (hayamimi優位、全て絶対値)。
+- **LID**: hayamimiの自動言語判定は500クリップ中498で正解言語のtierに一致。誤判定は
+  yueで2件（`yue_090.wav`→vi判定、`yue_095.wav`→th判定）。それ以外の4言語(400クリップ)は
+  誤判定0件。
+- **除外クリップ**: なし（両エンジンとも5言語×100本、計500クリップを完走）。
+
+### 制約
+
+- **turboに正解言語を渡す非対称条件**（`docs/COMPARISON.md`と同じ規約）。hayamimiは
+  LIDも含めた完全自動判定でこの数字を出している一方、turboはlanguage引数で正解を
+  与えられているため、turbo側の精度はやや有利な条件での測定値。
+- **second-opinion OFF**。本番のオプション機能（ja再デコードの合意ゲート）は既定値のまま
+  無効にして測定した。有効化した場合のja精度は本表に含まれない。
+- **FLEURSはread-aloudの単一話者クリップ**であり、雑音・オーバーラップ・自然発話ではない。
+  実運用条件（マイク入力・雑音・話者交代）ではここでの差がそのまま出るとは限らない。
+- **結果JSONは非追跡**（`testdata/fleurs_bench/results_{hayamimi,turbo}.json`）。再現する場合は
+  `scripts/make_fleursset.py --lang all` → `scripts/eval_fleurs_bench.py --engine ... --lang ...`
+  を参照。
