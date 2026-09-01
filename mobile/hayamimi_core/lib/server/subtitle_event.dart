@@ -38,6 +38,7 @@ class FinalSubtitleEvent extends SubtitleEvent {
     this.latencyMs,
     this.audioSeconds,
     this.switched = false,
+    this.punctuated = false,
   });
 
   final String text;
@@ -64,6 +65,13 @@ class FinalSubtitleEvent extends SubtitleEvent {
   /// Always `false` for a single-model session.
   final bool switched;
 
+  /// Whether [text] had Japanese punctuation (、 。 ？) restored into it —
+  /// see `LiveTranscriptEntry.punctuated`. `false` from any producer that
+  /// does not punctuate its fast line, which includes every remote (desktop)
+  /// session, any on-device session started without a `JaPunctuation`
+  /// model, and one whose `JaPunctuation` set `applyToFinals: false`.
+  final bool punctuated;
+
   @override
   Map<String, dynamic> toJson() => {
     'type': 'final',
@@ -73,6 +81,7 @@ class FinalSubtitleEvent extends SubtitleEvent {
     'latency_ms': latencyMs,
     'audio_s': audioSeconds,
     'switched': switched,
+    'punctuated': punctuated,
   };
 }
 

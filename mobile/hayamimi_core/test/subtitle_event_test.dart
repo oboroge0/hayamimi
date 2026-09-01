@@ -25,10 +25,11 @@ void main() {
         'latency_ms': null,
         'audio_s': null,
         'switched': false,
+        'punctuated': false,
       });
     });
 
-    test('toJson carries lang/speaker/latency/audio_s/switched through', () {
+    test('toJson carries lang/speaker/latency/audio_s/switched/punctuated through', () {
       const event = FinalSubtitleEvent(
         text: 'hello',
         lang: 'ja',
@@ -36,6 +37,7 @@ void main() {
         latencyMs: 123.5,
         audioSeconds: 2.5,
         switched: true,
+        punctuated: true,
       );
       expect(event.toJson(), {
         'type': 'final',
@@ -45,6 +47,7 @@ void main() {
         'latency_ms': 123.5,
         'audio_s': 2.5,
         'switched': true,
+        'punctuated': true,
       });
     });
 
