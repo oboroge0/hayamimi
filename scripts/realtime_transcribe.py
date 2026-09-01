@@ -101,7 +101,17 @@ def wav_chunks(samples: np.ndarray, sample_rate: int, realtime: bool):
         pos += WINDOW_SIZE
 
 
-def mic_chunks():
+MIC_QUEUE_TIMEOUT_S = 0.1  # how often the generator wakes up to check stop_event
+
+
+def mic_chunks(stop_event: "threading.Event | None" = None):
+    """Yield mic input frames until `stop_event` is set.
+
+    `q.get()` alone blocks forever with no chunk to hand back control to the
+    caller, so an embedding app has no way to break out short of
+    KeyboardInterrupt. Polling with a bounded timeout lets the generator
+    notice stop_event between callbacks instead.
+    """
     import sounddevice as sd
 
     q: "queue.Queue[np.ndarray]" = queue.Queue()
@@ -111,8 +121,11 @@ def mic_chunks():
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                          blocksize=WINDOW_SIZE, callback=callback):
-        while True:
-            yield q.get()
+        while stop_event is None or not stop_event.is_set():
+            try:
+                yield q.get(timeout=MIC_QUEUE_TIMEOUT_S)
+            except queue.Empty:
+                continue
 
 
 def ws_chunks(ingest):
@@ -931,13 +944,26 @@ def run_stream(chunks, vad, sample_rate: int, asr: RoutedASR, stats: SessionStat
                printer: PartialPrinter, refiner: "Refiner | None" = None,
                history: AudioHistory | None = None,
                translator_worker: "TranslationWorker | None" = None,
-               speaker_labeler=None):
+               speaker_labeler=None, stop_event: "threading.Event | None" = None):
+    """Drive the VAD -> ASR pipeline over `chunks` until it's exhausted or
+    `stop_event` is set.
+
+    `stop_event` is the cancellation hook for an app embedding this module:
+    the CLI itself still relies on KeyboardInterrupt (unchanged), but a
+    caller running this in a background thread has no SIGINT to send, so it
+    needs a way to ask the loop to stop that doesn't depend on the chunk
+    source unblocking on its own. Checked once per chunk here; mic_chunks()
+    additionally polls it directly since a plain `q.get()` would otherwise
+    block indefinitely with nothing to yield.
+    """
     audio_pos = 0.0
     last_partial = 0.0
     early_lang = None  # LID result computed mid-utterance so finals skip it
     if history is None:
         history = AudioHistory(sample_rate)
     for chunk in chunks:
+        if stop_event is not None and stop_event.is_set():
+            break
         if not isinstance(chunk, np.ndarray):
             # non-ndarray = a "flush now" signal (ws_ingest.FLUSH on client
             # disconnect): finalize whatever the VAD has in progress instead
@@ -1244,6 +1270,14 @@ def main():
             refiner.run_global_recluster()
 
     input_mode = args.input or ("wav" if args.wav else "mic")
+    # The CLI itself still relies on KeyboardInterrupt (unchanged behavior);
+    # stop_event exists for an app embedding this module in a thread it
+    # doesn't control via SIGINT -- it can call stop_event.set() from
+    # anywhere to unwind run_stream cleanly. Set here too, in the except
+    # handler, purely so the two cancellation paths converge on the same
+    # state (run_stream has usually already unwound via the exception by
+    # the time this runs).
+    stop_event = threading.Event()
 
     try:
         if server is not None:
@@ -1254,7 +1288,7 @@ def main():
             samples, sr = read_wave(args.wav)  # resampled to SAMPLE_RATE if needed
             run_stream(wav_chunks(samples, sr, realtime=not args.no_realtime),
                        vad, sr, asr, stats, printer, refiner, history, translator_worker,
-                       speaker_labeler)
+                       speaker_labeler, stop_event=stop_event)
             finish(sr)
         elif input_mode == "ws":
             from ws_ingest import INGEST_PATH, IngestServer
@@ -1264,11 +1298,13 @@ def main():
             print(f"ws ingest: ws://{args.ws_host}:{args.ws_port}{INGEST_PATH}  "
                   f"(JSON handshake, then binary pcm_s16le frames)", file=sys.stderr)
             run_stream(ws_chunks(ingest), vad, SAMPLE_RATE, asr, stats, printer, refiner,
-                       history, translator_worker, speaker_labeler)
+                       history, translator_worker, speaker_labeler, stop_event=stop_event)
         else:
-            run_stream(mic_chunks(), vad, SAMPLE_RATE, asr, stats, printer, refiner, history,
-                       translator_worker, speaker_labeler)
+            run_stream(mic_chunks(stop_event=stop_event), vad, SAMPLE_RATE, asr, stats, printer,
+                       refiner, history, translator_worker, speaker_labeler,
+                       stop_event=stop_event)
     except KeyboardInterrupt:
+        stop_event.set()
         finish(SAMPLE_RATE)
     finally:
         print(f"\n=== session summary: {stats.summary()} ===")
