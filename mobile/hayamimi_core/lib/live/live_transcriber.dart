@@ -140,6 +140,13 @@ class LiveTranscriber {
   // called from _processFrame) so the swap happens as soon as it's safe
   // without polling on a timer.
   sherpa_onnx.VoiceActivityDetector? _pendingVadInstall;
+  // Bumped by _buildNativeState and _teardownNativeState -- lets a
+  // long-running background rebuild (setVadSensitivity's VAD rebuild) tell,
+  // once its await resolves, whether the native state it was building
+  // against is still the current one or whether the session was torn down
+  // (and possibly rebuilt from scratch by a fresh start()) in the meantime.
+  // See isVadBuildStale in vad_sensitivity.dart for the comparison itself.
+  int _sessionGeneration = 0;
 
   // --- Draft ("発話中の暫定字幕"): while a VAD segment is still in progress,
   // periodically re-decode what's been captured of it so far and emit a
@@ -378,18 +385,34 @@ class LiveTranscriber {
         );
       }
 
-      await _buildNativeState(
-        modelKind: modelKind,
-        modelDir: modelDir,
-        vadModelPath: vadModelPath,
-        routingProfile: routingProfile,
-        senseVoiceModelDir: senseVoiceModelDir,
-        lidModelDir: lidModelDir,
-        decodingMethod: decodingMethod,
-        vadSensitivity: vadSensitivity ?? _vadSensitivity,
-        hotwordsFile: hotwordsFile,
-        hotwordsScore: hotwordsScore,
-      );
+      try {
+        await _buildNativeState(
+          modelKind: modelKind,
+          modelDir: modelDir,
+          vadModelPath: vadModelPath,
+          routingProfile: routingProfile,
+          senseVoiceModelDir: senseVoiceModelDir,
+          lidModelDir: lidModelDir,
+          decodingMethod: decodingMethod,
+          vadSensitivity: vadSensitivity ?? _vadSensitivity,
+          hotwordsFile: hotwordsFile,
+          hotwordsScore: hotwordsScore,
+        );
+      } catch (_) {
+        // _buildNativeState can throw after already building the
+        // recognizer/routed set (e.g. a good recognizer load followed by a
+        // truncated VAD model file) -- at this point isRunning is still
+        // false (no mic subscription yet), so without this, stop()/dispose()
+        // would treat the session as never having started and leak whatever
+        // was built.
+        await _teardownNativeState();
+        rethrow;
+      }
+      // A setVadSensitivity() call that arrived while _buildNativeState was
+      // still loading (isRunning/_debugStreaming were both false, so it
+      // couldn't rebuild against anything yet) queued its target instead --
+      // apply it now that native state, including _vadModelPath, is up.
+      _applyPendingVadSensitivityIfAny();
 
       try {
         final micStream = await _recorder.startStream(
@@ -477,6 +500,13 @@ class LiveTranscriber {
     String? hotwordsFile,
     double hotwordsScore = 1.5,
   }) async {
+    // A new generation starts the moment this build begins, not once it
+    // succeeds: any setVadSensitivity rebuild already in flight for the
+    // PREVIOUS generation must be treated as stale from this point on, even
+    // if this build itself goes on to fail (see start()'s/
+    // _runDebugWavStream's catch, which tears down -- and bumps the
+    // generation again -- on failure).
+    _sessionGeneration++;
     if (!modelKind.isImplemented) {
       throw LiveTranscriberException(
         '${modelKind.label} is not implemented yet. Only Zipformer '
@@ -984,13 +1014,20 @@ class LiveTranscriber {
   }
 
   Future<void> _teardownNativeState() async {
+    // Bumped here too (not just in _buildNativeState): a setVadSensitivity
+    // rebuild that's still in flight when this teardown happens must be
+    // treated as stale even if no new start() ever follows -- see
+    // isVadBuildStale and _rebuildVadUntilCaughtUp's use of it.
+    _sessionGeneration++;
     _vad?.free();
     _vad = null;
     // A rebuild that finished (or is still in flight) around the same time
     // as this teardown has nothing left to install into -- free it rather
-    // than leaking the native handle. setVadSensitivity's own in-flight
-    // loop checks _vadModelPath (cleared below) and isRunning/_debugStreaming
-    // before trying to install anything further.
+    // than leaking the native handle. A rebuild still in flight notices via
+    // the generation bump just above (isVadBuildStale) and won't try to
+    // install its result at all; this here covers a rebuild that had
+    // already finished and was sitting in _pendingVadInstall waiting for a
+    // safe swap point.
     _pendingVadInstall?.free();
     _pendingVadInstall = null;
     _vadModelPath = null;
@@ -1027,17 +1064,33 @@ class LiveTranscriber {
   /// [_maybeSwapPendingVad], called once per processed frame, is what
   /// actually performs the swap once that moment arrives.
   ///
-  /// If no session is running (and no debug wav stream is), [sensitivity]
-  /// is just remembered for the next [start]/[startDebugWavStream] -- there
-  /// is nothing native to rebuild against yet.
+  /// If no session is running or loading (and no debug wav stream is),
+  /// [sensitivity] is just remembered for the next [start]/
+  /// [startDebugWavStream] -- there is nothing native to rebuild against
+  /// yet. If [start]/[startDebugWavStream] is *currently* loading (between
+  /// the call and [isRunning]/[isDebugStreaming] actually flipping true),
+  /// [sensitivity] is queued the same way and applied the moment that
+  /// load's own [_buildNativeState] finishes -- calling this mid-load used
+  /// to silently lose the request, since [_buildNativeState] overwrites
+  /// [_vadSensitivity] with whatever it was given once it completes.
   ///
   /// Calling this again before an earlier call has finished replaces the
   /// pending target rather than queueing both: only the most recently
   /// requested [sensitivity] ever gets installed, and a build already in
   /// flight for a now-superseded target is discarded (freed) once it
-  /// completes instead of being installed.
+  /// completes instead of being installed. The same discard-instead-of-
+  /// install applies if the session is stopped (and possibly restarted)
+  /// while a rebuild's own model load is in flight -- see
+  /// [isVadBuildStale].
   Future<void> setVadSensitivity(VadSensitivity sensitivity) async {
     _pendingVadSensitivity = sensitivity;
+    if (_starting) {
+      // start()/startDebugWavStream() is currently loading: its own
+      // _buildNativeState call hasn't set _vadModelPath yet, so there is
+      // nothing to rebuild against. Once it finishes, it calls
+      // _applyPendingVadSensitivityIfAny, which picks this target up.
+      return;
+    }
     if (!isRunning && !_debugStreaming) {
       _vadSensitivity = sensitivity;
       _pendingVadSensitivity = null;
@@ -1050,6 +1103,20 @@ class LiveTranscriber {
       return;
     }
     await _rebuildVadUntilCaughtUp();
+  }
+
+  /// Called right after a successful [_buildNativeState], from both [start]
+  /// and [_runDebugWavStream]: if a [setVadSensitivity] call arrived while
+  /// this load was still in progress (queued into [_pendingVadSensitivity]
+  /// because [_starting] was true), kick off the rebuild for it now that
+  /// native state -- including [_vadModelPath] -- actually exists. Runs in
+  /// the background rather than being awaited: a rebuild here is a
+  /// follow-up request from the caller, not part of loading itself, so
+  /// [start]/[startDebugWavStream] shouldn't block their own return on it.
+  void _applyPendingVadSensitivityIfAny() {
+    if (_pendingVadSensitivity != null && !_vadRebuildInFlight) {
+      unawaited(_rebuildVadUntilCaughtUp());
+    }
   }
 
   Future<void> _rebuildVadUntilCaughtUp() async {
@@ -1067,6 +1134,13 @@ class LiveTranscriber {
           continue;
         }
 
+        // Captured *before* the await below: this is the native-state
+        // "epoch" this rebuild is being built for. Compared against
+        // _sessionGeneration once the build resolves (see isVadBuildStale)
+        // to detect a stop()+start() (or any other teardown/rebuild) that
+        // happened while buildVadOffIsolate was in flight.
+        final buildGeneration = _sessionGeneration;
+
         _emitModelLoad(model: 'vad', phase: 'start');
         final stopwatch = Stopwatch()..start();
         final built = await buildVadOffIsolate(
@@ -1080,14 +1154,17 @@ class LiveTranscriber {
           ms: stopwatch.elapsedMicroseconds / 1000,
         );
 
-        if (_pendingVadSensitivity != null || (!isRunning && !_debugStreaming)) {
+        final stale = isVadBuildStale(
+          buildGeneration: buildGeneration,
+          currentGeneration: _sessionGeneration,
+        );
+        if (_pendingVadSensitivity != null || stale) {
           // Superseded by a newer call while this was building, or the
-          // session ended in the meantime -- this build is stale, free it
-          // instead of installing it.
+          // native state it was built against has moved on (torn down,
+          // and/or rebuilt by a fresh start() -- see isVadBuildStale) --
+          // either way this build doesn't belong to the current session,
+          // so free it instead of installing it.
           built.free();
-          if (!isRunning && !_debugStreaming) {
-            _vadSensitivity = target;
-          }
           continue;
         }
 
@@ -1224,18 +1301,28 @@ class LiveTranscriber {
       throw LiveTranscriberException('WAV file not found: $wavPath');
     }
 
-    await _buildNativeState(
-      modelKind: modelKind,
-      modelDir: modelDir,
-      vadModelPath: vadModelPath,
-      routingProfile: routingProfile,
-      senseVoiceModelDir: senseVoiceModelDir,
-      lidModelDir: lidModelDir,
-      decodingMethod: decodingMethod,
-      vadSensitivity: vadSensitivity,
-      hotwordsFile: hotwordsFile,
-      hotwordsScore: hotwordsScore,
-    );
+    try {
+      await _buildNativeState(
+        modelKind: modelKind,
+        modelDir: modelDir,
+        vadModelPath: vadModelPath,
+        routingProfile: routingProfile,
+        senseVoiceModelDir: senseVoiceModelDir,
+        lidModelDir: lidModelDir,
+        decodingMethod: decodingMethod,
+        vadSensitivity: vadSensitivity,
+        hotwordsFile: hotwordsFile,
+        hotwordsScore: hotwordsScore,
+      );
+    } catch (_) {
+      // See start()'s identical catch: _buildNativeState can throw after
+      // already building the recognizer/routed set, and _debugStreaming is
+      // still false here, so without this the partially-built native state
+      // would leak.
+      await _teardownNativeState();
+      rethrow;
+    }
+    _applyPendingVadSensitivityIfAny();
     _resetSessionState();
 
     final frameBuffer = _frameBuffer;

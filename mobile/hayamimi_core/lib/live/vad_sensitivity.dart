@@ -88,3 +88,30 @@ class VadSensitivity {
 bool shouldSwapVadNow({required bool speechActive, required bool busy}) {
   return !speechActive && !busy;
 }
+
+/// Whether a VAD rebuild that started against [buildGeneration] should be
+/// discarded (freed, never installed) instead of swapped in, because the
+/// owning session's native state has since moved on to
+/// [currentGeneration] -- torn down, or torn down and rebuilt by a fresh
+/// `start()`, while the rebuild's own `buildVadOffIsolate` await was still
+/// in flight.
+///
+/// Why this matters: `setVadSensitivity`'s rebuild is a genuinely
+/// long-running async call (a real off-isolate model load), so a `stop()`
+/// followed immediately by a new `start()` can easily complete *during*
+/// that await. Without this check, the stale rebuild -- built against the
+/// OLD session's model path/sensitivity -- would land after the new
+/// session is already up, silently replacing (and freeing) the new
+/// session's own freshly built VAD with one that doesn't belong to it.
+///
+/// `LiveTranscriber` bumps a monotonically increasing generation counter
+/// every time it builds or tears down native state, captures the current
+/// value right before starting a rebuild, and compares it here once the
+/// rebuild's await resolves. Pure equality check, so it's unit-testable
+/// without the native VAD itself, same as [shouldSwapVadNow].
+bool isVadBuildStale({
+  required int buildGeneration,
+  required int currentGeneration,
+}) {
+  return buildGeneration != currentGeneration;
+}
