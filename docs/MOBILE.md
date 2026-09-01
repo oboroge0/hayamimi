@@ -1222,6 +1222,193 @@ suspicious result in half and retry each half (`_looks_truncated` /
   OrtLibrary.processSymbols` on iOS remains unverified, and the punctuator
   still refuses to load there by default.
 
+## Android emulator verification, run 2 — the segmentation fixes, and a third defect (2026-09-01)
+
+The run above ended with two changes to `hayamimi_core`'s defaults (VAD
+silence, and pre-roll) and no evidence that they worked, because they were
+written after the measurement. This is the re-run that checks them, on the
+same AVD, the same models, and the same 6.26 s three-sentence Japanese
+fixture. **Both defects are fixed.** A third, which the fixes made visible,
+is not — it is described at the end, along with the change this branch makes
+for it.
+
+Same setup as run 1 in every respect (emulator `hayamimi_test`,
+`ro.product.cpu.abi=x86_64`, API 35, host Windows 11 / Ryzen 5 5600, Flutter
+3.47.1 / Dart 3.13.1, ReazonSpeech ja zipformer int8 with
+`decodingMethod: 'modified_beam_search'` and `numThreads` 2, the fp16
+punctuation model, `RoutingProfile.jaOnly`, input through
+`startDebugWavStream`). Nothing was pushed to the device again: the model
+files were already there from run 1, and the padded wav on the device is
+byte-identical (328,418 B) to the one run 1 made. ONNX Runtime reported
+itself as 1.27.1, C API 11, unchanged.
+
+Five passes were run, twice, in two fresh processes — ten sessions in total.
+**Every text and every `audio_s` is identical between the two processes.** No
+`ErrorSubtitleEvent`, no `DecodeWorkerDied`, no crash.
+
+| pass | `prerollSeconds` | `vadSensitivity` | what it is for |
+|---|---|---|---|
+| `r1-defaults` | 1.0 (default) | package default (0.35 / 12.0) | the shipped configuration |
+| `r2-preroll0` | **0** | package default | control: turn pre-roll off only |
+| `r3-closing` | 1.0 | package default | package defaults with no `refineNow()` driver at all |
+| `r1-defaults-2` | 1.0 | package default | repeat of the first, for stability |
+| `old-defaults` | **0** | **0.5 / 5.0** | control: reproduce run 1 on this build |
+
+### The two defects from run 1: fixed
+
+Run 1's output, run 2's output, and the desktop reference, on the same file:
+
+| sentence | desktop reference | run 1 (0.5 s silence, no pre-roll) | run 2 `r1-defaults` |
+|---|---|---|---|
+| 1 | 東京の天気は晴れです。 | 東京の天気は晴れです。 | 東京の天気は晴れです。 |
+| 2 | あしたの会議は十時からです。 | 会議は十時からです。 (`あしたの` lost) | **あしたの会議は十時からです。** |
+| 3 | 資料は昨日送りました。 | 昨日は昨日送りました。 (`資料`→`昨日`) | **資料は昨日送りました。** |
+| segment lengths | 1.8 / 2.4 / 2.1 s | 1.564 / 2.044 / 1.724 s | **1.762 / 2.400 / 2.144 s** |
+
+All three sentences now match the desktop character for character, and the
+segment durations land within 40 ms of the desktop's.
+
+Each fix has its own control, so neither is credited with the other's effect.
+`old-defaults` puts run 1's VAD values back on this build and reproduces run
+1's single merged segment exactly — one 6.134 s segment reading
+`資料は昨日送りました`, the last sentence alone. `r2-preroll0` turns off only
+`prerollSeconds`, on the fixed VAD defaults, and reproduces run 1's texts and
+run 1's `audio_s` values exactly (1.564 / 2.044 / 1.724 s,
+`東京の天気は晴れです。` / `会議は十時からです。` / `昨日は昨日送りました。`).
+
+The pre-roll actually prepended was 0.198 / 0.356 / 0.420 s, not the full
+1.0 s, because `PrerollHistory.withPreroll` clamps at the previous segment's
+end so a segment never reaches back into the one before it. That is the
+documented behaviour, measured.
+
+### The closing refine fires
+
+`r3-closing` runs on the package's true defaults — `autoRefineEnabled` false,
+which is its own default, and no `refineNow()` call anywhere. A refine still
+arrives over all three finals before the awaited future completes, at
+`audio_s=6.306`, which is exactly `1.762 + 2.400 + 2.144`: the whole group.
+Run 1's equivalent measurement was a `refineNow()` after the await that found
+`refineBufferedSeconds=0.0` and did nothing, so the closing-refine change
+does what it was written to do.
+
+### Timings
+
+**Android emulator x86_64, API 35, host Ryzen 5 5600 — not a phone.** The
+AVD's CPU is the desktop's under virtualization. The float16 punctuation
+numbers are the least transferable of all, for the reason run 1 gives: ONNX
+Runtime's CPU provider has no float16 compute path on x86 and casts to
+float32 and back on every operator, which an ARM chip with a float16 vector
+unit does not do. Two processes, ten sessions.
+
+`model_load` events, in ms:
+
+| model | conditions | n | min | max | median | run 1 median |
+|---|---|---:|---:|---:|---:|---:|
+| `recognizer` | ja zipformer int8 (encoder 70.9 MB + decoder + joiner), 2 threads, `modified_beam_search` | 10 | 3390.3 | 4563.3 | **3883.7** | 3223 |
+| `punct` | `punct_bert.fp16.onnx` 181.8 MB, 2 intra-op threads | 10 | 927.4 | 1994.9 | **1140.2** | 1072 |
+| `vad` | `silero_vad.onnx` 0.64 MB | 10 | 21.5 | 41.8 | **32.9** | 33.9 |
+
+The recognizer median moved up ~660 ms against run 1. None of the three
+commits under test touches model building, and the `punct`/`vad` medians are
+flat, so read it as host load on a shared desktop rather than a regression.
+The first load of each model in a fresh process is at the slow end of its
+range.
+
+Finals (decode only, inside the worker), in ms:
+
+| segment `audio_s` | sentence | n | min | median | max |
+|---:|---|---:|---:|---:|---:|
+| 1.762 | 東京の天気は晴れです | 6 | 59.3 | **61.8** | 69.0 |
+| 2.400 | あしたの会議は十時からです | 6 | 74.3 | **80.4** | 91.4 |
+| 2.144 | 資料は昨日送りました | 6 | 66.1 | **71.5** | 85.6 |
+
+Real-time factor ≈ 0.033x, unchanged from run 1. Pre-roll costs 0–9 ms per
+final for 0.2–0.42 s of extra audio, which is inside the noise.
+
+Refines over those same segments, punctuated (re-decode plus `restore()`,
+reported as one number), in ms: **97–114 warm**, and **407.9 / 412.7** for
+the first refine in each of the two processes. That first-refine cost is a
+one-time warm-up inside the fp16 punctuation model, not a per-session one —
+each process ran five sessions and only the first refine paid it.
+
+**`restore()` is still not timed directly.** `latencyMs` covers the
+re-decode and the punctuation together, so subtracting the median final over
+the same audio is the only number available:
+
+| `audio_s` | refine (warm median) | final (median) | difference | output chars |
+|---:|---:|---:|---:|---:|
+| 1.762 | 97.2 | 61.8 | **35.4** | 11 |
+| 2.400 | 114.4 | 80.4 | **34.0** | 14 |
+| 2.144 | 96.6 | 71.5 | **25.1** | 11 |
+
+So roughly **25–35 ms per 11–14 character line**, warm, two intra-op threads
+— consistent with run 1's 26–33 ms per ~10 characters. It remains an
+inference from the difference of two timers.
+
+### The third defect: the fallback refine was unpunctuated
+
+On package defaults, `r3-closing`'s refine came back **unpunctuated**,
+reproduced identically in both processes:
+
+```
+[r3-closing] refine lang= punctuated=false audio_s=6.306 latency_ms=214.19 chars=35 text=東京の天気は晴れです あしたの会議は十時からです 資料は昨日送りました
+```
+
+Three sentences the fast path had recognized correctly, joined with spaces
+and no 。 anywhere.
+
+The mechanism, measured. A refine re-decodes the group's audio as one
+buffer, and this ja transducer keeps only the last utterance of
+multi-utterance audio — run 1 established that on the desktop, and this run
+re-established it on the device through public API alone
+(`LiveTranscriber.runDebugWavRefineTest`: the whole file returns
+`資料は昨日送りました`, 10 characters). So the merged re-decode came back at 10
+characters against a `fastText` of 35, and `10 < 0.7 × 35` fired
+`isRefineTextTooShort`, which replaced the text with the fast finals joined.
+That guard is doing its job — it stopped a caption that would have lost two
+of three sentences. The defect is that nothing had punctuated those finals,
+so the refine went out raw.
+
+It is not confined to the debug path. Punctuation ran in the decode worker,
+before the guard runs on the caller's isolate, so any refine whose group held
+two or more ja segments hit this; with `defaultAutoRefineSilenceSeconds` at
+4.0 s a real microphone session groups several sentences per refine, so it
+was the normal case. The harness only saw punctuated refines in the other
+passes because it forced `autoRefineSilenceSeconds` to 0.3 s, one refine per
+segment. Defect 1's fix is what exposed it: with run 1's single merged
+segment there was one sentence in the group and nothing to fall back to, so
+`old-defaults` still shows `punctuated=true`.
+
+**The desktop pipeline does not have this hole** because its fast finals are
+already punctuated — `RoutedASR.transcribe` runs `punct_ja.py` over ja finals
+— so `scripts/realtime_transcribe.py`'s identical `0.7 × len(fast_joined)`
+fallback yields punctuated text, and its line reads
+`[refine/ja] 東京の天気は晴れです。あしたの会議は十時からです。資料は昨日送りました。`
+
+**What this branch changed.** The decode worker now punctuates
+`finalSegment` results under the same condition it punctuates refines
+(routed `lang == 'ja'`, or a plain session flagged Japanese), so the joined
+fast text is already punctuated and the fallback keeps its marks. The refine
+reports `punctuated: true` only when every final in the group was
+punctuated, and the shrink comparison strips the restored marks off both
+sides rather than only the refine's. Drafts stay unpunctuated. The cost is
+one `restore()` per utterance rather than per refine — 25–35 ms per line at
+the sizes above, on the emulator — which `JaPunctuation(applyToFinals:
+false)` declines, restoring the refine-only behaviour and its unpunctuated
+fallback. `LiveTranscriptEntry`/`FinalSubtitleEvent` now carry `punctuated`
+(wire: `"punctuated"`) so a consumer can see which lines it applied to.
+
+**This fix has not been run on the emulator.** It is covered by the
+package's own tests only; a third run is what would confirm it on a device.
+
+### What remains unverified after run 2
+
+Unchanged from run 1: no physical ARM device (everything is emulated
+x86_64), `RoutingProfile.jaSenseVoice` still not exercised, `restore()`
+still not timed directly, and no release build and no iOS — so
+`OrtLibrary.processSymbols` on iOS remains unverified. New to this run: the
+punctuated-finals fix above.
+
 ## Next steps for a mobile profile
 
 - Load + accuracy validated on an Android emulator via `sherpa_onnx.dart`

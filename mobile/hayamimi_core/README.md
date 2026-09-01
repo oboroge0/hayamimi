@@ -443,28 +443,29 @@ before the parameter existed.
 
 **What changes when it is on.**
 
-* **Refine events only.** `RefineSubtitleEvent` (and
-  `LiveTranscriber.refineEntries`) come back with 、 and 。 in them, and ？
-  after a recognised question ending. `FinalSubtitleEvent`,
-  `PartialSubtitleEvent` and the `entries`/`drafts` streams carry the
-  recognizer's text unchanged. That is where the desktop pipeline
-  punctuates, and it is the pass with the context for it: a final covers one
-  speech segment and a draft part of one still being spoken, so sentence
-  boundaries there would fall wherever the speaker happened to pause.
-  Punctuating every final would also cost a full model run per utterance, on
-  a phone, for a line the next refine replaces.
+* **Refines and finals, not drafts.** `RefineSubtitleEvent` and
+  `FinalSubtitleEvent` (and the `refineEntries`/`entries` streams) come back
+  with 、 and 。 in them, and ？ after a recognised question ending.
+  `PartialSubtitleEvent` and the `drafts` stream carry the recognizer's text
+  unchanged: a draft covers part of a sentence still being spoken and is
+  re-decoded about once a second, so a mark placed in one is a guess about a
+  sentence that has not finished, paid for on a phone, on a line the
+  segment's own final replaces a moment later. See ["Why the fast line is
+  punctuated too"](#why-the-fast-line-is-punctuated-too) for what finals are
+  doing here — the desktop pipeline punctuates its finals as well, and
+  something depends on it.
 * **Each affected line says so.** `punctuated` on `LiveTranscriptEntry` and
-  on `RefineSubtitleEvent`, and `"punctuated"` in that event's JSON (every
-  key that was already there still is), so a consumer — including one across
-  the LAN — can tell text the punctuation model wrote from text the
-  recognizer produced.
-* **Which refines get it.** A `RoutingProfile.jaSenseVoice` session
-  punctuates the refines that came back as Japanese and leaves the rest
-  alone. A plain single-model session has no language tag to test, so giving
-  it a Japanese punctuation model is itself the statement that its model
-  transcribes Japanese: **do not pass this to a plain session with a
-  non-Japanese model**, which would run a Japanese model over, say, English
-  and produce nonsense rather than nothing.
+  on `FinalSubtitleEvent`/`RefineSubtitleEvent`, and `"punctuated"` in those
+  events' JSON (every key that was already there still is), so a consumer —
+  including one across the LAN — can tell text the punctuation model wrote
+  from text the recognizer produced.
+* **Which lines get it.** A `RoutingProfile.jaSenseVoice` session punctuates
+  what came back as Japanese and leaves the rest alone. A plain single-model
+  session has no language tag to test, so giving it a Japanese punctuation
+  model is itself the statement that its model transcribes Japanese: **do
+  not pass this to a plain session with a non-Japanese model**, which would
+  run a Japanese model over, say, English and produce nonsense rather than
+  nothing.
 * **Where it runs.** In the decode worker isolate, beside the recognizers —
   loaded after them, and reported on `modelLoads` /
   `ModelLoadSubtitleEvent` as `model: "punct"` with its measured load time.
@@ -479,13 +480,45 @@ before the parameter existed.
   model file is a configuration mistake, not something to degrade around.
 * **`textTransform` still runs last**, on the punctuated text.
 
-One interaction is worth knowing about. A refine falls back to the fast
-finals' text when the merged re-decode comes back much shorter than they
-were, and that length comparison is made on the text *without* the restored
-marks. They are characters nobody said, and one per clause is enough to lift
-a genuinely truncated re-decode back over the threshold. When that fallback
-does fire, the entry reports `punctuated: false`, because the text that
-survived is the finals', which nothing punctuated.
+#### Why the fast line is punctuated too
+
+A refine does not always emit its own text. It re-decodes the whole buffered
+group as one utterance, and this repo's Japanese recognizer keeps only the
+last utterance of multi-utterance audio (see ["Known limitation: a refine
+over a long group can lose its leading
+sentences"](#known-limitation-a-refine-over-a-long-group-can-lose-its-leading-sentences)),
+so a group of two or more segments usually comes back holding one sentence.
+`isRefineTextTooShort` catches that and emits the fast finals joined
+together instead, which is the whole point of the guard.
+
+While only refines were punctuated, that fallback text was raw, so the
+refine lost its marks in exactly the case the guard exists to protect. An
+Android emulator run on package defaults produced this, over three
+correctly recognized sentences:
+
+```
+refine punctuated=false text=東京の天気は晴れです あしたの会議は十時からです 資料は昨日送りました
+```
+
+With `autoRefineSilenceSeconds` at its 4.0 s default a microphone session
+groups several sentences per refine, so this was the ordinary outcome, not
+a corner case. The desktop pipeline never had the problem because its fast
+finals are already punctuated (`RoutedASR.transcribe` runs `punct_ja.py`
+over ja finals), so its identical fallback yields punctuated text.
+
+So finals are punctuated too. The fallback reports `punctuated: true` when
+every final in the group was punctuated, and the length comparison strips
+the restored marks off both sides before comparing — they are characters
+nobody said, and one per clause is enough to lift a genuinely truncated
+re-decode back over the threshold.
+
+The cost is one run of the punctuation model per utterance rather than per
+refine, on the same isolate the recognizer is on: about **25–35 ms per
+11–14 character line** on the emulator measured below, added to a final's
+`latency_ms`. `JaPunctuation(..., applyToFinals: false)` declines it —
+finals then arrive exactly as the recognizer produced them, refines are
+still punctuated, and a refine that falls back to the finals reports
+`punctuated: false`, since the text that survived is theirs.
 
 **Using `PunctuatorJa` directly.** The class stays public, for a caller who
 wants to punctuate something the live pipeline did not produce:
@@ -547,7 +580,7 @@ Two pieces of the reference implementation had no Dart equivalent:
 | Platform | Status |
 |---|---|
 | Windows (host, `flutter test`) | **Verified** — parity with the Python reference on 51 recorded cases. |
-| Android | **Verified on an x86_64 emulator** (API 35): `libonnxruntime.so` resolved to the single copy `sherpa_onnx` ships, `OrtGetApiBase` was found, and the runtime served C API version 11 (ONNX Runtime 1.27.1 — the same version this host records). The 181.8 MB float16 model loaded inside the decode worker and punctuated ja refines. **No physical ARM device.** See ["Measured on an Android emulator"](#measured-on-an-android-emulator). |
+| Android | **Verified on an x86_64 emulator** (API 35): `libonnxruntime.so` resolved to the single copy `sherpa_onnx` ships, `OrtGetApiBase` was found, and the runtime served C API version 11 (ONNX Runtime 1.27.1 — the same version this host records). The 181.8 MB float16 model loaded inside the decode worker and punctuated ja refines. Both emulator runs predate finals being punctuated, so **the fast line's punctuation has not been seen on a device**, only in this package's tests. **No physical ARM device.** See ["Measured on an Android emulator"](#measured-on-an-android-emulator). |
 | iOS | **Unverified, and refused by default.** `sherpa_onnx` links ONNX Runtime as an xcframework and it has not been confirmed that `OrtGetApiBase` stays exported from the app binary, so `PunctuatorJa.load` throws rather than guess. Pass `libraryPath: OrtLibrary.processSymbols` to try it. |
 | macOS / Linux | Pass `libraryPath`; nothing puts the library on a desktop host's loader search path. |
 
@@ -704,7 +737,7 @@ reason.
 | type | JSON shape | emitted when |
 |---|---|---|
 | `partial` | `{"type":"partial","text":...}` | A draft ("発話中の暫定字幕") re-decode fires while a VAD segment is still in progress. |
-| `final` | `{"type":"final","text":...,"lang":...,"speaker":...,"latency_ms":...,"audio_s":...,"switched":...}` | A VAD segment finalized. `audio_s` is the segment's duration in seconds; `switched` is `true` only when this segment is the reason a `RoutingProfile.jaSenseVoice` session's language changed. `speaker` is always empty (no diarization yet). |
+| `final` | `{"type":"final","text":...,"lang":...,"speaker":...,"latency_ms":...,"audio_s":...,"switched":...,"punctuated":...}` | A VAD segment finalized. `audio_s` is the segment's duration in seconds; `switched` is `true` only when this segment is the reason a `RoutingProfile.jaSenseVoice` session's language changed; `punctuated` is `true` when Japanese punctuation was restored into `text` (see ["Japanese punctuation restoration"](#japanese-punctuation-restoration)), and `false` from every producer that does not punctuate its fast line, remote sessions included. `speaker` is always empty (no diarization yet). |
 | `translation` | `{"type":"translation","lang":...,"text":...}` | Reserved for wire compatibility with the desktop pipeline's machine translation — not emitted by this package today. |
 | `refine` | `{"type":"refine","text":...,"lang":...,"speaker":...,"latency_ms":...,"audio_s":...,"punctuated":...}` | A refine ("清書") pass completed. `audio_s` is the total duration of the buffered group that was re-decoded; `punctuated` is `true` when Japanese punctuation was restored into `text` (see ["Japanese punctuation restoration"](#japanese-punctuation-restoration)), and `false` from every producer that does not punctuate, remote sessions included. |
 | `error` | `{"type":"error","message":...}` | A session failure not attributable to a call the caller made — e.g. the OS revoking mic access mid-session. |
@@ -905,23 +938,31 @@ an ARM chip with a float16 vector unit does not do. Full write-up, including
 how the models were placed and what was and wasn't exercised, in
 [`docs/MOBILE.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/MOBILE.md).
 
+These are the **second** emulator run (two processes, ten sessions,
+`modified_beam_search`, `numThreads` 2), on the VAD and pre-roll defaults
+this package ships now:
+
 | what | conditions | ms |
 |---|---|---|
-| `model_load` `recognizer` | ReazonSpeech ja zipformer int8, 2 threads, `modified_beam_search`, n=8 | 3223 (median) |
-| `model_load` `punct` | `punct_bert.fp16.onnx` (181.8 MB), 2 intra-op threads, n=7 | 1072 (median) |
-| `model_load` `vad` | `silero_vad.onnx` (0.64 MB), n=8 | 33.9 (median) |
-| final, decode only | segments of 1.5–2.0 s | 53–66 |
-| refine, re-decode + punctuation | the same 1.5–2.0 s of audio | 80–96 |
-| refine, re-decode + punctuation | one merged group of 6.13 s | 218–833 |
+| `model_load` `recognizer` | ReazonSpeech ja zipformer int8, 2 threads, `modified_beam_search`, n=10 | 3883.7 (median) |
+| `model_load` `punct` | `punct_bert.fp16.onnx` (181.8 MB), 2 intra-op threads, n=10 | 1140.2 (median) |
+| `model_load` `vad` | `silero_vad.onnx` (0.64 MB), n=10 | 32.9 (median) |
+| final, decode only | a 1.762 s / 2.400 s / 2.144 s segment, n=6 each | 61.8 / 80.4 / 71.5 (medians) |
+| refine, re-decode + punctuation | those same segments, warm | 97–114 |
+| refine, re-decode + punctuation | the first refine in a fresh process | 407.9 / 412.7 |
 
 The first load of each model in a fresh process sits at the slow end of its
-range (cold page cache), and 833 ms is the first refine of a run for the
-same reason. **Punctuation was not timed directly.** A refine's
-`latency_ms` covers the re-decode and the punctuation pass together, so the
-cost quoted for `restore()` on this run — roughly **26–33 ms per ~10
-characters**, warm, two intra-op threads — is a refine minus the final over
-the identical samples. That is an inference from the difference of two
-timers, not a measurement.
+range (cold page cache), and the first refine of a process costs ~310 ms
+more than the rest — a one-time warm-up inside the fp16 punctuation model,
+paid once per process and not once per session. The recognizer median moved
+up ~660 ms against the first run while `punct` and `vad` stayed flat, which
+reads as load noise on a shared desktop rather than a change in the code.
+
+**Punctuation was not timed directly.** A `latency_ms` covers the decode and
+the punctuation pass together, so the cost quoted for `restore()` on this
+run — roughly **25–35 ms per 11–14 character line**, warm, two intra-op
+threads — is a refine minus the final over the identical samples. That is an
+inference from the difference of two timers, not a measurement.
 
 ### Known limitation: a refine over a long group can lose its leading sentences
 
@@ -944,11 +985,12 @@ What this package does about it today, and what it doesn't:
   contain several sentences in the first place. Segmentation is load-bearing
   for correctness here, not just for latency.
 - When a refine comes back much shorter than the fast finals it is replacing,
-  the finals' combined text is emitted instead (`isRefineTextTooShort`). That
-  catches the case where a group of several good finals refines to one
-  sentence — but not the case where a single over-long *segment* was already
-  truncated on the fast path, because then there is no better text to fall
-  back to.
+  the finals' combined text is emitted instead (`isRefineTextTooShort`), with
+  their punctuation, since finals are punctuated too (see ["Why the fast line
+  is punctuated too"](#why-the-fast-line-is-punctuated-too)). That catches
+  the case where a group of several good finals refines to one sentence — but
+  not the case where a single over-long *segment* was already truncated on
+  the fast path, because then there is no better text to fall back to.
 - The desktop pipeline goes further: it splits a suspicious result in half
   and retries each half (`_looks_truncated` / `_split_retry` in
   `scripts/asr_engine.py`, v0.3.1). **That is not ported to this package
