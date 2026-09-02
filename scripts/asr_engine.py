@@ -43,6 +43,24 @@ VAD_MODEL_PATH = os.path.join(MODELS_DIR, "silero_vad.onnx")
 # (WER 1.6% vs v3's 2.5%, but v3's casing/punctuation reads far better).
 RZ_LANGS = {"ja"}
 
+# The ja tier's sherpa-onnx OfflineRecognizerConfig values, hoisted out of
+# _build_reazon() so scripts/dump_ja_config.py can report the configuration a
+# ja-only re-implementation has to match WITHOUT loading a model (see
+# docs/JA_PIPELINE.md). _build_reazon() below is the only other reader; these
+# are the same literals it used before, moved rather than changed.
+RZ_MODEL_TYPE = "zipformer"
+RZ_DECODING_METHOD = "modified_beam_search"
+RZ_MODELING_UNIT = "cjkchar"
+RZ_HOTWORDS_SCORE = 2.0
+# The four files the recognizer is built from, as the glob patterns _find()
+# resolves them with, in the order from_transducer() takes them.
+RZ_MODEL_FILES = {
+    "encoder": "encoder-*.int8.onnx",
+    "decoder": "decoder-*.int8.onnx",
+    "joiner": "joiner-*.int8.onnx",
+    "tokens": "tokens.txt",
+}
+
 # Paraformer-zh beats SenseVoice on real Chinese (CER 5.6% vs 7.5%); the
 # dedicated Korean zipformer is worse (30%), so ko stays on SenseVoice.
 # See docs/EVAL_REAL_ZHKO.md.
@@ -211,20 +229,21 @@ def _find(model_dir: str, pattern: str) -> str:
     return hits[0] if hits else ""
 
 
-def _build_reazon(threads: int, hotwords_file: str = "", hotwords_score: float = 2.0):
+def _build_reazon(threads: int, hotwords_file: str = "",
+                  hotwords_score: float = RZ_HOTWORDS_SCORE):
     # modified_beam_search: CER 8.6% -> 5.8% on real broadcast ja for +25%
     # decode time (still 37x realtime). v3/en showed no gain and stays greedy.
     return sherpa_onnx.OfflineRecognizer.from_transducer(
-        encoder=_find(RZ_MODEL_DIR, "encoder-*.int8.onnx"),
-        decoder=_find(RZ_MODEL_DIR, "decoder-*.int8.onnx"),
-        joiner=_find(RZ_MODEL_DIR, "joiner-*.int8.onnx"),
-        tokens=os.path.join(RZ_MODEL_DIR, "tokens.txt"),
+        encoder=_find(RZ_MODEL_DIR, RZ_MODEL_FILES["encoder"]),
+        decoder=_find(RZ_MODEL_DIR, RZ_MODEL_FILES["decoder"]),
+        joiner=_find(RZ_MODEL_DIR, RZ_MODEL_FILES["joiner"]),
+        tokens=os.path.join(RZ_MODEL_DIR, RZ_MODEL_FILES["tokens"]),
         num_threads=threads,
-        model_type="zipformer",
-        decoding_method="modified_beam_search",
+        model_type=RZ_MODEL_TYPE,
+        decoding_method=RZ_DECODING_METHOD,
         hotwords_file=hotwords_file,
         hotwords_score=hotwords_score,
-        modeling_unit="cjkchar",
+        modeling_unit=RZ_MODELING_UNIT,
     )
 
 
@@ -616,7 +635,7 @@ def _load_replacements(path: str) -> list[tuple[str, str]]:
 # a key file per model: checked BEFORE building, because sherpa-onnx's C++
 # layer exits the process (not a catchable exception) on an empty model path
 _KEY_FILES = {
-    "rz": (RZ_MODEL_DIR, "encoder-*.int8.onnx"),
+    "rz": (RZ_MODEL_DIR, RZ_MODEL_FILES["encoder"]),
     "pz": (PARA_ZH_DIR, "model*.onnx"),
     "sv": (SV_MODEL_DIR, "model*.onnx"),
     "v3": (V3_MODEL_DIR, "encoder*.onnx"),
