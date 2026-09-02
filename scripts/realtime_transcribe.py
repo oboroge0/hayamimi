@@ -30,6 +30,13 @@ from subtitle_server import EventHub, RuntimeControls, SubtitleServer
 
 SAMPLE_RATE = 16000
 WINDOW_SIZE = 512  # samples per VAD chunk, ~32ms @ 16kHz
+# The rest of build_vad()'s fixed VadModelConfig values. Named here (rather
+# than as literals in the call) so scripts/dump_ja_config.py can report the
+# VAD configuration a re-implementation has to match without constructing a
+# detector; build_vad() below is the only other reader. Same values as before.
+VAD_MIN_SPEECH_S = 0.25    # ignore speech runs shorter than this
+VAD_BUFFER_S = 30.0        # VoiceActivityDetector's ring buffer
+VAD_NUM_THREADS = 1        # silero_vad.onnx is tiny; one thread is plenty
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
 VAD_MODEL = os.path.join(MODELS_DIR, "silero_vad.onnx")
 
@@ -78,14 +85,14 @@ def build_vad(min_silence: float = 0.35,
             model=VAD_MODEL,
             threshold=vad_threshold,
             min_silence_duration=min_silence,
-            min_speech_duration=0.25,
+            min_speech_duration=VAD_MIN_SPEECH_S,
             window_size=WINDOW_SIZE,
             max_speech_duration=max_speech,
         ),
         sample_rate=SAMPLE_RATE,
-        num_threads=1,
+        num_threads=VAD_NUM_THREADS,
     )
-    return sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=30)
+    return sherpa_onnx.VoiceActivityDetector(cfg, buffer_size_in_seconds=VAD_BUFFER_S)
 
 
 class LiveVad:

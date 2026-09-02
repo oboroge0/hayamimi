@@ -22,20 +22,29 @@ import time
 import unicodedata
 from pathlib import Path
 
-import numpy as np
-import onnxruntime as ort
-
-try:
-    import fugashi
-except ImportError as e:  # pragma: no cover
-    raise ImportError(
-        "fugashi is required for the Mojicast punctuation tokenizer. "
-        "Install with: pip install fugashi unidic-lite"
-    ) from e
-
+# numpy / onnxruntime / fugashi are imported lazily, inside the methods that
+# need them, so `import punct_ja` costs nothing but the constants below.
+# scripts/dump_ja_config.py reads those constants in an environment that has
+# none of the three installed (CI installs sherpa-onnx numpy scipy soundfile
+# pytest and no models), and the punctuation model is a 363 MB optional
+# download anyway. Constructing a PunctuatorJa still raises the same
+# ImportError for a missing fugashi that importing this module used to raise.
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_DIR = SCRIPT_DIR.parent / "models" / "mojicast-punct-onnx"
+
+# --- the restorer's fixed configuration ------------------------------------
+# Named constants rather than bare literals in the signature below, so
+# scripts/dump_ja_config.py can report them without importing onnxruntime.
+# docs/JA_PIPELINE.md specifies the same values for the C++ port.
+PUNCT_COMMA_THRESHOLD = 0.5
+PUNCT_PERIOD_THRESHOLD = 0.5
+PUNCT_MAX_CHARS = 500          # under the model's 512 positions, incl. CLS/SEP
+PUNCT_FORCE_FINAL_PERIOD = True
+PUNCT_ONNX_FILENAME = "punct_bert.onnx"   # fp32; see docs/PUNCT_JA.md
+PUNCT_INPUT_NAMES = ("input_ids", "attention_mask")
+PUNCT_OUTPUT_NAME = "logits"
+PUNCT_INTRA_OP_NUM_THREADS = 4
 
 # Trailing/leading punctuation that we should not duplicate insertion after.
 _JA_PUNCT_CHARS = set("。、！？!?…「」『』（）()【】・,.\n")
@@ -61,12 +70,22 @@ class PunctuatorJa:
     def __init__(
         self,
         model_dir: str | Path = DEFAULT_MODEL_DIR,
-        comma_threshold: float = 0.5,
-        period_threshold: float = 0.5,
-        max_chars: int = 500,
-        force_final_period: bool = True,
-        onnx_filename: str = "punct_bert.onnx",
+        comma_threshold: float = PUNCT_COMMA_THRESHOLD,
+        period_threshold: float = PUNCT_PERIOD_THRESHOLD,
+        max_chars: int = PUNCT_MAX_CHARS,
+        force_final_period: bool = PUNCT_FORCE_FINAL_PERIOD,
+        onnx_filename: str = PUNCT_ONNX_FILENAME,
     ):
+        import onnxruntime as ort
+
+        try:
+            import fugashi
+        except ImportError as e:  # pragma: no cover
+            raise ImportError(
+                "fugashi is required for the Mojicast punctuation tokenizer. "
+                "Install with: pip install fugashi unidic-lite"
+            ) from e
+
         model_dir = Path(model_dir)
         # NOTE: the int8 dynamic-quantized file shipped in the upstream HF
         # repo (punct_bert.int8.onnx) was verified to produce near-constant,
@@ -109,7 +128,7 @@ class PunctuatorJa:
 
         # --- onnxruntime session ---
         so = ort.SessionOptions()
-        so.intra_op_num_threads = 4
+        so.intra_op_num_threads = PUNCT_INTRA_OP_NUM_THREADS
         self.session = ort.InferenceSession(
             str(onnx_path), sess_options=so, providers=["CPUExecutionProvider"]
         )
@@ -135,6 +154,8 @@ class PunctuatorJa:
         if not text:
             return text
 
+        import numpy as np
+
         chars = self._tokenize_chars(text)
         if not chars:
             return text
@@ -148,7 +169,8 @@ class PunctuatorJa:
         mask_np = np.array([attention_mask], dtype=np.int64)
 
         logits = self.session.run(
-            ["logits"], {"input_ids": ids_np, "attention_mask": mask_np}
+            [PUNCT_OUTPUT_NAME],
+            dict(zip(PUNCT_INPUT_NAMES, (ids_np, mask_np))),
         )[0][0]  # -> (seq_len, 2)
 
         probs = 1.0 / (1.0 + np.exp(-logits))
