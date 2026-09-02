@@ -1,0 +1,175 @@
+{
+  "generated_by": "scripts/dump_ja_config.py",
+  "generated_at": "2026-09-02T05:32:08Z",
+  "schema_version": 1,
+  "describes": "docs/JA_PIPELINE.md",
+  "config": {
+    "route": {
+      "forced_lang": "ja",
+      "language_identification": false,
+      "second_opinion_default": false,
+      "second_opinion_agree_threshold": 0.25,
+      "postprocessing_order": [
+        "itn",
+        "punctuation",
+        "replacements"
+      ]
+    },
+    "recognizer": {
+      "name": "sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17",
+      "api": "sherpa_onnx.OfflineRecognizer.from_transducer",
+      "files": {
+        "encoder": "encoder-*.int8.onnx",
+        "decoder": "decoder-*.int8.onnx",
+        "joiner": "joiner-*.int8.onnx",
+        "tokens": "tokens.txt"
+      },
+      "model_type": "zipformer",
+      "decoding_method": "modified_beam_search",
+      "modeling_unit": "cjkchar",
+      "num_threads": 4,
+      "hotwords_file": "",
+      "hotwords_score": 2.0,
+      "hotwords_usable": false,
+      "feature_sample_rate": 16000,
+      "feature_dim": 80
+    },
+    "vad": {
+      "model": "silero_vad.onnx",
+      "threshold": 0.5,
+      "min_silence_duration": 0.35,
+      "min_speech_duration": 0.25,
+      "max_speech_duration": 12.0,
+      "window_size": 512,
+      "sample_rate": 16000,
+      "buffer_size_in_seconds": 30.0,
+      "num_threads": 1,
+      "speech_padding_supported": false
+    },
+    "preroll": {
+      "seconds": 1.0,
+      "history_keep_seconds": 30.0,
+      "clamped_to_previous_segment_end": true,
+      "source": "real audio from the rolling capture history"
+    },
+    "head_dropout_retry": {
+      "min_buffer_seconds": 4.0,
+      "min_silence_seconds": 0.35,
+      "min_speech_seconds": 0.25,
+      "pad_seconds": 0.35,
+      "pad_real_context_each_side": true,
+      "pad_zero_samples_each_side": true,
+      "sample_rate": 16000,
+      "density_floor_cjk": 2.4,
+      "density_floor_latin": 6.0,
+      "retry_tail_chars": 12,
+      "retry_tail_match": 0.6,
+      "fallback_chunk_seconds": 8.0,
+      "fallback_overlap_seconds": 0.25
+    },
+    "punctuation": {
+      "model": "punct_bert.onnx",
+      "vocab": "vocab.txt",
+      "input_names": [
+        "input_ids",
+        "attention_mask"
+      ],
+      "output_name": "logits",
+      "comma_threshold": 0.5,
+      "period_threshold": 0.5,
+      "max_chars": 500,
+      "force_final_period": true,
+      "intra_op_num_threads": 4,
+      "question_suffixes": [
+        "ですか",
+        "ますか",
+        "でしょうか",
+        "かな",
+        "かしら",
+        "かい",
+        "の",
+        "だろうか",
+        "でしたか",
+        "ましたか"
+      ],
+      "punctuation_chars": [
+        "\n",
+        "!",
+        "(",
+        ")",
+        ",",
+        ".",
+        "?",
+        "…",
+        "、",
+        "。",
+        "「",
+        "」",
+        "『",
+        "』",
+        "【",
+        "】",
+        "・",
+        "！",
+        "（",
+        "）",
+        "？"
+      ],
+      "normalization": "NFKC"
+    },
+    "itn": {
+      "enabled": true,
+      "module": "scripts/itn_cjk.py",
+      "applicable_langs": [
+        "ja",
+        "yue",
+        "zh"
+      ]
+    }
+  },
+  "models": {
+    "recognizer.encoder": {
+      "file": "sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17/encoder-epoch-35-avg-1.int8.onnx",
+      "present": true,
+      "bytes": 70876409,
+      "sha256": "ead1579e118b821a767242a8eb9272634b0e63ba16f8dfc4d126732406eae268"
+    },
+    "recognizer.decoder": {
+      "file": "sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17/decoder-epoch-35-avg-1.int8.onnx",
+      "present": true,
+      "bytes": 1308690,
+      "sha256": "d0179db78a2e65445c5c3dc41e94c62068fc539fe4e45060e32f438cca76432f"
+    },
+    "recognizer.joiner": {
+      "file": "sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17/joiner-epoch-35-avg-1.int8.onnx",
+      "present": true,
+      "bytes": 1033417,
+      "sha256": "c7f4ba40a8ae307a6c30b5c06e2570add04466bcb45bab62699f0ec5d00ed495"
+    },
+    "recognizer.tokens": {
+      "file": "sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17/tokens.txt",
+      "present": true,
+      "bytes": 26631,
+      "sha256": "144f8a4f639373a1bdf7eabb2437482ef64b0cc5db24ad27cce65f293e4faa24"
+    },
+    "vad": {
+      "file": "silero_vad.onnx",
+      "present": true,
+      "bytes": 643854,
+      "sha256": "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
+    },
+    "punctuation.model": {
+      "file": "mojicast-punct-onnx/punct_bert.onnx",
+      "present": true,
+      "bytes": 363501157,
+      "sha256": "4ed3c28ede4792526c6abab9101a3b6c304ab09fd0bda4e318e0acb2b7008e63"
+    },
+    "punctuation.vocab": {
+      "file": "mojicast-punct-onnx/vocab.txt",
+      "present": true,
+      "bytes": 27928,
+      "sha256": "57411bcac5e9559f2aa4d316a2217289048cb40fe23187b02a81aeb3e5d61cf3"
+    },
+    "_total_bytes": 437418086
+  }
+}
