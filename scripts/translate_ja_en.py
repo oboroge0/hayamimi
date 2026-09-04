@@ -2,13 +2,13 @@
 
 Uses FuguMT ja-en (staka/fugumt-ja-en), converted to CTranslate2 by the
 Mojicast project (ishiki-emo/mojicast-fugumt-ja-en-ct2, CC BY-SA 4.0).
-See docs/TRANSLATE.md for model source, license, and measured latency.
+See docs/design/translate.md for model source, license, and measured latency.
 
 Design notes (following Mojicast's TRANSLATION_REPORT.md):
 - no_repeat_ngram_size is used to suppress repetition loops (e.g. "Thank
   thank thank..."). Measured n=1 here, not the reference's n=3 -- see
-  docs/TRANSLATE.md for why.
-- beam_size chosen for a good latency/quality tradeoff (see docs/TRANSLATE.md).
+  docs/design/translate.md for why.
+- beam_size chosen for a good latency/quality tradeoff (see docs/design/translate.md).
 - Any exception, or empty/garbage output, falls back to returning the
   original Japanese text unchanged -- a subtitle line must never go blank.
 """
@@ -28,7 +28,7 @@ BEAM_SIZE = 5
 # Mojicast's original report) did NOT eliminate repetition loops -- it still
 # produced runs like "Thank thank thank thank you...". no_repeat_ngram_size=1
 # (block any single-token repeat) was required to meaningfully suppress them.
-# See docs/TRANSLATE.md for the measurements behind this choice.
+# See docs/design/translate.md for the measurements behind this choice.
 NO_REPEAT_NGRAM_SIZE = 1
 MAX_DECODING_LENGTH_CAP = 150
 MAX_DECODING_LENGTH_MIN = 30

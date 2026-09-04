@@ -1,7 +1,7 @@
 """Build the Dart<->Python parity fixture for the mobile punctuation port.
 
 Problem: `mobile/hayamimi_core` re-implements `scripts/punct_ja.py`'s
-Japanese punctuation restorer in Dart (see docs/PUNCT_JA.md for the model
+Japanese punctuation restorer in Dart (see docs/design/punct_ja.md for the model
 itself, and the package README for why the port exists). A
 re-implementation is only trustworthy if it is pinned to the reference
 implementation on real sentences, not on hand-written examples that both

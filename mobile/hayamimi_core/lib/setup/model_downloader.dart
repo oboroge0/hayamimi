@@ -535,7 +535,7 @@ Future<bool> _allPlacementsVerified(
 }
 
 /// Hashes a file off the main isolate -- these can be tens to hundreds of
-/// MB (see `docs/MOBILE.md`'s size table), and this runs both on every
+/// MB (see `docs/design/mobile_quantization.md`'s size table), and this runs both on every
 /// idempotency check and after every download, so keeping it off whatever
 /// isolate the caller is on matters the same way model loading does (see
 /// `lib/live/native_model_loader.dart`).

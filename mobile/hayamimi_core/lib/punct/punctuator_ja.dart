@@ -14,10 +14,10 @@ import 'punct_ort_session.dart';
 ///
 /// How it works: a character-level BERT classifier decides, for every
 /// character, whether a comma or a period should follow it. The model is
-/// the one `docs/PUNCT_JA.md` describes, converted to float16 by
+/// the one `docs/design/punct_ja.md` describes, converted to float16 by
 /// `scripts/quantize_punct.py --variant fp16` (182 MB, half of the
 /// original, and identical predictions on the 250-sentence FLEURS check
-/// recorded in `docs/MOBILE.md`). A rule-based pass then turns a
+/// recorded in `docs/design/mobile_quantization.md`). A rule-based pass then turns a
 /// sentence-final 。 into ？ after a question ending, because the model has
 /// no question-mark class to predict.
 ///

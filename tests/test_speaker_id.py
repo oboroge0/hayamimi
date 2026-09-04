@@ -6,8 +6,8 @@ _centroids/_counts/_threshold, so tests build a bare instance with
 object.__new__() and set just those attributes directly.
 
 The two real-audio tests at the bottom of this file (fast-path regression
-check + the hysteresis two_speakers.wav failure mode, docs/
-DIARIZATION_PLAN.md section 9 / iteration 6) DO load the real CAM++ model
+check + the hysteresis two_speakers.wav failure mode, docs/design/
+diarization.md section 9 / iteration 6) DO load the real CAM++ model
 and, for the second one, scripts/diarize.py's GroupDiarizer (which also
 needs the pyannote segmentation-3.0 model) -- both skip cleanly if their
 model/fixture is missing, same pattern as tests/test_diarize.py.
@@ -96,7 +96,7 @@ def test_match_embedding_picks_nearest_of_several_centroids():
 
 
 # ---------------------------------------------------------------------------
-# Round 5 (docs/DIARIZATION_PLAN.md section 15) T3: exclude_provisional
+# Round 5 (docs/design/diarization.md section 15) T3: exclude_provisional
 # ---------------------------------------------------------------------------
 
 def test_exclude_provisional_skips_a_one_off_centroid_as_a_match_target():
@@ -127,7 +127,7 @@ def test_exclude_provisional_false_is_a_no_op_default():
 
 
 # ---------------------------------------------------------------------------
-# Round 5 (docs/DIARIZATION_PLAN.md section 15) T1: constrained joint remap
+# Round 5 (docs/design/diarization.md section 15) T1: constrained joint remap
 # ---------------------------------------------------------------------------
 
 def test_joint_remap_single_cluster_matches_independent_match_embedding():
@@ -200,7 +200,7 @@ def test_joint_remap_empty_input_returns_empty_list():
 
 
 # ---------------------------------------------------------------------------
-# docs/DIARIZATION_PLAN.md section 10.6/10.8: centroid-open diagnostics
+# docs/design/diarization.md section 10.6/10.8: centroid-open diagnostics
 # ---------------------------------------------------------------------------
 
 def test_match_embedding_default_source_is_empty_and_only_logged_on_open():
@@ -230,7 +230,7 @@ def test_label_forwards_source_to_match_embedding():
 
 
 def test_centroid_summary_flags_one_off_opens_with_a_final_match_count_of_one():
-    # docs/DIARIZATION_PLAN.md section 10.8's root-cause finding: production
+    # docs/design/diarization.md section 10.8's root-cause finding: production
     # prints every fast-path S{n} the instant it opens, including a
     # centroid that (like this one) never gets matched again -- exactly
     # what centroid_summary()'s final_match_count is meant to surface, since
@@ -248,7 +248,7 @@ def test_centroid_summary_flags_one_off_opens_with_a_final_match_count_of_one():
 
 
 # ---------------------------------------------------------------------------
-# issue #11 (docs/DIARIZATION_PLAN.md section 10.8, option B): display-only
+# issue #11 (docs/design/diarization.md section 10.8, option B): display-only
 # provisional labeling. Unlike section 9's hysteresis, this must NEVER
 # change what match_embedding()/label() return (assignment) -- only what a
 # caller shows via display_label() at print time.
@@ -341,7 +341,7 @@ def test_provisional_label_count_skips_merged_away_centroids():
 
 
 # ---------------------------------------------------------------------------
-# iteration 6 (docs/DIARIZATION_PLAN.md section 9): new-speaker hysteresis
+# iteration 6 (docs/design/diarization.md section 9): new-speaker hysteresis
 # ---------------------------------------------------------------------------
 
 def test_hysteresis_first_speaker_confirmed_immediately():
@@ -377,7 +377,7 @@ def test_hysteresis_disabled_opens_new_speaker_immediately():
 
 
 # ---------------------------------------------------------------------------
-# iteration 6 (docs/DIARIZATION_PLAN.md section 9): periodic centroid merging
+# iteration 6 (docs/design/diarization.md section 9): periodic centroid merging
 # ---------------------------------------------------------------------------
 
 def test_merge_centroids_folds_similar_speakers():
@@ -455,7 +455,7 @@ def test_merge_history_flattens_across_calls():
 
 # ---------------------------------------------------------------------------
 # real-audio regression: fast path on a genuine short two-speaker recording
-# (docs/DIARIZATION_PLAN.md section 9 / iteration 6's speaker-count work
+# (docs/design/diarization.md section 9 / iteration 6's speaker-count work
 # must not regress the module's stated use case -- "turn-taking
 # conversations", commonly just 1-2 speakers, per the module docstring)
 # ---------------------------------------------------------------------------

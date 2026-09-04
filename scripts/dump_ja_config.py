@@ -1,11 +1,11 @@
 """Print hayamimi's Japanese-route configuration as JSON.
 
-Why this exists: docs/JA_PIPELINE.md specifies the ja route precisely enough
+Why this exists: docs/spec/ja_pipeline.ja.md specifies the ja route precisely enough
 for another project to re-implement it (a C++ Godot GDExtension over
 sherpa-onnx, at the time of writing). A document drifts away from the code
 that it describes; this script reads the configuration out of the code
 itself, and tests/test_ja_pipeline_spec.py compares its output against the
-committed docs/ja_pipeline_spec.json so the drift is a failing test rather
+committed docs/spec/ja_pipeline_spec.json so the drift is a failing test rather
 than a wrong document.
 
 No model is loaded and no recognizer is constructed. Every value below comes
@@ -15,7 +15,7 @@ on a checkout with no `models/` directory (which is exactly what CI has).
 Usage:
     python scripts/dump_ja_config.py                  # configuration only
     python scripts/dump_ja_config.py --with-models    # + sha256 / byte sizes
-    python scripts/dump_ja_config.py --with-models --out docs/ja_pipeline_spec.json
+    python scripts/dump_ja_config.py --with-models --out docs/spec/ja_pipeline_spec.json
 """
 
 from __future__ import annotations
@@ -211,7 +211,7 @@ def build_spec(with_models: bool, models_dir: str) -> dict:
         .isoformat()
         .replace("+00:00", "Z"),
         "schema_version": SCHEMA_VERSION,
-        "describes": "docs/JA_PIPELINE.md",
+        "describes": "docs/spec/ja_pipeline.ja.md",
         "config": build_config(),
     }
     if with_models:

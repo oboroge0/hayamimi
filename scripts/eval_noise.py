@@ -15,14 +15,14 @@ are checkpointed to a JSON cache (testdata/_noise_eval_cache.json under
 --root; testdata/ is already gitignored) so this script can be re-run
 multiple times, optionally scoped with --noise/--snr, and it will only
 (re)compute conditions missing from the cache. Pass --report to (re)write
-docs/NOISE.md from whatever is in the cache without evaluating anything.
+docs/eval/noise.md from whatever is in the cache without evaluating anything.
 
 GTCRN denoiser A/B (--denoise):
     Pass --denoise to run the SAME condition set through sherpa-onnx's
     OfflineSpeechDenoiser (GTCRN model, models/gtcrn/gtcrn_simple.onnx under
     --root) before handing samples to RoutedASR. Each denoised condition is
     cached under a separate key ("<condition>+denoise") alongside the plain
-    result, so both sides of the A/B are available at once for docs/NOISE.md
+    result, so both sides of the A/B are available at once for docs/eval/noise.md
     to compare. The denoiser's own processing time is measured separately
     (denoise_rtf) and also folded into the row's total rtf (denoise time +
     decode time, over audio duration) so --denoise numbers are directly
@@ -52,7 +52,7 @@ from eval_common import load_manifest
 import eval_common
 
 WORKTREE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DOCS_PATH = os.path.join(WORKTREE_ROOT, "docs", "NOISE.md")
+DOCS_PATH = os.path.join(WORKTREE_ROOT, "docs", "eval", "noise.md")
 
 CLEAN_DIRS = ["testdata/eval_real", "testdata/eval_real_zhko", "testdata/eval_real_yue"]
 NOISE_TYPES = ["white", "pink", "babble"]
@@ -403,7 +403,7 @@ def main():
     ap.add_argument("--snr", nargs="*", type=int, choices=SNR_LEVELS_DB,
                      help="restrict to these SNR levels in dB (default: all)")
     ap.add_argument("--report", action="store_true",
-                     help="only (re)write docs/NOISE.md from the existing cache, no evaluation")
+                     help="only (re)write docs/eval/noise.md from the existing cache, no evaluation")
     ap.add_argument("--denoise", action="store_true",
                      help="run the selected conditions through the GTCRN speech denoiser "
                           "before RoutedASR (results cached under separate '+denoise' keys)")

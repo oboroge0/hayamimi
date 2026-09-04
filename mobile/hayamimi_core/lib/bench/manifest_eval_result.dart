@@ -29,7 +29,7 @@ class ManifestEvalResult {
   final String? detectedLang;
 
   /// Real-time factor for this clip. Not meaningful across devices — see
-  /// docs/MOBILE.md's on-emulator accuracy parity note — but useful for
+  /// docs/design/mobile_quantization.md's on-emulator accuracy parity note — but useful for
   /// spotting an outlier clip within a single run.
   double get rtf =>
       audioDurationSeconds > 0 ? decodeSeconds / audioDurationSeconds : 0;

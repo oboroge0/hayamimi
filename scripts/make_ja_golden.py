@@ -1,6 +1,6 @@
 """Regenerate tests/golden/ja/golden.json by running the real ja pipeline.
 
-Problem: docs/JA_PIPELINE.md specifies the Japanese route for
+Problem: docs/spec/ja_pipeline.ja.md specifies the Japanese route for
 re-implementation elsewhere, and a specification nobody executes rots. The
 golden set is the executable half: eight FLEURS ja clips, and the exact text
 `scripts/realtime_transcribe.py` emits for each of them today. A change that
@@ -199,7 +199,7 @@ def build_golden() -> dict:
     return {
         "_generated_by": "scripts/make_ja_golden.py",
         "_purpose": (
-            "Pinned output of hayamimi's Japanese route (docs/JA_PIPELINE.md) "
+            "Pinned output of hayamimi's Japanese route (docs/spec/ja_pipeline.ja.md) "
             "on eight FLEURS ja clips. tests/test_ja_golden.py re-runs the "
             "pipeline and compares; see tests/golden/ja/README.md for the "
             "exact-match / CER two-level rule."

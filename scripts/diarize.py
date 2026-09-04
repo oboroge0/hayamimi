@@ -3,7 +3,7 @@
 Wraps sherpa_onnx.OfflineSpeakerDiarization: pyannote segmentation-3.0 for
 speaker-change/voice-activity detection, the same CAM++ embedding model
 scripts/speaker_id.py already uses, and FastClustering for the actual
-speaker assignment. See docs/DIARIZATION_PLAN.md sections 2-3 for the
+speaker assignment. See docs/design/diarization.md sections 2-3 for the
 design rationale (this is the "clustering diarizer" that iteration (3)
 plugs into Refiner.maybe_refine()).
 
@@ -28,7 +28,7 @@ SEGMENTATION_MODEL = os.path.join(
 # SIM_THRESHOLD=0.45, but the two are not directly comparable -- FastClustering
 # clusters embeddings with (1 - cosine_similarity) distance internally, and
 # operates on pyannote-segmentation-bounded speech turns rather than raw VAD
-# segments, so it tends to need different tuning. See docs/DIARIZATION_PLAN.md
+# segments, so it tends to need different tuning. See docs/design/diarization.md
 # section 6 (iteration 3 sweep) for the values tried.
 DEFAULT_THRESHOLD = 0.5
 
@@ -36,7 +36,7 @@ DEFAULT_THRESHOLD = 0.5
 # semantics as the segmentation model's underlying VAD post-processing):
 # min_duration_on drops speech turns shorter than this after segmentation,
 # min_duration_off bridges (merges across) silence gaps shorter than this.
-# docs/DIARIZATION_PLAN.md Round 2 (section 12) sweeps these -- see that
+# docs/design/diarization.md Round 2 (section 12) sweeps these -- see that
 # section for the min-silence-0.5-equivalent confusion-vs-latency tradeoff
 # that motivated exposing them instead of only tuning production's
 # min_silence_duration.
@@ -62,7 +62,7 @@ class GroupDiarizer:
         if not os.path.exists(SEGMENTATION_MODEL):
             raise FileNotFoundError(
                 f"pyannote segmentation model missing: {SEGMENTATION_MODEL}\n"
-                "download it: see docs/DIARIZATION_PLAN.md section 2, or run "
+                "download it: see docs/design/diarization.md section 2, or run "
                 "`curl -L -o /tmp/seg.tar.bz2 "
                 "https://github.com/k2-fsa/sherpa-onnx/releases/download/"
                 "speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
@@ -75,7 +75,7 @@ class GroupDiarizer:
         self._default_num_clusters = num_clusters
         self._sd = sherpa_onnx.OfflineSpeakerDiarization(self._build_config(num_clusters))
         self.sample_rate = self._sd.sample_rate
-        # Round 9 Experiment A (docs/DIARIZATION_PLAN.md section 19): tracks
+        # Round 9 Experiment A (docs/design/diarization.md section 19): tracks
         # whichever num_clusters value is CURRENTLY live in self._sd's
         # config, so process() only calls the (cheap but not free) set_config
         # when a call's requested hint actually differs from what's already
@@ -110,7 +110,7 @@ class GroupDiarizer:
         find any speech turn (callers should fall back to their existing
         single-label behavior in that case).
 
-        num_clusters (Round 9 Experiment A, docs/DIARIZATION_PLAN.md section
+        num_clusters (Round 9 Experiment A, docs/design/diarization.md section
         19): None (default) is a no-op -- this call uses whatever
         FastClusteringConfig.num_clusters the constructor was given (-1 =
         "let FastClustering pick the count itself", sherpa-onnx's own

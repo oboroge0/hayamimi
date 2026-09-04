@@ -16,7 +16,7 @@ Two engines, selected with --engine:
   - turbo: faster-whisper large-v3-turbo, device=cpu, compute_type=int8,
     beam_size=1, language=<given>. Turbo is handed the correct language
     directly -- a documented asymmetry vs. hayamimi's auto-LID path, matching
-    the conditions stated in docs/COMPARISON.md.
+    the conditions stated in docs/results/comparison.md.
 
 Scoring: reuses eval_accuracy.wer_en / eval_accuracy.cer_ja exactly as
 eval_engine.py does: en=WER, others=CER (yue additionally t2s-normalized via

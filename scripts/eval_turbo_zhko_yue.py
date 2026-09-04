@@ -1,7 +1,7 @@
 """faster-whisper large-v3-turbo INT8 (CPU) on the zh/ko/yue real-speech sets.
 
 Completes the 5-language head-to-head against hayamimi's production scorecard
-(docs/SCORECARD.md): ja/en were already measured in docs/EVAL_REAL.md
+(docs/results/scorecard.md): ja/en were already measured in docs/eval/eval_real.md
 (iteration #4-5); this script fills in zh, ko, yue using the same scoring
 convention as scripts/eval_engine.py (cer_ja for zh/ko, cer_ja on
 opencc t2s-normalized text for yue), so the two sides are directly

@@ -113,7 +113,7 @@ are consistently faster.
   source repo's numbers.
   **Update**: a from-scratch INT8 requantization of the fp32 file (not the
   broken upstream artifact) was verified functional and measured as part of
-  the mobile-sizing work — see `docs/MOBILE.md`, "Punctuation model INT8"
+  the mobile-sizing work — see `docs/design/mobile_quantization.md`, "Punctuation model INT8"
   section, and `scripts/quantize_punct.py`. It is 74.9% smaller (363.5MB ->
   91.4MB) and ~1.8-2x faster on this PC. A first 15-reference sample
   (TV-news captions) showed no accuracy regression, but a larger
@@ -125,7 +125,7 @@ are consistently faster.
   `PunctuatorJa` **keeps fp32 (`punct_bert.onnx`) as the default**; pass
   `onnx_filename="quantized_ort/punct_bert.int8.onnx"` explicitly if the
   size/speed win is worth the measured recall/F1 cost for a given use
-  case. See `docs/MOBILE.md` for the full comparison table and analysis.
+  case. See `docs/design/mobile_quantization.md` for the full comparison table and analysis.
 - **No streaming/incremental restoration.** `restore()` re-tokenizes and
   re-runs the whole given text each call; it's meant to be called on
   finalized ASR segments (e.g. one call per utterance/segment), not on a

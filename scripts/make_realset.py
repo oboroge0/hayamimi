@@ -42,7 +42,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS_DIR = os.path.join(ROOT, "scripts")
 EVAL_REAL_DIR = os.path.join(ROOT, "testdata", "eval_real")
 MANIFEST_PATH = os.path.join(EVAL_REAL_DIR, "manifest.json")
-DOCS_PATH = os.path.join(ROOT, "docs", "EVAL_REAL.md")
+DOCS_PATH = os.path.join(ROOT, "docs", "eval", "eval_real.md")
 
 sys.path.insert(0, SCRIPTS_DIR)
 
@@ -285,7 +285,7 @@ def write_markdown(results, systems, agg):
         f"**faster-whisper large-v3-turbo** (INT8, CPU) on a small set of "
         f"**real, human-spoken** utterances ({n_ja} Japanese + {n_en} English, "
         f"{total_audio:.1f}s total audio, `testdata/eval_real/`) — as opposed "
-        f"to the TTS-synthesized set in `testdata/eval/` (see `docs/EVAL.md`).\n"
+        f"to the TTS-synthesized set in `testdata/eval/` (see `docs/eval/eval.md`).\n"
     )
     lines.append(
         "## Data sources\n\n"
@@ -333,7 +333,7 @@ def write_markdown(results, systems, agg):
     for name, a in agg.items():
         lines.append(f"| {name} | {a['wer_en']:.4f} | {a['cer_ja']:.4f} | {a['mean_rtf']:.4f} |")
 
-    lines.append("\n## Comparison to the TTS baseline (`docs/EVAL.md`)\n")
+    lines.append("\n## Comparison to the TTS baseline (`docs/eval/eval.md`)\n")
     lines.append(
         "TTS baseline (CER-ja% / WER-en%): Parakeet 9.1/13.7, SenseVoice 8.3/13.0, "
         "Omnilingual 10.3/15.1, Whisper-turbo 8.6/12.2. Real speech is expected to be "

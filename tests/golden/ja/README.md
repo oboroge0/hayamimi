@@ -1,7 +1,7 @@
 # Japanese route golden set
 
 Eight audio clips and the exact text hayamimi's Japanese route produces for
-them. `docs/JA_PIPELINE.md` describes that route in prose so another project
+them. `docs/spec/ja_pipeline.ja.md` describes that route in prose so another project
 can re-implement it; this directory is the part a machine can check.
 
 ## Attribution
@@ -9,7 +9,7 @@ can re-implement it; this directory is the part a machine can check.
 The clips come from **FLEURS** (`google/fleurs`, `ja_jp`), Copyright Google,
 licensed **CC BY 4.0** (<https://creativecommons.org/licenses/by/4.0/>). They
 are copied unmodified from `testdata/fleurs_bench/ja/`, which is the
-benchmark set `docs/BENCHMARKS.md` scores against; the reference text in
+benchmark set `docs/results/benchmarks.md` scores against; the reference text in
 `golden.json` is that set's `manifest.json`, verbatim.
 
 | file | FLEURS id | seconds |
@@ -36,7 +36,7 @@ benchmark set `docs/BENCHMARKS.md` scores against; the reference text in
   numeral is never converted, which is the rule that keeps `一番`/`九州` intact.
 - **`ja_044` records a real failure, on purpose.** Its first sentence
   (`アピアはサモアの首都です`) survives only as `あ。` — the head-dropout
-  `docs/JA_PIPELINE.md` describes, in the form the pre-roll cannot fix
+  `docs/spec/ja_pipeline.ja.md` describes, in the form the pre-roll cannot fix
   because the whole utterance, not just its head, is what the VAD cut short.
   Pinning it means a change that fixes it is visible as a change.
 - **No clip's reference ends in `？`.** All 100 FLEURS ja references were

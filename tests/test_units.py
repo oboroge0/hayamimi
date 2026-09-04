@@ -171,7 +171,7 @@ def test_validated_targets_are_a_subset_of_supported():
 
 
 def test_validated_targets_tier_matches_measured_set():
-    # zh/ko/es have measured chrF (docs/TRANSLATE_M2M.md); an arbitrary M2M-100
+    # zh/ko/es have measured chrF (docs/design/translate_m2m.md); an arbitrary M2M-100
     # target with no measurement (e.g. fr) must stay out of the validated tier.
     assert {"zh", "ko", "es"} <= translate_m2m.VALIDATED_TARGETS
     assert "fr" not in translate_m2m.VALIDATED_TARGETS
@@ -457,7 +457,7 @@ def test_sticky_short_detection_does_not_reset_a_real_candidate():
     assert (pend3, cnt3) == (None, 0)
 
 
-# ---- dual-LID switch confirmation (docs/LID.md) ----------------------------
+# ---- dual-LID switch confirmation (docs/eval/lid.md) ----------------------------
 
 def test_sv_lid_tag_normalizes_bracketed_tag():
     assert asr_engine.sv_lid_tag("<|ja|>") == "ja"
@@ -495,7 +495,7 @@ def test_dual_confirm_holds_current_lang_on_disagreement():
 def test_dual_confirm_switches_immediately_on_agreement():
     # LID.md scenario: whisper-tiny and SenseVoice both say "en" -> switch
     # immediately, no length or repeat-count gate needed (both LIDs agreeing
-    # measured 85-98% accurate at every length in docs/LID.md table 3).
+    # measured 85-98% accurate at every length in docs/eval/lid.md table 3).
     lang, switched = asr_engine.resolve_dual_confirm("en", "ja", 1.0, "en")
     assert lang == "en"
     assert switched is True
@@ -684,7 +684,7 @@ def test_refine_same_lang_is_a_noop():
 
 def test_refine_agreement_below_length_gate_still_does_not_override():
     # Even if whisper-tiny and SenseVoice happen to agree, a sub-2.5s group
-    # doesn't get to override -- docs/LID.md's own curve hasn't separated
+    # doesn't get to override -- docs/eval/lid.md's own curve hasn't separated
     # from noise yet at that length for several languages.
     lang, changed = asr_engine.resolve_refine_lang("ko", "ja", "ja", 2.0)
     assert (lang, changed) == ("ko", False)
@@ -749,7 +749,7 @@ class _FakeRefiner:
         self.spans = []
         self.calls = []
         # add_span() now bumps self.stats.refine_lang_boundary_flushes on a
-        # language-boundary split (docs/DIARIZATION_PLAN.md section 10.6
+        # language-boundary split (docs/design/diarization.md section 10.6
         # diagnostics) -- None mirrors how the real Refiner behaves when
         # constructed without a SessionStats (see Refiner.__init__).
         self.stats = None
@@ -867,7 +867,7 @@ def test_refiner_worker_prints_groups_in_enqueue_order_despite_slower_first_deco
 # ---- one task it explicitly enqueues -----------------------------------
 
 def test_refiner_shutdown_must_drain_full_backlog_not_just_last_task():
-    # Full-pipeline QA (docs/DIARIZATION_PLAN.md section 10) found that a
+    # Full-pipeline QA (docs/design/diarization.md section 10) found that a
     # 10-minute --speakers run silently dropped the meeting's final ~1
     # minute of refine output with no exception and exit code 0. Root
     # cause: realtime_transcribe.py's finish() called

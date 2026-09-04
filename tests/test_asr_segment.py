@@ -1,6 +1,6 @@
 """Guards the head-dropout split RETRY in RoutedASR.transcribe().
 
-Background (docs/BENCHMARKS.md / the FLEURS ja regression): the catalog's
+Background (docs/results/benchmarks.md / the FLEURS ja regression): the catalog's
 offline recognizers can collapse a buffer holding several utterances into a
 single one -- fed a whole multi-sentence clip in one decode_stream() call,
 the ReazonSpeech zipformer returned only the LAST sentence and silently
@@ -339,7 +339,7 @@ def test_live_path_preroll_keeps_utterance_initial_words(capsys):
     behind on this fixture's fast-onset first sentence), so decoding
     vad.front.samples as-is can lose or garble the utterance's first word --
     with the preroll forced to 0, this very clip decoded 資料は→昨日は
-    (docs/BENCHMARKS.md 2026-08-31, live-path verification). The live path
+    (docs/results/benchmarks.md 2026-08-31, live-path verification). The live path
     guards against that by prepending up to PREROLL_S of real context from
     AudioHistory in drain_segments(); this test pins that end-to-end: every
     sentence's initial word must survive the full VAD -> preroll -> decode

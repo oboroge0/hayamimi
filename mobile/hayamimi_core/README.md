@@ -312,7 +312,7 @@ delimited.
 
 The first six knobs were exercised as-is in the on-device session recorded
 in ["Platform status"](#platform-status) below — see
-[`docs/MOBILE.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/MOBILE.md)
+[`docs/design/mobile_quantization.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/design/mobile_quantization.md)
 for the full measurement conditions. `prerollSeconds` came later, from the
 Android emulator run described in the same section.
 
@@ -771,7 +771,7 @@ iPhone 15, int8 ran at **RTF 0.013** (ja zipformer, `modified_beam_search`)
 faster than fp32 anywhere we measured, so on ARM phones int8 is both the
 smallest *and* the fastest choice; there's no speed reason to carry the
 larger fp16/fp32 files. Full measurements and conditions:
-[`docs/MOBILE.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/MOBILE.md),
+[`docs/design/mobile_quantization.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/design/mobile_quantization.md),
 "On-device (iPhone 15) verification".
 
 | profile | models on device | disk | languages |
@@ -889,7 +889,7 @@ If you'd rather manage the files by hand (a CI step, a custom CDN, …),
   and its `vocab.txt` are not on the sherpa-onnx release page — they're a
   local build artifact of `python scripts/quantize_punct.py --variant
   fp16` in the main hayamimi repo, described in
-  [`docs/PUNCT_JA.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/PUNCT_JA.md).
+  [`docs/design/punct_ja.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/design/punct_ja.md).
   There is no `ModelDownloader` entry for it yet — copy both files to
   wherever you pass as `JaPunctuation(modelPath: ..., vocabPath: ...)`, no
   fixed subdirectory required.
@@ -918,13 +918,13 @@ Japanese punctuation model.
 
 What has actually been run where, as of this release — not a claim about
 what *should* work elsewhere. Full write-ups:
-[`docs/MOBILE.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/MOBILE.md)
+[`docs/design/mobile_quantization.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/design/mobile_quantization.md)
 and
-[`docs/IOS_VERIFY.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/IOS_VERIFY.md).
+[`docs/verify/ios.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/verify/ios.md).
 
 | Platform | ASR bench / live mic | Multi-language routing | Remote mode | Japanese punctuation |
 |---|---|---|---|---|
-| **iOS** (real iPhone 15) | **Verified.** Bench RTF 0.013 (ja int8, `modified_beam_search`, single run); Live tab transcribed real mic input end-to-end with no reported heat or UI stutter. | Ran live on-device with real speech switching ja/en; badge-switch accuracy was mixed because the session had multiple people talking in the room, so treat it as "it works," not a clean accuracy number — see `docs/IOS_VERIFY.md` for a cleaner single-speaker retest plan. | **Not attempted** — ruled out of scope by the repo owner for this verification session (the Mac's Wi-Fi IP was outside normal private-LAN ranges); not a known failure. | **Unverified, and refused by default** — see ["Punctuation platform status"](#punctuation-platform-status). |
+| **iOS** (real iPhone 15) | **Verified.** Bench RTF 0.013 (ja int8, `modified_beam_search`, single run); Live tab transcribed real mic input end-to-end with no reported heat or UI stutter. | Ran live on-device with real speech switching ja/en; badge-switch accuracy was mixed because the session had multiple people talking in the room, so treat it as "it works," not a clean accuracy number — see `docs/verify/ios.md` for a cleaner single-speaker retest plan. | **Not attempted** — ruled out of scope by the repo owner for this verification session (the Mac's Wi-Fi IP was outside normal private-LAN ranges); not a known failure. | **Unverified, and refused by default** — see ["Punctuation platform status"](#punctuation-platform-status). |
 | **Android** | **Emulator only.** Load/accuracy validated on an AVD via `sherpa_onnx.dart` (CER 6.19% vs. the PC's 5.50% on the same 15-clip ja set, a +0.69pp gap attributed to onnxruntime kernel differences); RTF from an emulator reflects the *host PC's* CPU under virtualization, not a phone, so it isn't a real-device number. The **decode worker isolate** is verified on an x86_64 emulator (API 35): it spawned, initialized the sherpa-onnx bindings and built every model inside itself, decoded across the isolate boundary for a whole session, and was torn down and rebuilt three times in one process without a crash. **A real Android device has not been used for this package.** | Validated via manifest batch eval on the emulator only; the live-mic path has not been run on Android at all (only on iOS — see the iOS column). `RoutingProfile.jaSenseVoice` was **not exercised** in the emulator run below, which ran `jaOnly`. | Not covered by an Android-specific verification pass. | **Verified on an x86_64 emulator** (API 35): ja refines came back `punctuated: true` with 。 at the same sentence ends as the Python reference, and a control run without a punctuation model gave `punctuated: false`. **Not run on a physical ARM device**; see ["Punctuation platform status"](#punctuation-platform-status). |
 | **Windows** (desktop host) | Not a supported target platform for this package (see `pubspec.yaml`'s `platforms:`) — used only to run this repo's own `flutter analyze`/`flutter test` gates and the punctuation parity test below. | n/a | n/a | **Verified** — parity with the Python reference on 51 recorded cases (`flutter test`). |
 | **macOS / Linux** | Not a supported target platform for this package. | n/a | n/a | Would need an explicit `libraryPath`; not exercised. |
@@ -938,7 +938,7 @@ least transferable of all: ONNX Runtime's CPU provider has no float16
 compute path on x86 and casts to float32 and back on every operator, which
 an ARM chip with a float16 vector unit does not do. Full write-up, including
 how the models were placed and what was and wasn't exercised, in
-[`docs/MOBILE.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/MOBILE.md).
+[`docs/verify/android_emulator.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/verify/android_emulator.md).
 
 These are the **second** emulator run (two processes, ten sessions,
 `modified_beam_search`, `numThreads` 2), on the VAD and pre-roll defaults
