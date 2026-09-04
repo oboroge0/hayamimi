@@ -1,7 +1,8 @@
 """Print hayamimi's Japanese-route configuration as JSON.
 
-Why this exists: docs/spec/ja_pipeline.ja.md specifies the ja route precisely enough
-for another project to re-implement it (a C++ Godot GDExtension over
+Why this exists: docs/spec/ja_pipeline.md (Japanese: docs/spec/ja_pipeline.ja.md)
+specifies the ja route precisely enough for another project to re-implement
+it (a C++ Godot GDExtension over
 sherpa-onnx, at the time of writing). A document drifts away from the code
 that it describes; this script reads the configuration out of the code
 itself, and tests/test_ja_pipeline_spec.py compares its output against the
@@ -211,7 +212,7 @@ def build_spec(with_models: bool, models_dir: str) -> dict:
         .isoformat()
         .replace("+00:00", "Z"),
         "schema_version": SCHEMA_VERSION,
-        "describes": "docs/spec/ja_pipeline.ja.md",
+        "describes": "docs/spec/ja_pipeline.md",
         "config": build_config(),
     }
     if with_models:
