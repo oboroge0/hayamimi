@@ -24,8 +24,8 @@ English: [README.md](README.md)
 | 文書 | 言語 | 種別 | 内容 |
 |---|---|---|---|
 | [`guide/embedding.md`](guide/embedding.md) / [`guide/embedding.ja.md`](guide/embedding.ja.md) | en / ja | 結論 | Pythonエンジンを自分のアプリから動かす方法。importできる部品、構造化イベントの一覧、`POST /config`、`POST /reset`。 |
-| [`../mobile/hayamimi_core/README.md`](../mobile/hayamimi_core/README.md) | en | 結論 | Flutter/Dartパッケージのガイド。初期化、モデル配置、実行時設定、スレッドモデル、プラットフォーム状況。 |
-| [`spec/ja_pipeline.ja.md`](spec/ja_pipeline.ja.md) | ja | 結論 | 他言語で再実装できる粒度まで書いた日本語経路の仕様。英訳は未着手。 |
+| [`../mobile/hayamimi_core/README.md`](../mobile/hayamimi_core/README.md) / [`../mobile/hayamimi_core/README.ja.md`](../mobile/hayamimi_core/README.ja.md) | en / ja | 結論 | Flutter/Dartパッケージのガイド。初期化、モデル配置、実行時設定、スレッドモデル、プラットフォーム状況。 |
+| [`spec/ja_pipeline.md`](spec/ja_pipeline.md) / [`spec/ja_pipeline.ja.md`](spec/ja_pipeline.ja.md) | en / ja | 結論 | 他言語で再実装できる粒度まで書いた日本語経路の仕様。 |
 | [`spec/ja_pipeline_spec.json`](spec/ja_pipeline_spec.json) | — | 結論 | 同じ設定の機械可読版。`scripts/dump_ja_config.py`が生成し、`tests/test_ja_pipeline_spec.py`が差分を見るので、仕様とコードが黙って乖離しない。 |
 
 ## 調整する
@@ -121,7 +121,7 @@ English: [README.md](README.md)
 | `docs/TRANSLATE_M2M.md` | [`docs/design/translate_m2m.md`](design/translate_m2m.md) |
 | `docs/MOBILE.md` | 分割: [`docs/design/mobile_quantization.md`](design/mobile_quantization.md) + [`docs/verify/android_emulator.md`](verify/android_emulator.md) |
 | `docs/IOS_VERIFY.md` | [`docs/verify/ios.md`](verify/ios.md) |
-| `docs/JA_PIPELINE.md` | [`docs/spec/ja_pipeline.ja.md`](spec/ja_pipeline.ja.md) |
+| `docs/JA_PIPELINE.md` | [`docs/spec/ja_pipeline.md`](spec/ja_pipeline.md) |
 | `docs/ja_pipeline_spec.json` | [`docs/spec/ja_pipeline_spec.json`](spec/ja_pipeline_spec.json) |
 | `README.md`の「Embedding in another app」「Embedding: runtime control and structured events」 | [`docs/guide/embedding.md`](guide/embedding.md) |
 | `README.ja.md`の「他アプリへの組み込み」「組み込み: 実行時制御と構造化イベント」 | [`docs/guide/embedding.ja.md`](guide/embedding.ja.md) |

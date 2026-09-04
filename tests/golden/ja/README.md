@@ -1,8 +1,9 @@
 # Japanese route golden set
 
 Eight audio clips and the exact text hayamimi's Japanese route produces for
-them. `docs/spec/ja_pipeline.ja.md` describes that route in prose so another project
-can re-implement it; this directory is the part a machine can check.
+them. `docs/spec/ja_pipeline.md` (Japanese: `docs/spec/ja_pipeline.ja.md`)
+describes that route in prose so another project can re-implement it; this
+directory is the part a machine can check.
 
 ## Attribution
 
@@ -36,7 +37,7 @@ benchmark set `docs/results/benchmarks.md` scores against; the reference text in
   numeral is never converted, which is the rule that keeps `一番`/`九州` intact.
 - **`ja_044` records a real failure, on purpose.** Its first sentence
   (`アピアはサモアの首都です`) survives only as `あ。` — the head-dropout
-  `docs/spec/ja_pipeline.ja.md` describes, in the form the pre-roll cannot fix
+  `docs/spec/ja_pipeline.md` describes, in the form the pre-roll cannot fix
   because the whole utterance, not just its head, is what the VAD cut short.
   Pinning it means a change that fixes it is visible as a change.
 - **No clip's reference ends in `？`.** All 100 FLEURS ja references were
