@@ -98,7 +98,7 @@ happens automatically as part of `flutter build`/`flutter run`.
 
 For a full, step-by-step run-through of getting this app onto a physical
 iPhone with free Apple ID signing, pushing model files onto the device, and
-a verification checklist, see [`docs/IOS_VERIFY.md`](../docs/IOS_VERIFY.md).
+a verification checklist, see [`docs/verify/ios.md`](../docs/verify/ios.md).
 
 ## Where to put the model and test audio
 

@@ -1,6 +1,6 @@
 # ASR Accuracy Evaluation — Real Speech (Chinese + Korean)
 
-Comparison of **SenseVoice** (multilingual), **Omnilingual** (multilingual, no lang hint), and a **dedicated per-language model** on a small set of **real, human-spoken** utterances (12 Mandarin Chinese + 12 Korean, 169.0s total audio, `testdata/eval_real_zhko/`). Goal: determine whether swapping SenseVoice for a dedicated per-language model is worthwhile for zh and ko, mirroring the existing ja/en real-speech comparison in `docs/EVAL_REAL.md`.
+Comparison of **SenseVoice** (multilingual), **Omnilingual** (multilingual, no lang hint), and a **dedicated per-language model** on a small set of **real, human-spoken** utterances (12 Mandarin Chinese + 12 Korean, 169.0s total audio, `testdata/eval_real_zhko/`). Goal: determine whether swapping SenseVoice for a dedicated per-language model is worthwhile for zh and ko, mirroring the existing ja/en real-speech comparison in `docs/eval/eval_real.md`.
 
 ## Data source
 

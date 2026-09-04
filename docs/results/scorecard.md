@@ -16,7 +16,7 @@
 他言語は朗読系データでの計測であり、性質が異なる。再生成手順は
 `scripts/make_realset.py` / `make_realset_zhko.py` / `make_realset_yue.py`(各スクリプト
 冒頭に取得元の詳細あり)。標準ベンチ一本での5言語比較は FLEURS 統一計測
-(`docs/BENCHMARKS.md` 2026-09-01節)を参照。
+(`docs/results/benchmarks.md` 2026-09-01節)を参照。
 
 | lang | clips | LID正解 | 主tier | mean err | mean RTF |
 |---|---|---|---|---|---|

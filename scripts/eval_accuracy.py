@@ -34,7 +34,7 @@ import soundfile as sf
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EVAL_DIR = os.path.join(ROOT, "testdata", "eval")
 MANIFEST_PATH = os.path.join(EVAL_DIR, "manifest.json")
-DOCS_PATH = os.path.join(ROOT, "docs", "EVAL.md")
+DOCS_PATH = os.path.join(ROOT, "docs", "eval", "eval.md")
 
 MODEL_JA_DIR = os.path.join(ROOT, "models", "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8")
 MODEL_EN_DIR = os.path.join(ROOT, "models", "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8")

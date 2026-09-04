@@ -1,7 +1,7 @@
 """Two-stage constrained agglomerative re-clustering -- shared pure logic.
 
 Originally written inline in eval_diar_overlap.py (Round 6,
-docs/DIARIZATION_PLAN.md section 16) to solve a very concrete problem: naive
+docs/design/diarization.md section 16) to solve a very concrete problem: naive
 single-stage agglomerative clustering of window-local speaker embeddings
 produced a "dendrogram cliff" (threshold 0.7 -> 14 speakers, 0.9 -> 2
 speakers, nothing usable in between) because embeddings built from under a
@@ -10,7 +10,7 @@ speakers. The fix: only embeddings with enough *reliable* (clean, minimum-
 duration) speech take part in the agglomerative merge; everything else is
 assigned afterward to whichever resulting centroid it is closest to.
 
-Round 7 (docs/DIARIZATION_PLAN.md section 17) reuses this exact algorithm for
+Round 7 (docs/design/diarization.md section 17) reuses this exact algorithm for
 a different accumulation granularity -- refine-group local clusters instead
 of sliding-window local speakers -- via eval_diar.py's --global-recluster and
 realtime_transcribe.py's --speaker-global-recluster. This module is the
@@ -24,8 +24,8 @@ entirely) never built a per-cluster embedding in the first place, so it kept
 its fast-path label forever and never entered the re-cluster pool -- the
 session split into two disconnected label spaces (re-clustered vs.
 untouched) and the same real speaker could land in either one depending on
-which space their groups happened to fall into. Round 8 (docs/
-DIARIZATION_PLAN.md section 18) T1 closes that gap: every accumulation site
+which space their groups happened to fall into. Round 8 (docs/design/
+diarization.md section 18) T1 closes that gap: every accumulation site
 now also embeds a *group-level* representative for a single-speaker/declined
 group (pool_audio_for_group() below picks the audio), so every refine
 group -- not just the multi-cluster ones -- contributes exactly one entry to
@@ -38,7 +38,7 @@ def pool_audio_for_group(buf: np.ndarray, sr: int, turns: list,
                          g_start: int | None = None, g_end: int | None = None):
     """Pick the audio + duration to embed for a refine group's re-cluster
     pool contribution, when the group is single-speaker or the local
-    diarizer declined (Round 8, docs/DIARIZATION_PLAN.md section 18 T1).
+    diarizer declined (Round 8, docs/design/diarization.md section 18 T1).
 
     turns: list of (local_id, start, end) tuples ALREADY FILTERED to the
     diarizer's own >=0.3s (or equivalent MIN_TURN_S) speech turns, in the

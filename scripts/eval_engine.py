@@ -24,7 +24,7 @@ from eval_accuracy import cer_ja, wer_en
 from eval_common import load_manifest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DOCS_PATH = os.path.join(ROOT, "docs", "SCORECARD.md")
+DOCS_PATH = os.path.join(ROOT, "docs", "results", "scorecard.md")
 
 MANIFESTS = [
     ("testdata/eval_real", None),        # ja + en

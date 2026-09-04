@@ -1,7 +1,7 @@
-"""docs/ja_pipeline_spec.json must keep describing the code it came from.
+"""docs/spec/ja_pipeline_spec.json must keep describing the code it came from.
 
-The Japanese route is specified for re-implementation in docs/JA_PIPELINE.md,
-with the numbers in machine-readable form in docs/ja_pipeline_spec.json. Both
+The Japanese route is specified for re-implementation in docs/spec/ja_pipeline.ja.md,
+with the numbers in machine-readable form in docs/spec/ja_pipeline_spec.json. Both
 are only worth anything while they still match `scripts/`, so this is the
 drift check: re-run the dump and compare.
 
@@ -15,7 +15,7 @@ Two halves, because they need different things on disk:
 
 Regenerate after an intentional change:
 
-    python scripts/dump_ja_config.py --with-models --out docs/ja_pipeline_spec.json
+    python scripts/dump_ja_config.py --with-models --out docs/spec/ja_pipeline_spec.json
 """
 
 import json
@@ -25,7 +25,7 @@ import sys
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SPEC_PATH = os.path.join(ROOT, "docs", "ja_pipeline_spec.json")
+SPEC_PATH = os.path.join(ROOT, "docs", "spec", "ja_pipeline_spec.json")
 MODELS_DIR = os.path.join(ROOT, "models")
 
 # Deliberately NOT imported at module scope: scripts/dump_ja_config.py pulls
@@ -53,15 +53,15 @@ def test_spec_file_exists_and_declares_its_generator():
 
 
 def test_config_matches_the_live_dump():
-    """The whole point: docs/ja_pipeline_spec.json's `config` block is what
+    """The whole point: docs/spec/ja_pipeline_spec.json's `config` block is what
     scripts/ currently says, not what it said when someone wrote it down."""
     committed = _spec()["config"]
     live = _dump()["config"]
     assert live == committed, (
-        "docs/ja_pipeline_spec.json is stale. Regenerate it with\n"
+        "docs/spec/ja_pipeline_spec.json is stale. Regenerate it with\n"
         "  python scripts/dump_ja_config.py --with-models "
-        "--out docs/ja_pipeline_spec.json\n"
-        "and update docs/JA_PIPELINE.md to match."
+        "--out docs/spec/ja_pipeline_spec.json\n"
+        "and update docs/spec/ja_pipeline.ja.md to match."
     )
 
 
@@ -80,7 +80,7 @@ def test_dump_needs_no_models_directory():
 def test_model_hashes_match_when_models_are_present():
     committed = _spec().get("models")
     if not committed:
-        pytest.skip("docs/ja_pipeline_spec.json carries no model hashes")
+        pytest.skip("docs/spec/ja_pipeline_spec.json carries no model hashes")
     live = _dump(with_models=True)["models"]
     missing = [k for k, v in live.items()
                if isinstance(v, dict) and not v.get("present")]
@@ -88,5 +88,5 @@ def test_model_hashes_match_when_models_are_present():
         pytest.skip(f"ja-route model files not installed: {missing}")
     assert live == committed, (
         "the ja-route model files on disk differ from the ones "
-        "docs/ja_pipeline_spec.json was generated from"
+        "docs/spec/ja_pipeline_spec.json was generated from"
     )

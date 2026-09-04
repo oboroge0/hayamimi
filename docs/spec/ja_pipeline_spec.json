@@ -2,7 +2,7 @@
   "generated_by": "scripts/dump_ja_config.py",
   "generated_at": "2026-09-02T05:32:08Z",
   "schema_version": 1,
-  "describes": "docs/JA_PIPELINE.md",
+  "describes": "docs/spec/ja_pipeline.ja.md",
   "config": {
     "route": {
       "forced_lang": "ja",

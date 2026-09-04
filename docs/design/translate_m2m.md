@@ -25,7 +25,7 @@ Constructing a `TranslatorM2M` for a target outside that set still works,
 but prints:
 
 ```
-note: 'fr' is an unvalidated translation target (quality not yet measured; see docs/TRANSLATE_M2M.md)
+note: 'fr' is an unvalidated translation target (quality not yet measured; see docs/design/translate_m2m.md)
 ```
 
 to stderr. `BEAM_SIZE_BY_TARGET` similarly only has tuned entries for zh/ko/en;
@@ -182,7 +182,7 @@ once (`~0.5s` load time per target), per-line `time.perf_counter()` around
 **ko mean: 309 ms/line** (min 267 ms, max 375 ms).
 
 This is well above Mojicast's reported 115 ms (zh) / 167 ms (ko) per line --
-the same pattern seen in `docs/TRANSLATE.md` for the ja-en module (203 ms
+the same pattern seen in `docs/design/translate.md` for the ja-en module (203 ms
 here vs. their 19 ms). Likely the same causes: different CPU/thread
 configuration, no per-call CTranslate2 tuning (`inter_threads`/
 `intra_threads`) applied yet, and this machine simply being slower per-call

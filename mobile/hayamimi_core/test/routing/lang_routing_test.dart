@@ -3,7 +3,7 @@ import 'package:hayamimi_core/routing/lang_routing.dart';
 
 /// Ported test cases from `tests/test_units.py` (desktop `asr_engine.py`),
 /// so the Dart routing logic stays behaviorally identical to the PC
-/// pipeline's dual-LID policy documented in `docs/LID.md`.
+/// pipeline's dual-LID policy documented in `docs/eval/lid.md`.
 void main() {
   group('svLidTag', () {
     test('normalizes bracketed tag', () {

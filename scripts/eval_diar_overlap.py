@@ -1,6 +1,6 @@
 """Overlap-aware diarization PROTOTYPE + DER scoring (Round 6, eval-only).
 
-docs/DIARIZATION_PLAN.md section 16. This is a measurement tool, not a
+docs/design/diarization.md section 16. This is a measurement tool, not a
 production path: nothing in realtime_transcribe.py / diarize.py calls it.
 
 Why it exists
@@ -133,7 +133,7 @@ def load_segmentation(num_threads: int = 4):
     return sess
 
 
-# Round 9 Experiment B (docs/DIARIZATION_PLAN.md section 20): class indices
+# Round 9 Experiment B (docs/design/diarization.md section 20): class indices
 # grouped by how many speakers each powerset entry represents, precomputed
 # once so powerset_decode()'s gate doesn't rebuild these lists every call.
 _PAIR_CLASSES = [i for i, spk in enumerate(POWERSET) if len(spk) == 2]
@@ -148,7 +148,7 @@ def powerset_decode(logits: np.ndarray, pair_gate: float | None = None) -> np.nd
     speakers. That set may contain two speakers -- which is precisely the
     information sherpa-onnx's ExcludeOverlap() throws away (section 14).
 
-    pair_gate (Round 9 Experiment B, docs/DIARIZATION_PLAN.md section 20):
+    pair_gate (Round 9 Experiment B, docs/design/diarization.md section 20):
     None (default) is Round 6's original unconditional behavior -- the plain
     argmax's pick is used as-is, whether it's a pair class or not. Round 6
     found this way overlap emission's own net contribution was small and
@@ -203,7 +203,7 @@ def segment_windows(samples: np.ndarray, sess, hop_samples: int, batch: int = 8,
     combined later).
 
     pair_gate is passed straight through to powerset_decode() -- see its
-    docstring (Round 9 Experiment B, docs/DIARIZATION_PLAN.md section 20).
+    docstring (Round 9 Experiment B, docs/design/diarization.md section 20).
     """
     assert hop_samples % FRAME_SHIFT == 0, hop_samples
     starts = list(range(0, max(len(samples) - WINDOW_SAMPLES, 0) + 1, hop_samples))
@@ -337,7 +337,7 @@ def diarize_overlap(wav_path: str, hop_s: float = DEFAULT_HOP_S,
     clustering threshold -- only step 4-5 (cluster + aggregate) is repeated
     per threshold, which is what makes the sweep cheap.
 
-    pair_gate (Round 9 Experiment B, docs/DIARIZATION_PLAN.md section 20):
+    pair_gate (Round 9 Experiment B, docs/design/diarization.md section 20):
     passed straight through to segment_windows()/powerset_decode() -- unlike
     `thresholds`, this changes step 1-2 (which frames get called "overlap" in
     the first place), so it is NOT free to sweep: a different pair_gate needs
@@ -478,7 +478,7 @@ def main():
     ap.add_argument("--linkage", default="average", choices=["average", "complete", "single"],
                     help="scipy linkage method for the cross-window clustering")
     ap.add_argument("--pair-gate", type=float, default=None, metavar="P",
-                    help="Round 9 (docs/DIARIZATION_PLAN.md section 20) Experiment B: only "
+                    help="Round 9 (docs/design/diarization.md section 20) Experiment B: only "
                          "treat a frame as overlap (2 simultaneous window-local speakers) when "
                          "the powerset pair-class posterior argmax picked is >= this probability "
                          "(0-1); below it, the frame is re-decided among the empty-set/single- "

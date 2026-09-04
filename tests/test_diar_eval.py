@@ -208,7 +208,7 @@ def test_group_segments_empty_input():
     assert group_segments([], SR, group_gap_s=2.0, group_max_s=25.0) == []
 
 
-# ---- eval-vs-production grouping divergence (docs/DIARIZATION_PLAN.md ------
+# ---- eval-vs-production grouping divergence (docs/design/diarization.md ------
 # section 10.6/10.8 root-cause investigation) --------------------------------
 
 class _FakeAsrForGrouping:
@@ -226,7 +226,7 @@ class _FakeAsrForGrouping:
 
 
 def test_production_over_splits_relative_to_eval_replica_on_a_skipped_vad_segment():
-    """docs/DIARIZATION_PLAN.md section 10.6 found the full production
+    """docs/design/diarization.md section 10.6 found the full production
     pipeline (--speakers) reaching far more global speaker labels (S1..S13
     on ES2011a) than eval_diar.py's --method refine_diarize DER hypothesis
     for the identical audio (4-5). Section 10.8 traces one concrete,

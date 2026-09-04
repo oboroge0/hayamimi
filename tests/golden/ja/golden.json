@@ -1,6 +1,6 @@
 {
   "_generated_by": "scripts/make_ja_golden.py",
-  "_purpose": "Pinned output of hayamimi's Japanese route (docs/JA_PIPELINE.md) on eight FLEURS ja clips. tests/test_ja_golden.py re-runs the pipeline and compares; see tests/golden/ja/README.md for the exact-match / CER two-level rule.",
+  "_purpose": "Pinned output of hayamimi's Japanese route (docs/spec/ja_pipeline.ja.md) on eight FLEURS ja clips. tests/test_ja_golden.py re-runs the pipeline and compares; see tests/golden/ja/README.md for the exact-match / CER two-level rule.",
   "_source": "FLEURS (google/fleurs, ja_jp), Copyright Google, licensed CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/). Clips copied unmodified from testdata/fleurs_bench/ja/; the reference text is that set's manifest.json.",
   "_recorded_on": {
     "date": "2026-09-02",

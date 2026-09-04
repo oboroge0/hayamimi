@@ -8,7 +8,7 @@ ReazonSpeech zipformer に VAD が切り出した音声区間をそのまま渡�
 
 原因は認識器ではなく、その手前の VAD にある。Silero VAD は「音声が始まった」と
 判定するまでに遅れがあり、`testdata/multi_sentence_ja.wav` の 1 文目では真の
-発話開始より **198ms 遅れて** 区間を開始していた（docs/BENCHMARKS.md
+発話開始より **198ms 遅れて** 区間を開始していた（docs/results/benchmarks.md
 2026-08-31 のライブ経路検証）。その結果、区間の先頭が語頭の子音を切り落とした
 状態で認識器に入り、zipformer は最初の語をそもそも出力しない。
 
@@ -234,7 +234,7 @@ pre-roll が 1.0 秒未満なのは、`with_preroll` が直前の区間の終端
 
 - **各クリップの発話区間 1 つだけ**しか測っていない。2 番目以降の区間の冒頭に
   ついては何も言えない（`multi_sentence_ja.wav` の 3 区間分だけが例外）。
-- **FLEURS は朗読音声**であり、放送・実況・雑談ではない。docs/EVAL_REAL.md 系の
+- **FLEURS は朗読音声**であり、放送・実況・雑談ではない。docs/eval/eval_real.md 系の
   実素材で同じ率になる保証はない。
 - **リアルタイム性は測っていない。** `mean ms` はオフラインの壁時計デコード時間
   で、live 経路のレイテンシ（VAD 終端検出待ちを含む）ではない。

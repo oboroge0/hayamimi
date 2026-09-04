@@ -127,7 +127,7 @@ produced `.int8.onnx` files wouldn't load the same way on mobile — this has
 only been verified on desktop CPU") by actually running the shipped
 `.int8.onnx` files through `sherpa_onnx.dart` on an Android emulator
 (`hayamimi_test` AVD, x86_64, API level matching `mobile/android`) and
-scoring the output against the same PC baseline docs/EVAL_REAL.md and this
+scoring the output against the same PC baseline docs/eval/eval_real.md and this
 document use.
 
 **Speed caveat, stated once and applying to every number below**: the
@@ -220,7 +220,7 @@ tab (`mobile/`) on a physical iPhone 15 (iOS 27.0 beta), zipformer
 full_int8, `modified_beam_search`, model pushed to `Documents/model/` and
 `Documents/test.wav` (`test_ja_1.wav` from the ReazonSpeech release's
 `test_wavs/`) via `xcrun devicectl device copy to` — see
-`docs/IOS_VERIFY.md` for the setup steps.
+`docs/verify/ios.md` for the setup steps.
 
 | environment | RTF (ja int8, `modified_beam_search`) | notes |
 |---|---|---|
@@ -267,12 +267,12 @@ failure.
 
 Second mobile-sizing target: the ja punctuation-restoration BERT-char model
 behind `scripts/punct_ja.py` (`models/mojicast-punct-onnx/punct_bert.onnx`,
-see `docs/PUNCT_JA.md` for the model/architecture background), quantized and
+see `docs/design/punct_ja.md` for the model/architecture background), quantized and
 evaluated with `scripts/quantize_punct.py`.
 
 ### Background: the upstream INT8 file is broken here
 
-`docs/PUNCT_JA.md` already documents that the INT8 file the upstream Mojicast
+`docs/design/punct_ja.md` already documents that the INT8 file the upstream Mojicast
 HF repo ships (`punct_bert.int8.onnx`) was found non-functional in this
 environment (onnxruntime 1.29.0, CPU EP, Windows): its logits were nearly
 constant and didn't track the input at all, so `punct_ja.py` was hard-coded
@@ -349,7 +349,7 @@ fp32 here, with no regression observed.
 Unlike the ReazonSpeech encoder above (where dynamic INT8 was *slower* than
 fp32 on this PC's MLAS path), this BERT-char model's INT8 export is
 **~2x faster** here, consistent with the ~11ms/5ms fp32/int8 numbers the
-upstream Mojicast repo itself cites (`docs/PUNCT_JA.md`) — this model's
+upstream Mojicast repo itself cites (`docs/design/punct_ja.md`) — this model's
 matmul-heavy transformer shape apparently does hit onnxruntime's INT8
 fast path on this build, even though the ASR transducer's conv/GEMM mix
 didn't. Model load time is also roughly halved. As with the ASR result,
@@ -565,7 +565,7 @@ preprocessing step — neither is yet pinned in `requirements.txt`.
 
 ## Multi-language routing on mobile
 
-Ports the desktop pipeline's dual-LID routing policy (`docs/LID.md`,
+Ports the desktop pipeline's dual-LID routing policy (`docs/eval/lid.md`,
 `scripts/asr_engine.py`'s `resolve_dual_confirm`/`resolve_sticky_lang`/
 `sv_lid_tag`) to Dart, so the mobile Live screen can switch between
 languages per VAD segment instead of running a single fixed-language model
@@ -585,7 +585,7 @@ this profile needs combined. So mobile ships **2 tiers**:
   path (`modified_beam_search`, matches `scripts/asr_engine.py::_build_reazon`).
 - **en/zh/ko/yue** → SenseVoice small, which already covers all four in one
   model (its own internal LID arbitrates between them at decode time). No
-  dedicated Paraformer-zh tier either — the desktop docs/EVAL_REAL_ZHKO.md
+  dedicated Paraformer-zh tier either — the desktop docs/eval/eval_real_zhko.md
   win for zh (Paraformer 5.6% CER vs SenseVoice 7.5%) doesn't justify a
   third model on a phone; SenseVoice's zh output is used as-is.
 
@@ -656,7 +656,7 @@ task — see "Open items" below).
   `manifest.json` through `RoutedRecognizerSet`, treating each clip as an
   independent bootstrap "session" (manifest clips are isolated recordings,
   not a continuous conversation, so this measures the harder bootstrap
-  dual-LID path specifically — `docs/LID.md` table 3's "一致時正解率" is
+  dual-LID path specifically — `docs/eval/lid.md` table 3's "一致時正解率" is
   the relevant comparison). Each result gains a `detectedLang` field
   alongside the existing `hyp`/`ref`, so both language-routing accuracy and
   per-language CER can be scored. `mobile/lib/main.dart`'s Bench tab gained
@@ -677,17 +677,17 @@ meaningful here.
 **Sample**: 20 clips — the first 5 of each language from `testdata/eval_real`
 (ja, en) and `testdata/eval_real_zhko` (zh, ko), 127.8s of audio total. This
 is a **quarter to a third** of the 12-15-clip-per-language samples
-`docs/SCORECARD.md`'s PC numbers use, so treat deltas as indicative, not
+`docs/results/scorecard.md`'s PC numbers use, so treat deltas as indicative, not
 conclusive — the task's own reproduction budget capped it at ~20 clips
 rather than the full 54-clip PC set.
 
 Scored with the same functions the PC pipeline uses:
 `scripts/eval_accuracy.py`'s `cer_ja` (NFKC-normalized, punctuation/
 whitespace-stripped, character-level Levenshtein) for ja/zh/ko, `wer_en`
-(word-level, `jiwer`) for en — the same split `docs/SCORECARD.md` and
-`docs/EVAL_REAL_ZHKO.md` use.
+(word-level, `jiwer`) for en — the same split `docs/results/scorecard.md` and
+`docs/eval/eval_real_zhko.md` use.
 
-| lang | clips | LID正解 (mobile) | mean err (mobile) | mean err (PC, `docs/SCORECARD.md`) | mean RTF (mobile, informational) |
+| lang | clips | LID正解 (mobile) | mean err (mobile) | mean err (PC, `docs/results/scorecard.md`) | mean RTF (mobile, informational) |
 |---|---|---|---|---|---|
 | ja | 5 | 4/5 | 0.320 (CER) | 0.075 (CER) | 0.093 |
 | en | 5 | 5/5 | 0.017 (WER) | 0.023 (WER) | 0.062 |
@@ -710,7 +710,7 @@ whisper-tiny and SenseVoice's own LID agreed on "zh" for this clip
 -LID policy did exactly what it's designed to do given two wrong-but
 -agreeing signals), so the session routed to SenseVoice and decoded
 Chinese-script garbage (`飞卡皮卡追卡。`) against the ja CER scorer, i.e.
-CER 1.0 for that one clip. `docs/LID.md`'s own curves already show ja as
+CER 1.0 for that one clip. `docs/eval/lid.md`'s own curves already show ja as
 one of the two languages (with ko) that whisper-tiny-alone LID never
 reaches 95% accuracy on within the 7s window; this is a live instance of
 that documented weak spot, on an utterance that's unusually
@@ -729,7 +729,7 @@ wrong language's model, correctly, given what both LIDs agreed on."
 #### en: not worse than PC despite dropping the dedicated tier — read this with the sample-size caveat
 
 The task brief expected mobile's en number to come in **worse** than
-`docs/SCORECARD.md`'s PC value (WER 2.3%, `v3`/Parakeet-TDT-v3 tier),
+`docs/results/scorecard.md`'s PC value (WER 2.3%, `v3`/Parakeet-TDT-v3 tier),
 since mobile drops that dedicated tier and routes en through SenseVoice
 instead (see the model-catalog decision above). On this 5-clip sample it
 did not: mobile's SenseVoice-routed en scored WER **1.7%**, nominally
@@ -767,7 +767,7 @@ n=5 vs PC's n=12, plus this 5-clip subset happening to include two
 harder items, `ko_04`'s Latin-script name "Gibson" mixed into Korean text
 and `ko_05`'s off-by-one-syllable start). No clip decoded garbled or
 wrong-language text; every error is an ordinary ASR substitution/
-insertion/deletion, consistent with `docs/EVAL_REAL_ZHKO.md`'s per-clip
+insertion/deletion, consistent with `docs/eval/eval_real_zhko.md`'s per-clip
 SenseVoice CER range (0.000-0.242) for the same models on the fuller
 12-clip set.
 
@@ -816,7 +816,7 @@ SenseVoice CER range (0.000-0.242) for the same models on the fuller
   language-badge accuracy isn't a clean single-speaker number — a quieter
   retest would be needed before trusting it as a routing-accuracy figure.
 - The 20-clip on-device sample above (5 per language) is a quarter to a
-  third of `docs/SCORECARD.md`'s 12-15-clip-per-language PC sample; the
+  third of `docs/results/scorecard.md`'s 12-15-clip-per-language PC sample; the
   en result in particular (mobile nominally *beating* PC's dedicated v3
   tier) should not be read as "dropping the v3 tier is free" — see the en
   subsection above. A larger on-device run (the full `eval_real`/

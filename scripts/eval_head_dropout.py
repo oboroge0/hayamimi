@@ -4,7 +4,7 @@ countermeasure prevents it.
 Head dropout = the decode of a VAD speech segment loses the utterance's
 leading characters. Silero's speech-start detection lags the true onset
 (measured ~198ms behind on testdata/multi_sentence_ja.wav's first sentence,
-docs/BENCHMARKS.md 2026-08-31), so a segment handed to the recognizer as-is
+docs/results/benchmarks.md 2026-08-31), so a segment handed to the recognizer as-is
 can begin mid-phoneme and the zipformer never emits the first word.
 
 This script reproduces the live path's VAD exactly (realtime_transcribe's
