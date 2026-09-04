@@ -941,3 +941,62 @@ def test_refiner_shutdown_must_drain_full_backlog_not_just_last_task():
     # and there is exactly one persistent worker thread, not one per call
     worker_threads = [t for t in threading.enumerate() if t is refiner._worker_thread]
     assert len(worker_threads) == 1
+
+
+def _omni_safety_net_stub(omni_available: bool):
+    """RoutedASR stub for the empty-specialist safety net in transcribe():
+    --mode single (forced ja), the ja route returns nothing, and the only
+    question is what happens when the omni fallback is or is not installed."""
+    asked = []
+
+    class _Stub:
+        forced_lang = "ja"
+        dual_confirm = False
+        last_lang = None
+        _pending_lang = None
+        _pending_count = 0
+        _unavailable = set() if omni_available else {"omni"}
+        _itn_overrides = asr_engine.itn_cjk.EMPTY_OVERRIDES
+        ko_spacer = None
+        punct = None
+        _looks_truncated = staticmethod(asr_engine.RoutedASR._looks_truncated)
+
+        def _get(self, name):
+            asked.append(name)
+            if name in self._unavailable:
+                raise asr_engine.ModelUnavailable(name)
+            return f"<{name}>"
+
+        def _route(self, lang):
+            assert lang == "ja"
+            return ("<rz>", "rz")
+
+        def _decode(self, rec, samples, sample_rate):
+            return "omni text" if rec == "<omni>" else ""
+
+        def _replace(self, text):
+            return text
+
+    return _Stub(), asked
+
+
+def test_empty_specialist_falls_through_to_omni_when_installed():
+    stub, asked = _omni_safety_net_stub(omni_available=True)
+    result = asr_engine.RoutedASR.transcribe(
+        stub, np.zeros(16000, dtype=np.float32), 16000, live=True)
+    assert asked == ["omni"]
+    assert result["text"] == "omni text"
+    assert result["tier"] == "omni"
+
+
+def test_empty_specialist_stays_empty_on_a_minimal_install():
+    """A minimal install has no omni model. The safety net must degrade to
+    the specialist's empty result (a non-speech line, dropped by the caller)
+    instead of letting ModelUnavailable escape -- on 2026-09-04 that escape
+    took the whole live process down mid-stream on the first empty decode."""
+    stub, asked = _omni_safety_net_stub(omni_available=False)
+    result = asr_engine.RoutedASR.transcribe(
+        stub, np.zeros(16000, dtype=np.float32), 16000, live=True)
+    assert asked == ["omni"]
+    assert result["text"] == ""
+    assert result["tier"] == "rz"

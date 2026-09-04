@@ -1575,9 +1575,17 @@ class RoutedASR:
             text, text_model = self._decode(rec, samples, sample_rate), tier
         if not text.strip() and tier != "omni" and not suppress_fallback:
             # safety net: the specialist came back empty (likely LID mistake);
-            # the 1600-language generalist gets the last word.
-            text = self._decode(self._get("omni"), samples, sample_rate)
-            tier, text_model = "omni", "omni"
+            # the 1600-language generalist gets the last word. On a minimal
+            # install (no omni model) the empty result stands: every other
+            # _get() caller already tolerates ModelUnavailable, and letting
+            # it escape here killed the whole live process mid-stream.
+            try:
+                omni = self._get("omni")
+            except ModelUnavailable:
+                omni = None
+            if omni is not None:
+                text = self._decode(omni, samples, sample_rate)
+                tier, text_model = "omni", "omni"
         corrected = script_corrected_lang(lang, text)
         if self.forced_lang is None and live and text.strip() and corrected != lang:
             # the decoded script contradicts the LID tag (romaji-mangled
