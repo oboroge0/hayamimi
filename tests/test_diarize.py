@@ -1,6 +1,6 @@
 """Smoke tests for scripts/diarize.py's GroupDiarizer.
 
-Needs the pyannote segmentation-3.0 model (see docs/DIARIZATION_PLAN.md
+Needs the pyannote segmentation-3.0 model (see docs/design/diarization.md
 section 2) and the CAM++ embedding model already used by --speakers; both
 skip cleanly if missing so this doesn't break a minimal checkout.
 """
@@ -17,7 +17,7 @@ from diarize import SEGMENTATION_MODEL, GroupDiarizer
 
 pytestmark = pytest.mark.skipif(
     not os.path.exists(SEGMENTATION_MODEL),
-    reason="pyannote segmentation-3.0 model not downloaded (see docs/DIARIZATION_PLAN.md section 2)",
+    reason="pyannote segmentation-3.0 model not downloaded (see docs/design/diarization.md section 2)",
 )
 
 TWO_SPEAKERS_WAV = os.path.join(os.path.dirname(SCRIPTS_DIR), "testdata", "two_speakers.wav")

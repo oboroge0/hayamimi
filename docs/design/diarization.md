@@ -291,7 +291,7 @@ DER は Miss（参照にある発話を検出できなかった時間）、False
 
 - ①のAMIサブセットに対し、現行 `--speakers`（`SpeakerLabeler` の
   ナイーブな逐次最近傍割当）をそのまま走らせてDERを計測する。
-- `docs/BENCHMARKS.md` の慣習に合わせて表形式で記録（音声、話者数、
+- `docs/results/benchmarks.md` の慣習に合わせて表形式で記録（音声、話者数、
   DER、内訳が取れれば pyannote.metrics で追加計測）。
 - 完了条件: ベースラインDER（おそらく20〜40%程度になると予想。
   現行は同時発話非対応・話者数無制限オープンセットのため悪化しやすい）
@@ -332,7 +332,7 @@ DER は Miss（参照にある発話を検出できなかった時間）、False
 - RTFの実測（清書パスに追加した diarization 処理がGOALSのRTF<0.2予算に
   収まるか、清書はリアルタイム制約が高速パスほど厳しくないため許容幅は
   広いが計測はしておく）。
-- `docs/BENCHMARKS.md` 追記、README の Limitations 更新
+- `docs/results/benchmarks.md` 追記、README の Limitations 更新
   （「同時発話は分離できない」は残る点も明記: pyannote segmentationは
   オーバーラップを検出できるが、本計画のスコープでは overlap-aware な
   文字起こし統合まではやらない）。
@@ -2707,7 +2707,7 @@ pytest: 163 passed, 1 skipped（§17の159 passed, 1 skippedに、本ラウン�
   という単位そのものを変える（更に細かく分割する、あるいはウィンドウ
   単位の埋め込みをそもそも清書パスとは別に保持し続ける）別アーキテクチャ
   が必要——ただしそれはリアルタイム字幕としての清書グループ設計
-  （GROUP_GAP_S/GROUP_MAX_S、docs/DIARIZATION_PLAN.md本文の各所参照）
+  （GROUP_GAP_S/GROUP_MAX_S、docs/design/diarization.md本文の各所参照）
   自体の見直しになり、本ループ（Round 1〜8）のスコープを超える。
 - overlap出力のUX（§16で据え置き）、セッション末尾ラベル訂正のUX
   （§17で明示化）は共に未着手のまま。後者は本ラウンドでは
@@ -3102,5 +3102,5 @@ gatingによる改善は、この実装・このモデルでは再現しなか�
 - [pyannote-audio `utils/powerset.py`](https://github.com/pyannote/pyannote-audio/blob/develop/pyannote/audio/utils/powerset.py)（上記C++コード内で直接参照されているpowersetデコードの元アルゴリズム）
 - `models/sherpa-onnx-pyannote-segmentation-3-0/model.onnx` のONNXメタデータ（Round 6で直接読み出し: `window_size`=160000, `receptive_field_shift`=270, `num_classes`=7, `powerset_max_classes`=2）
 - リポジトリ内: `scripts/speaker_id.py`, `scripts/realtime_transcribe.py`,
-  `scripts/download_models.py`, `README.md`, `docs/GOALS.md`,
-  `docs/BENCHMARKS.md`
+  `scripts/download_models.py`, `README.md`, `docs/design/goals.md`,
+  `docs/results/benchmarks.md`

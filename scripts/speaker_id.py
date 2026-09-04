@@ -18,7 +18,7 @@ MAX_EMBED_SECONDS = 6.0  # embeddings saturate; cap input length
 
 # Threshold for the refine-path local-cluster-to-global remap only (see
 # match_embedding()'s threshold= override, and __init__'s docstring below).
-# docs/DIARIZATION_PLAN.md section 8 (iteration 5) swept this independently
+# docs/design/diarization.md section 8 (iteration 5) swept this independently
 # of SIM_THRESHOLD on the AMI dev meetings (ES2011a, IS1008a) and confirmed
 # on the 3 test meetings: 0.35 gave the best DER/speaker-count trade-off
 # (mean DER ~13.9% over 5 meetings vs ~14.1-14.3% at the old single
@@ -27,7 +27,7 @@ MAX_EMBED_SECONDS = 6.0  # embeddings saturate; cap input length
 # still overestimating, but the single biggest lever found so far).
 REMAP_THRESHOLD = 0.35
 
-# docs/DIARIZATION_PLAN.md section 8's "残課題" identified the fast path
+# docs/design/diarization.md section 8's "残課題" identified the fast path
 # (label(), SIM_THRESHOLD=0.45) as the root cause of the remaining
 # speaker-count overestimation: it keeps opening a fresh global centroid
 # any time one VAD segment's embedding falls short of 0.45 against every
@@ -43,7 +43,7 @@ REMAP_THRESHOLD = 0.35
 #      centroids whose cosine similarity has drifted above
 #      merge_threshold. Past emitted labels are not rewritten (that would
 #      need re-sending already-printed lines -- out of scope, see
-#      docs/DIARIZATION_PLAN.md section 9), but every later label for
+#      docs/design/diarization.md section 9), but every later label for
 #      either speaker converges on the surviving (lower-numbered) one.
 #      merge_history() exposes the old->new label map for a session
 #      summary.
@@ -59,7 +59,7 @@ REMAP_THRESHOLD = 0.35
 # 9 -- neither survived the full evaluation (AMI sweep + a real short
 # two-speaker recording) cleanly enough to flip on by default:
 #
-#   A rejected: docs/DIARIZATION_PLAN.md section 9's dev sweep (ES2011a,
+#   A rejected: docs/design/diarization.md section 9's dev sweep (ES2011a,
 #   IS1008a) found merging fragile -- its effective threshold range is a
 #   knife-edge (0.55-0.60 catastrophically merged *unrelated* speakers on
 #   ES2011a, DER 49-50%; 0.65-0.75 either matched baseline exactly or
@@ -88,11 +88,11 @@ REMAP_THRESHOLD = 0.35
 # runs multi-speaker meetings and doesn't mind this trade-off can still
 # opt in), but neither is recommended, and speaker-count overestimation
 # in meetings remains open for a future iteration -- see
-# docs/DIARIZATION_PLAN.md section 9's "残課題".
+# docs/design/diarization.md section 9's "残課題".
 MERGE_THRESHOLD = 0.80
 HYSTERESIS_MIN_HITS = 2
 
-# GitHub issue #11 / docs/DIARIZATION_PLAN.md section 10.8's option B: a
+# GitHub issue #11 / docs/design/diarization.md section 10.8's option B: a
 # DISPLAY-ONLY mitigation for the same speaker-count-overestimation problem
 # section 9 tried (and rejected) two assignment-changing fixes for. Unlike
 # those, this one never touches which centroid an embedding gets assigned to
@@ -129,7 +129,7 @@ class SpeakerLabeler:
         `threshold` instead, e.g. for a caller that wants the old
         single-threshold behavior).
 
-        docs/DIARIZATION_PLAN.md section 7 found DER improved a lot under
+        docs/design/diarization.md section 7 found DER improved a lot under
         the refine path but global speaker count got *worse* (more S{n}
         splitting) -- the remap call re-matches embeddings far more often
         than the fast path does (once per local diarization cluster per
@@ -161,7 +161,7 @@ class SpeakerLabeler:
         self._centroids: list[np.ndarray] = []  # running mean per speaker
         self._counts: list[int] = []
 
-        # --- iteration 6 (docs/DIARIZATION_PLAN.md section 9) ---
+        # --- iteration 6 (docs/design/diarization.md section 9) ---
         self._merge_enabled = merge_enabled
         self._merge_threshold = merge_threshold
         # index -> canonical (surviving) index, for centroids merged away by
@@ -179,7 +179,7 @@ class SpeakerLabeler:
         # creation) so merge_centroids() can fold this flag unconditionally.
         self._confirmed: list[bool] = []
 
-        # Diagnostics for docs/DIARIZATION_PLAN.md section 10.6's open
+        # Diagnostics for docs/design/diarization.md section 10.6's open
         # question: does the production full pipeline open more global
         # centroids via the fast path (label(), called once per VAD
         # segment) or via the refine-path remap (match_embedding() with an
@@ -198,7 +198,7 @@ class SpeakerLabeler:
         Split out of label() so callers that already have their own
         clustering (e.g. scripts/diarize.py's GroupDiarizer, whose local
         speaker clusters need remapping onto this labeler's global
-        centroids -- docs/DIARIZATION_PLAN.md iteration 4) can get the same
+        centroids -- docs/design/diarization.md iteration 4) can get the same
         embedding label() would compute without going through its
         assign-or-open-new-speaker side effects.
         """
@@ -242,7 +242,7 @@ class SpeakerLabeler:
         centroid_open_counts() whenever this call opens a brand-new
         centroid -- see __init__'s _open_log comment. Purely observational.
 
-        exclude_provisional (Round 5, docs/DIARIZATION_PLAN.md section 15
+        exclude_provisional (Round 5, docs/design/diarization.md section 15
         T3): when True, a centroid that hasn't yet been matched a second
         time (self._counts[i] < PROVISIONAL_CONFIRM_HITS -- is_provisional()'s
         own definition, section 10.8's "one-off outlier" case) is skipped
@@ -296,7 +296,7 @@ class SpeakerLabeler:
     def match_embeddings_joint(self, embs: list[np.ndarray], update: bool = True,
                                 threshold: float | None = None, source: str = "") -> list[str]:
         """Constrained joint remap for a whole refine group's local clusters
-        at once (Round 5, docs/DIARIZATION_PLAN.md section 15 T1).
+        at once (Round 5, docs/design/diarization.md section 15 T1).
 
         match_embedding() called independently per local cluster (the
         pre-existing remap path) greedily nearest-matches each cluster on
@@ -393,7 +393,7 @@ class SpeakerLabeler:
         is_provisional() would return False for them (real recurring
         voices, not still-untested one-off centroids).
 
-        Round 9 Experiment A (docs/DIARIZATION_PLAN.md section 19) uses
+        Round 9 Experiment A (docs/design/diarization.md section 19) uses
         this as the num_clusters hint for diarize.GroupDiarizer's
         FastClustering: a CONFIRMED count is a deliberately more
         conservative estimate than len(self._centroids) (which would also
@@ -405,7 +405,7 @@ class SpeakerLabeler:
     def centroid_open_counts(self) -> dict[str, int]:
         """{source: count} of how many currently-open centroids were first
         opened by each caller-supplied `source` tag (see match_embedding()),
-        for diagnosing docs/DIARIZATION_PLAN.md section 10.6."""
+        for diagnosing docs/design/diarization.md section 10.6."""
         counts: dict[str, int] = {}
         for src in self._open_log:
             counts[src] = counts.get(src, 0) + 1
@@ -419,7 +419,7 @@ class SpeakerLabeler:
         opening one plus every later match_embedding() hit) ever folded into
         that centroid's running mean. A count of 1 means the centroid was
         opened and never matched again: exactly the "one-off embedding
-        outlier" case docs/DIARIZATION_PLAN.md section 10.6 asks about --
+        outlier" case docs/design/diarization.md section 10.6 asks about --
         such a centroid still prints its own S{n} line the moment it opens
         (production's console has no concept of "too rare to show"), while
         a DER hypothesis built from per-group majority votes or remap
@@ -432,7 +432,7 @@ class SpeakerLabeler:
             for i in range(len(self._centroids))
         ]
 
-    # --- issue #11 (docs/DIARIZATION_PLAN.md section 10.8, option B):
+    # --- issue #11 (docs/design/diarization.md section 10.8, option B):
     # display-only provisional labeling ---
 
     def _index_for_label(self, label: str) -> int | None:
@@ -481,7 +481,7 @@ class SpeakerLabeler:
         return sum(1 for i in range(len(self._centroids))
                    if i not in self._alias and self._counts[i] < PROVISIONAL_CONFIRM_HITS)
 
-    # --- iteration 6: new-speaker hysteresis (docs/DIARIZATION_PLAN.md section 9) ---
+    # --- iteration 6: new-speaker hysteresis (docs/design/diarization.md section 9) ---
 
     def _label_for(self, idx: int) -> str:
         """Display label for global centroid `idx`.
@@ -507,7 +507,7 @@ class SpeakerLabeler:
                 best, best_sim = i, sim
         return best
 
-    # --- iteration 6: periodic centroid merging (docs/DIARIZATION_PLAN.md section 9) ---
+    # --- iteration 6: periodic centroid merging (docs/design/diarization.md section 9) ---
 
     def maybe_merge_centroids(self) -> dict[str, str]:
         """No-op unless merge_enabled; see merge_centroids()."""
@@ -577,3 +577,26 @@ class SpeakerLabeler:
         """Cumulative {old_label: surviving_label} map from every
         merge_centroids() call so far, for a session summary."""
         return dict(self._merge_history)
+
+    def reset(self) -> None:
+        """Forget every speaker this labeler has ever seen: centroids,
+        counts, aliases, merge history, confirmation state, and the
+        open-source diagnostic log all go back to empty, as if a fresh
+        SpeakerLabeler had just been constructed. The CAM++ embedding
+        extractor (self._extractor) is NOT rebuilt -- it carries no
+        per-session state, and reloading it would pay its model-load cost
+        for nothing.
+
+        For an app embedding this module (GitHub issue #29): call this
+        when a live session restarts (new recording, unrelated speakers)
+        so S1/S2/... labels start over instead of continuing to accumulate
+        against speakers from a conversation that has already ended.
+        realtime_transcribe.reset_live_session() calls this as part of its
+        session-reset sequence.
+        """
+        self._centroids = []
+        self._counts = []
+        self._alias = {}
+        self._merge_history = {}
+        self._confirmed = []
+        self._open_log = []

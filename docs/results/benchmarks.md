@@ -126,7 +126,7 @@ tier1 SenseVoice (ja/zh/ko/yue/en) / tier2 Parakeet v3 (欧州25言語) / tier3 
 - 既知課題（未着手）: SenseVoiceの韓国語出力にトークン間の過剰スペース（正しい分かち書きには韓国語の単語分割器が必要）。
   実音声データセット（Common Voice等）での精度検証も未実施。
 
-## 2026-08-24: 実音声評価 (docs/EVAL_REAL.md) — 重大な発見と対策 (改善イテレーション#4-5)
+## 2026-08-24: 実音声評価 (docs/eval/eval_real.md) — 重大な発見と対策 (改善イテレーション#4-5)
 
 ReazonSpeech test（実TV放送日本語）15クリップ + LibriSpeech dev-clean（実英語朗読）15クリップで4+2システムを評価。
 
@@ -146,7 +146,7 @@ ReazonSpeech test（実TV放送日本語）15クリップ + LibriSpeech dev-clea
 
 ## 2026-08-24: 中韓 実音声評価 + OBSオーバーレイ (改善イテレーション#6)
 
-FLEURS実音声 (zh 12 / ko 12クリップ) で検証（docs/EVAL_REAL_ZHKO.md）:
+FLEURS実音声 (zh 12 / ko 12クリップ) で検証（docs/eval/eval_real_zhko.md）:
 
 | lang | SenseVoice | 専用モデル | Omnilingual | 結論 |
 |---|---|---|---|---|
@@ -162,7 +162,7 @@ FLEURS実音声 (zh 12 / ko 12クリップ) で検証（docs/EVAL_REAL_ZHKO.md�
 
 - **LRUモデルアンロード** (`max_resident`, CLI既定3): tier0(rz)は常駐、他はLRUで追い出し。cap=2で全カタログを巡回してもRSS 1.35GB、追い出し後の再デコードも正常。
 - **日本語句読点復元**: Mojicastと同じBERT ONNX (`ishiki-emo/mojicast-punct-onnx`, Apache-2.0) をja確定文に適用。1回15〜24ms。
-  **注意: 同リポジトリのINT8版はonnxruntime 1.29/Windowsで出力が壊れている（logitsが入力に反応しない）。fp32版を使うこと**（docs/PUNCT_JA.md）。
+  **注意: 同リポジトリのINT8版はonnxruntime 1.29/Windowsで出力が壊れている（logitsが入力に反応しない）。fp32版を使うこと**（docs/design/punct_ja.md）。
 - 句読点モデルはプリロード最優先に（本線に乗ると初回確定が2.2秒化するため）。
 - 最終確認: ja確定 平均197ms（句読点込み）。RSS: cap=3+句読点で1.95GB（目標2GB以内、ただし余裕なし）。
 
@@ -173,7 +173,7 @@ FLEURS実音声 (zh 12 / ko 12クリップ) で検証（docs/EVAL_REAL_ZHKO.md�
 - 結果: **ja確定 平均98〜103ms（句読点込み）**（前回197ms）。コールドスタート直後の独語初回確定も2468ms→486ms。
 - 確定レイテンシの内訳はほぼ「デコード時間のみ」になった。次の短縮余地はVADの無音確認(0.5s)側にある。
 
-## 2026-08-24: 広東語(yue) 実音声評価 (docs/EVAL_REAL_YUE.md)
+## 2026-08-24: 広東語(yue) 実音声評価 (docs/eval/eval_real_yue.md)
 
 FLEURS yue_hant_hk 12クリップ。**SenseVoice維持で確定**（繁→簡正規化後CER 6.0%が最良。
 WenetYue-CTC 7.2%、Zipformer-yue 37.2%、Omnilingual 27.2%）。却下した専用モデルは削除済み。
@@ -209,7 +209,7 @@ WenetYue-CTC 7.2%、Zipformer-yue 37.2%、Omnilingual 27.2%）。却下した専
 
 ## 2026-08-24: エンドツーエンド・スコアカード + 広東語ルーティング修正 (改善イテレーション#12)
 
-scripts/eval_engine.py で本番経路（LID込み）を初めて採点（docs/SCORECARD.md）。
+scripts/eval_engine.py で本番経路（LID込み）を初めて採点（docs/results/scorecard.md）。
 
 - **発見したバグ**: whisper-tiny LIDは広東語を「zh」と判定（12クリップ中0正解）→ Paraformer-zhに流れCER 42.4%。
   モデル単体評価では見えない、ルーティング起因の劣化だった。
@@ -309,7 +309,7 @@ scripts/eval_engine.py で本番経路（LID込み）を初めて採点（docs/S
 
 ## 2026-08-24: 実映像テスト起点のノイズ確定抑制 (改善イテレーション#22)
 
-- 実映像テスト（docs/VIDEO_TEST.md）で特定したゴミ確定への対策2点:
+- 実映像テスト（docs/eval/video_test.md）で特定したゴミ確定への対策2点:
   1. 空テキストの確定を完全スキップ（従来は空行が話者ラベル付きで出ていた）。
   2. **言語切替ガード**: 2.0秒未満の発話に新言語判定が出たらノイズとみなしセッション言語でデコード
      （`--lang-switch-guard`、0で無効）。ジングル・効果音のランダム言語誤爆を抑制。
@@ -388,9 +388,9 @@ scripts/eval_engine.py で本番経路（LID込み）を初めて採点（docs/S
 
 同一クリップ・同一採点でのガチンコ比較を全5言語で完成させた。CPU (Ryzen 5 5600, 6スレッド) 実測。
 
-- **hayamimi側**: docs/SCORECARD.md の本番経路（LID→ルーティング→デコード→ja句読点）の値をそのまま転記。
+- **hayamimi側**: docs/results/scorecard.md の本番経路（LID→ルーティング→デコード→ja句読点）の値をそのまま転記。
   ja/en は `testdata/eval_real`、zh/ko は `testdata/eval_real_zhko`、yue は `testdata/eval_real_yue`。
-- **turbo側**: `scripts/eval_turbo_zhko_yue.py`（新規、ja/enは既存の `docs/EVAL_REAL.md` の値を流用）で、
+- **turbo側**: `scripts/eval_turbo_zhko_yue.py`（新規、ja/enは既存の `docs/eval/eval_real.md` の値を流用）で、
   faster-whisper large-v3-turbo INT8 (CPU, `language=`強制, `beam_size=1`) を**同一クリップ**に対して実行。
 - **採点**: 両者とも `scripts/eval_accuracy.py` の `cer_ja`（NFKC正規化+句読点/空白除去+レーベンシュタイン距離、
   en は jiwer WER）を使用。yue は opencc `t2s` で簡体字正規化してからCER算出（`scripts/eval_engine.py` と同じ規約）。
@@ -500,8 +500,8 @@ VAD → プリロール → デコードの実経路に通し、各文の冒頭�
 既存の needs_models 規約でスキップされる。
 ## 2026-09-01: FLEURS test 5言語×100本 統一head-to-head (v0.3.1 リリースチャート用)
 
-これまでの `docs/SCORECARD.md`（real-speechセット、言語あたり12〜15本）や
-`docs/EVAL_REAL_ZHKO.md` / `docs/EVAL_REAL_YUE.md`（別々のセット・別々の日付で計測）を
+これまでの `docs/results/scorecard.md`（real-speechセット、言語あたり12〜15本）や
+`docs/eval/eval_real_zhko.md` / `docs/eval/eval_real_yue.md`（別々のセット・別々の日付で計測）を
 一本化し、**同一クリップ・同一採点・同一CPU**で hayamimi 本番経路 と
 faster-whisper large-v3-turbo を5言語×100本、直接比較した。
 
@@ -533,7 +533,7 @@ faster-whisper large-v3-turbo を5言語×100本、直接比較した。
   （`eval_engine.py` と同一の慣習）。
 - **turbo**: `faster-whisper` `large-v3-turbo`、`device=cpu`、`compute_type=int8`、
   `beam_size=1`、**`language=<正解言語>` を明示指定**（hayamimiは自動判定なので、turbo側に
-  やや有利な非対称条件 — `docs/COMPARISON.md` に記載済みの規約と同じ）。
+  やや有利な非対称条件 — `docs/results/comparison.md` に記載済みの規約と同じ）。
 - CPU: Ryzen 5 5600 (6C12T, 6スレッド指定) / Windows 11。sherpa-onnx 1.13.6、
   faster-whisper 1.2.1。ITN（数字正規化）はSenseVoiceの`use_itn=True`が効く経路で有効。
 
@@ -551,7 +551,7 @@ faster-whisper large-v3-turbo を5言語×100本、直接比較した。
 
 - **速度**: hayamimiがturboの約12〜21倍速い（RTF比較: ja 16x, en 11x, zh 13x, ko 18x, yue 20x）。
   turboのRTFは0.64〜0.83で、**この短尺クリップ(平均十数秒)のバッチ処理では実時間を下回る**。
-  `docs/COMPARISON.md` の旧実測(実放送クリップ、RTF 1.03〜1.39)と食い違うのは計測条件の差
+  `docs/results/comparison.md` の旧実測(実放送クリップ、RTF 1.03〜1.39)と食い違うのは計測条件の差
   (クリップ長・スレッド数)によるもので、どちらも実測値。なおバッチRTFが1を切っても、
   Whisper系は発話中の逐次出力(ストリーミング字幕)ができない点は変わらない。
   hayamimiは全言語RTF < 0.08。
@@ -566,7 +566,7 @@ faster-whisper large-v3-turbo を5言語×100本、直接比較した。
 
 ### 制約
 
-- **turboに正解言語を渡す非対称条件**（`docs/COMPARISON.md`と同じ規約）。hayamimiは
+- **turboに正解言語を渡す非対称条件**（`docs/results/comparison.md`と同じ規約）。hayamimiは
   LIDも含めた完全自動判定でこの数字を出している一方、turboはlanguage引数で正解を
   与えられているため、turbo側の精度はやや有利な条件での測定値。
 - **second-opinion OFF**。本番のオプション機能（ja再デコードの合意ゲート）は既定値のまま

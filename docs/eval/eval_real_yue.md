@@ -1,6 +1,6 @@
 # ASR Accuracy Evaluation — Real Speech (Cantonese / yue)
 
-Comparison of **SenseVoice** (multilingual, `language="yue"`), **Omnilingual** (multilingual, no lang hint), and two **dedicated Cantonese models** on a small set of **real, human-spoken** Cantonese utterances (12 clips, 86.7s total audio, `testdata/eval_real_yue/`). Goal: determine whether SenseVoice's built-in `yue` route is good enough, or whether a dedicated Cantonese model should be swapped in, mirroring the existing zh/ko real-speech comparison in `docs/EVAL_REAL_ZHKO.md`.
+Comparison of **SenseVoice** (multilingual, `language="yue"`), **Omnilingual** (multilingual, no lang hint), and two **dedicated Cantonese models** on a small set of **real, human-spoken** Cantonese utterances (12 clips, 86.7s total audio, `testdata/eval_real_yue/`). Goal: determine whether SenseVoice's built-in `yue` route is good enough, or whether a dedicated Cantonese model should be swapped in, mirroring the existing zh/ko real-speech comparison in `docs/eval/eval_real_zhko.md`.
 
 ## Data source
 

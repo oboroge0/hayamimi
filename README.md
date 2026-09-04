@@ -20,13 +20,13 @@ instead routes each utterance to whichever specialist model is best for its
 language, all running as quantized (INT8) ONNX models via
 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) -- no PyTorch, no CUDA.
 
-On real broadcast Japanese audio (see `docs/SCORECARD.md`), that routing
+On real broadcast Japanese audio (see `docs/results/scorecard.md`), that routing
 gets **3.8% CER** (remeasured 2026-09-01 with the head-dropout fix and CJK
 number normalization in the pipeline), vs `whisper-large-v3-turbo`'s 13.8%
 on the same clips, while running at 10-50x realtime on a 6-core desktop CPU.
 A full comparison against Whisper variants, cloud STT APIs, and other local
 models -- including the languages where hayamimi loses -- is in
-`docs/COMPARISON.md`.
+`docs/results/comparison.md`.
 
 ## Features
 
@@ -34,13 +34,14 @@ models -- including the languages where hayamimi loses -- is in
 |---|---|
 | 5-route language catalog | ja/zh/ko/yue/en+24 EU languages each go to a dedicated best-in-class model; everything else (~1600 languages) falls back to Meta's Omnilingual ASR |
 | Partial subtitles | in-progress draft text updates every ~0.5s while you're still speaking |
-| Fast finals | a finalized line typically lands ~100ms after you stop talking (ja; see `docs/GOALS.md` for other languages) |
+| Fast finals | a finalized line typically lands ~100ms after you stop talking (ja; see `docs/design/goals.md` for other languages) |
 | Two-pass refinement | after 2s of silence, recent utterances are batch re-decoded for a higher-accuracy "clean" transcript (ja real-broadcast CER 15.5% -> 12.0%) |
 | Speaker labels | `--speakers` tags each utterance S1/S2/... live via CAM++ nearest-centroid matching, then the refine pass re-diarizes each group with pyannote segmentation-3.0 and remaps clusters onto the same S{n} labels (mean DER 25.7% -> 13.9% on 5 AMI meetings, see Limitations) |
-| Translation | `--translate en,zh,ko,es,...` translates Japanese lines live (en via FuguMT; any other M2M-100 target code is accepted if the model's vocabulary supports it -- zh/ko/es have measured quality, see docs/TRANSLATE_M2M.md) |
+| Translation | `--translate en,zh,ko,es,...` translates Japanese lines live (en via FuguMT; any other M2M-100 target code is accepted if the model's vocabulary supports it -- zh/ko/es have measured quality, see docs/design/translate_m2m.md) |
 | Hotwords / user dictionary | `--hotwords` biases decoding toward proper nouns (currently has no effect on the ja tier -- see Limitations); `--replace` does post-hoc find/replace and works everywhere |
 | CJK number normalization | conservative kanji-numeral -> arabic-digit conversion (ja/zh/yue only): magnitude numbers, 点-decimals, and digit-string years/codes; idioms/proper nouns are left alone by default (`scripts/itn_cjk.py`) |
 | Runtime dictionary APIs | `RoutedASR.set_replacements()`/`set_itn_overrides()` swap the find/replace and ITN exclude/force dictionaries mid-session; with `--serve`, `GET`/`POST /replacements` and `/itn_overrides` do the same over HTTP |
+| Structured events + runtime config | every stage of the pipeline (finals, translations, model loads, warnings, session summaries...) publishes to an `EventHub` an embedding app can listen to directly; `--serve` additionally exposes `GET`/`POST /config` and `POST /reset` for changing language/translation/VAD settings and resetting a session without restarting the process -- see "Embedding: runtime control and structured events" below |
 | OBS overlay + dashboard | `--serve` starts a local HTTP server with a browser-source overlay and a live dashboard |
 | Network audio input | `--input ws` accepts mic audio over a WebSocket (phone, ESP32/stackchan) and feeds it through the same pipeline, including `--serve`'s dashboard/overlay |
 | Memory-bounded | LRU model eviction keeps resident models under a configurable cap (default: <2GB total) |
@@ -94,13 +95,14 @@ to stderr on startup either way.
 ## Embedding in another app
 
 `scripts/realtime_transcribe.py`'s pieces (`RoutedASR`, `build_vad`,
-`run_stream`) are importable, not just CLI-only: `RoutedASR(...)` and
-`build_vad(...)` raise a catchable `asr_engine.ModelUnavailable` instead of
-letting sherpa-onnx's C++ layer call `exit()` on a missing model path, and
-`run_stream(..., stop_event=some_threading_Event)` accepts a
-`threading.Event` cancellation token so a host app running the pipeline on
-its own thread can stop it cleanly (`stop_event.set()`) without relying on
-`KeyboardInterrupt`, which only works for the CLI's own process.
+`run_stream`) are importable, not just CLI-only, and the session they build
+can be reconfigured and observed while it runs: `hub.add_listener(callback)`
+delivers structured JSON events (`partial`, `final`, `refine`,
+`model_load`, `warning`, ...) in-process with no HTTP server, and `--serve`
+adds `GET`/`POST /config` and `POST /reset` over the same session. The full
+guide -- the event table, the `/config` keys, and what `POST /reset` does --
+is in [`docs/guide/embedding.md`](docs/guide/embedding.md). For Flutter/Dart,
+see [`mobile/hayamimi_core/README.md`](mobile/hayamimi_core/README.md).
 
 ## Requirements
 
@@ -156,12 +158,12 @@ All flags are on `scripts/realtime_transcribe.py`:
 | `--transcript PATH` | none | append refined transcript lines to this file |
 | `--hotwords PATH` | none | hotword list (one per line) to bias decoding toward proper nouns -- **currently has no effect on the ja tier** (ReazonSpeech's byte-level BPE tokens.txt can't encode them; a startup warning tells you how many failed). Use `--replace` for ja proper nouns instead |
 | `--replace PATH` | none | user dictionary: `wrong=right` per line, applied to all output |
-| `--mode {single,balanced,fast}` | `balanced` | language-switching preset. `balanced` switches only when both language detectors agree (see `docs/LID.md`); `single` pins the language given by `--lang` and never switches; `fast` switches on every detection, matching pre-v0.2.0 behavior. Individual flags below override the preset |
+| `--mode {single,balanced,fast}` | `balanced` | language-switching preset. `balanced` switches only when both language detectors agree (see `docs/eval/lid.md`); `single` pins the language given by `--lang` and never switches; `fast` switches on every detection, matching pre-v0.2.0 behavior. Individual flags below override the preset |
 | `--lang-switch-guard SEC` | 2.0 | treat a new-language detection shorter than this as noise: it can never count toward confirming a switch (see `--lid-switch-confirm`) and it suppresses the omnilingual fallback on an empty decode (`0` disables) |
 | `--lid-switch-confirm N` | 2 | consecutive new-language detections (each >= `--lang-switch-guard` long) required before the session actually switches language; raise for stickier single-language sessions |
 | `--speakers` | off | label utterances with speaker ids (S1, S2, ...); the refine pass re-diarizes each group with pyannote segmentation-3.0 |
 | `--speaker-remap-threshold T` | 0.35 | cosine-similarity threshold for mapping the refine pass's local diarization clusters onto the session's global S{n} labels (the live fast path keeps its own 0.45 threshold) |
-| `--translate [LANGS]` | off, `en` | translate Japanese lines to these comma-separated languages. `en` uses the dedicated FuguMT module; any other M2M-100 target code (`zh`, `ko`, `es`, `fr`, ...) is accepted if the model's vocabulary supports it -- unvalidated targets (anything outside `zh`/`ko`/`es`) print a quality-not-measured note, see docs/TRANSLATE_M2M.md |
+| `--translate [LANGS]` | off, `en` | translate Japanese lines to these comma-separated languages. `en` uses the dedicated FuguMT module; any other M2M-100 target code (`zh`, `ko`, `es`, `fr`, ...) is accepted if the model's vocabulary supports it -- unvalidated targets (anything outside `zh`/`ko`/`es`) print a quality-not-measured note, see docs/design/translate_m2m.md |
 
 ## Architecture
 
@@ -210,7 +212,7 @@ bounded no matter how many languages a session wanders through.
 
 End-to-end (LID -> routing -> decode -> ja punctuation), real speech, no
 preroll/two-pass (single clips). `en` uses WER, all others use CER (`yue`
-t2s-normalized). Full methodology in `docs/SCORECARD.md`.
+t2s-normalized). Full methodology in `docs/results/scorecard.md`.
 
 | Language | Clips | LID accuracy | Route | Mean error | Mean RTF |
 |---|---|---|---|---|---|
@@ -221,8 +223,8 @@ t2s-normalized). Full methodology in `docs/SCORECARD.md`.
 | yue | 12 | 12/12 | SenseVoice | 6.1% | 0.043 |
 
 RTF (real-time factor) well under 0.2 across every route means each route
-runs 9-16x faster than realtime on CPU alone -- see `docs/GOALS.md` for the
-full target table and `docs/BENCHMARKS.md` for the complete iteration log
+runs 9-16x faster than realtime on CPU alone -- see `docs/design/goals.md` for the
+full target table and `docs/results/benchmarks.md` for the complete iteration log
 (30+ measured changes, latency/memory/accuracy tradeoffs and why each one was
 made or rejected).
 
@@ -251,14 +253,14 @@ Headline numbers from that log:
   `--lid-switch-confirm`) mitigates this but confidently-wrong LID+decode
   combinations (where the garbled text happens to match the wrong
   language's character set) remain a known blind spot -- see
-  `docs/BENCHMARKS.md`'s iteration #29 for a quantified before/after.
+  `docs/results/benchmarks.md`'s iteration #29 for a quantified before/after.
   `--lid-switch-confirm 1 --lang-switch-guard 0` fully disables the sticky
   hysteresis (every detection switches the session immediately), trading
   noise robustness for maximum responsiveness -- useful when validating
   whether the lock itself, rather than its tuning, is the right call for
   your setup.
 - **A session's very first utterance always confirms against SenseVoice
-  before deciding the language** (see `docs/NOISE.md`'s dual-LID confirm
+  before deciding the language** (see `docs/eval/noise.md`'s dual-LID confirm
   section), so a whisper-tiny bootstrap misfire can no longer route the
   session to a language with no matching model. Languages outside
   SenseVoice's 5 (ja/en/zh/ko/yue) -- European/`--minimal`-uncovered ones --
@@ -286,7 +288,7 @@ Headline numbers from that log:
   global S{n} labels -- so a group containing several speaker turns keeps
   a separate `[refine/S{n}]` line per turn instead of collapsing to one.
   Measured on 5 AMI meetings (50 min total, CC BY 4.0, collar 0.25s; see
-  `docs/DIARIZATION_PLAN.md` section 8), this cut mean DER from 25.7%
+  `docs/design/diarization.md` section 8), this cut mean DER from 25.7%
   (live-pass-only labeling) to 13.9%. Reference speaker count is 4 per
   meeting; hayamimi's hypothesis still overestimates it (4-8 speakers),
   so `--speakers` should be read as good-enough turn labeling, not a
@@ -294,12 +296,12 @@ Headline numbers from that log:
   screen with one-off labels, a speaker's first appearance shows as
   provisional (`S5?`) and only resolves to a plain `S{n}` once it recurs; a
   label that never recurs stays `?` for the rest of the session (see
-  `docs/DIARIZATION_PLAN.md` section 11).
+  `docs/design/diarization.md` section 11).
 - **Translation quality has a real ceiling**, not just a tuning one.
   FuguMT (ja->en) and M2M-100 (ja->zh/ko) are small models; repetition loops
   are suppressed but not eliminated, and numeric values are not reliably
-  preserved in ja->zh/ko translation (see `docs/TRANSLATE.md` and
-  `docs/TRANSLATE_M2M.md` for measured failure cases before you rely on this
+  preserved in ja->zh/ko translation (see `docs/design/translate.md` and
+  `docs/design/translate_m2m.md` for measured failure cases before you rely on this
   for anything numeric or financial).
 - **Multi-sentence speech can still lose its leading sentence(s).** The
   offline recognizers sometimes collapse a buffer holding several utterances
@@ -311,7 +313,7 @@ Headline numbers from that log:
   head-dropout investigation), and milder dropouts whose transcript still
   looks long enough to pass for normal.
 - **The end-to-end mic pipeline has not been independently verified beyond
-  this project's own testing** -- see `docs/GOALS.md`'s remaining-work
+  this project's own testing** -- see `docs/design/goals.md`'s remaining-work
   section. File an issue if your results differ from the numbers above.
 
 ## License
@@ -353,6 +355,13 @@ hayamimi exists on top of, and would not exist without:
   Academy) -- the CAM++ speaker embedding model behind `--speakers`.
 - [Kiwi](https://github.com/bab2min/kiwipiepy) -- Korean morphological
   tokenizer, used to fix SenseVoice's token-spaced Korean output.
+
+## Documentation
+
+[`docs/README.md`](docs/README.md) is the index: an embedding guide, a tuning
+reference listing every knob and the record behind its default, the current
+accuracy numbers, and the dated experiment logs and design investigations
+behind them.
 
 ## Contributing
 

@@ -103,7 +103,7 @@ def main():
 
     sing_dir = os.path.join(args.root, "testdata", "eval_singing")
     speech_dir = os.path.join(args.root, "testdata", "eval_singing_speech")
-    docs_path = os.path.join(DEFAULT_ROOT, "docs", "SINGING.md")
+    docs_path = os.path.join(DEFAULT_ROOT, "docs", "eval", "singing.md")
 
     asr = RoutedASR(threads=6, preload=False)
 
@@ -123,7 +123,7 @@ def main():
     ]
 
     # ja speech twins measured here; en/ko/zh read-aloud baseline comes from
-    # docs/SCORECARD.md (eval_real), quoted for context.
+    # docs/results/scorecard.md (eval_real), quoted for context.
     baseline = {"ja": None, "en": 0.023, "ko": 0.081}
     ja_spoken = summarize(spoken, "ja")
     if ja_spoken:

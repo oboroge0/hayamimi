@@ -166,13 +166,13 @@ sherpa-onnx 1.13.6 の `OfflineSpeechDenoiser`（GTCRN, `models/gtcrn/gtcrn_simp
 `scripts/asr_engine.py` の `RoutedASR.transcribe()` は、セグメントごとに whisper-tiny ベースの
 `SpokenLanguageIdentification` を1回呼んで言語タグを取得するだけで、確信度（confidence/logprob）は
 sherpa-onnx の Python API 上に存在しない（`SpokenLanguageIdentification.compute()` は言語コードの
-文字列しか返さない）。`docs/LID.md` で whisper-tiny 単独LIDの正解率をセグメント長別に実測したところ、
+文字列しか返さない）。`docs/eval/lid.md` で whisper-tiny 単独LIDの正解率をセグメント長別に実測したところ、
 babble_snr10 条件では2秒で59%、clean条件でも2秒で61%しかなく、単発の誤爆でルーティング先の専用モデル
 （ReazonSpeech/Paraformer/SenseVoice/v3/Omni）ごと変わってerrが跳ね上がる。さらに yue（広東語）は
 whisper-tinyの出力語彙にCantoneseクラスが無いため、単独LIDでは原理的にzh系タグに丸められ続け、
 どれだけ長い発話でも0%のまま。
 
-一方、同じ `docs/LID.md` の測定で、whisper-tiny の判定とSenseVoiceの内蔵LID（`<|xx|>` タグ、
+一方、同じ `docs/eval/lid.md` の測定で、whisper-tiny の判定とSenseVoiceの内蔵LID（`<|xx|>` タグ、
 zh/yue裁定に既存コードが使っていた信号）が**一致した場合**の正解率は、babble_snr10で2秒85%・
 2.5秒93%、cleanで2秒98%・2.5秒100%と、単独LIDを大きく上回る（一致率自体は低い場面もあるが、
 一致したときの信頼性は極めて高い）。つまり「長さや連続回数」ではなく「2つの独立したLIDが
@@ -281,7 +281,7 @@ zh/yue裁定に既存コードが使っていた信号）が**一致した場合
 - 対象60条件（5言語 × white20/10/5/0・pink20/10/5/0・babble20/10/5/0）中、
   **LID正解率が改善したのは10条件、悪化したのは2条件、残り48条件は変化なし**。err も概ね連動して改善。
 - **babbleでの改善が特に大きい**: yue（babble snr=0dB: LID 5/12→**12/12**、err -0.310）は
-  `docs/LID.md` の予測どおり全回復した。whisper-tinyはyueを原理的に検出できないため
+  `docs/eval/lid.md` の予測どおり全回復した。whisper-tinyはyueを原理的に検出できないため
   旧ヒステリシスでは救えなかったが、二重判定はSenseVoiceのタグを直接使うため取りこぼさない。
   ja（babble snr=10dB: LID 12/15→15/15、err -0.148）も大きく改善。white/pinkでも
   ja white snr=5dB（11/15→14/15、err -0.154）、ja pink snr=0dB（13/15→14/15、err -0.128）など
@@ -316,7 +316,7 @@ v3ルート経由で `[ru/v3] Porra, são é a.` という完全な破綻出力�
 - after: `[ko/sv] 오하싸와.`（seg=1.9s, probe=68ms） -- 崩壊は解消（SenseVoiceプローブが必ず
   介在するようになった）が、この特定クリップはSenseVoiceプローブ自体も誤判定（"ko"）していることが
   判明した。診断用にReazonSpeechで同区間を単独デコードすると「大橋さんはやっぱり」という一貫した
-  日本語が得られ、正解は "ja" と確認できる。`docs/LID.md` 表2の通りSenseVoice単体の1.5〜2秒での
+  日本語が得られ、正解は "ja" と確認できる。`docs/eval/lid.md` 表2の通りSenseVoice単体の1.5〜2秒での
   ja正解率はclean/babbleとも60〜80%台に留まり、この極短・低情報量クリップは両LIDが独立に外れる
   ケースに該当する。セグメント2（3.2秒、"そこの上流かな"）では両LIDが"ja"で一致し即座に正しく
   切り替わっており、セッションは1セグメントで自己修復している。

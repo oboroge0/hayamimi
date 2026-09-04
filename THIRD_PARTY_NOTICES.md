@@ -78,11 +78,23 @@ evaluation -- `asr_engine.py`'s routing does not use them.
 | [pytest](https://github.com/pytest-dev/pytest) | MIT |
 | [OpenCC](https://github.com/BYVoid/OpenCC) | Apache-2.0 |
 
+## Bundled test data
+
+`tests/golden/ja/` contains eight audio clips from **FLEURS**
+(`google/fleurs`, `ja_jp`), Copyright Google, licensed
+**CC BY 4.0** (<https://creativecommons.org/licenses/by/4.0/>). They are
+committed unmodified, together with their reference transcripts, so
+`tests/test_ja_golden.py` can pin the Japanese route's output without a
+download. See `tests/golden/ja/README.md` for the per-clip FLEURS ids.
+
+No other corpus audio is committed: `testdata/` is untracked and is fetched
+by the eval scripts.
+
 ## Design inspiration
 
 Several integration choices in this project (the FuguMT/M2M-100 CTranslate2
 conversions, the punctuation model export, and beam-size/repetition-control
-settings noted in `docs/TRANSLATE.md` and `docs/TRANSLATE_M2M.md`) are drawn
+settings noted in `docs/design/translate.md` and `docs/design/translate_m2m.md`) are drawn
 from or reuse artifacts published by the [Mojicast](https://github.com/ishiki-emo/mojicast)
 project (MIT-licensed offline captioning app) by ishiki-emo. Credit and thanks
 to that project -- see the README credits section.

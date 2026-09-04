@@ -1,6 +1,6 @@
 """Diarization Error Rate (DER) scoring for hayamimi's speaker labeling.
 
-docs/DIARIZATION_PLAN.md iteration (2): score the current --speakers
+docs/design/diarization.md iteration (2): score the current --speakers
 (scripts/speaker_id.py's SpeakerLabeler, a naive online-nearest-centroid
 turn-taking assignment) against the AMI reference subset built by
 scripts/make_diarset.py, using DER as the metric.
@@ -188,7 +188,7 @@ def group_segments(fast_segments: list[tuple[int, int, str]], sample_rate: int,
     return groups
 
 
-DEFAULT_GLOBAL_RECLUSTER_THRESHOLD = 0.65  # Round 7, docs/DIARIZATION_PLAN.md section 17
+DEFAULT_GLOBAL_RECLUSTER_THRESHOLD = 0.65  # Round 7, docs/design/diarization.md section 17
 DEFAULT_GLOBAL_RECLUSTER_RELIABLE_S = 1.5  # same "reliable" cutoff Round 6 settled on
 
 
@@ -228,7 +228,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     the AMI sweep for no scoring benefit.
 
     Returns (hyp, stats) where stats carries diarization wall-clock time
-    and call count, for the RTF measurement docs/DIARIZATION_PLAN.md
+    and call count, for the RTF measurement docs/design/diarization.md
     iteration 3 asks for.
 
     sim_threshold/remap_threshold plumb straight through to
@@ -241,7 +241,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     speaker_id.REMAP_THRESHOLD when None (SpeakerLabeler's own default --
     *not* falling back to sim_threshold, so this function's default call
     matches production's default, not the old single-threshold behavior).
-    docs/DIARIZATION_PLAN.md section 8 (iteration 5) swept these
+    docs/design/diarization.md section 8 (iteration 5) swept these
     independently of diar_threshold (diarize.DEFAULT_THRESHOLD, which only
     affects the *local* clustering within one group) and landed on
     REMAP_THRESHOLD=0.35 with SIM_THRESHOLD left at 0.45.
@@ -255,9 +255,9 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     min_duration_on/min_duration_off plumb straight through to
     diarize.GroupDiarizer's sherpa-onnx OfflineSpeakerDiarizationConfig
     (default None -- falls back to diarize.DEFAULT_MIN_DURATION_ON/OFF).
-    Round 2 (docs/DIARIZATION_PLAN.md section 12) sweeps these.
+    Round 2 (docs/design/diarization.md section 12) sweeps these.
 
-    min_remap_update_s (Round 4, docs/DIARIZATION_PLAN.md section 14 T2):
+    min_remap_update_s (Round 4, docs/design/diarization.md section 14 T2):
     0.0 (default) is a no-op -- every local cluster remaps exactly as
     before (match_embedding(update=True), which can fold the cluster's
     embedding into an existing global centroid's running mean, or open a
@@ -274,7 +274,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     flag is the "ignore clusters <1s for centroid updates" experiment T2
     describes as one candidate fix for that.
 
-    joint_remap (Round 5, docs/DIARIZATION_PLAN.md section 15 T1): False
+    joint_remap (Round 5, docs/design/diarization.md section 15 T1): False
     (default) is a no-op -- each group's local clusters (other than any
     excluded by min_remap_update_s above) still remap independently via
     match_embedding(), exactly the pre-existing behavior. When True,
@@ -285,7 +285,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     docstring. Mirrors realtime_transcribe.Refiner._emit_turns() exactly,
     same as every other flag here.
 
-    exclude_provisional_remap (Round 5, docs/DIARIZATION_PLAN.md section 15
+    exclude_provisional_remap (Round 5, docs/design/diarization.md section 15
     T3, only run if T1 fails or leaves IS1009a confusion >8%): False
     (default) is a no-op. When True, every remap match_embedding() call
     below (both the min_remap_update_s read-only probe and the
@@ -294,7 +294,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     never be chosen as a remap target -- see match_embedding()'s
     exclude_provisional docstring.
 
-    global_recluster (Round 7, docs/DIARIZATION_PLAN.md section 17): False
+    global_recluster (Round 7, docs/design/diarization.md section 17): False
     (default) is a no-op -- every local cluster's global label comes
     entirely from the incremental remap above, exactly as every earlier
     round's behavior. When True, this function ALSO keeps every
@@ -313,7 +313,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
     never touches the fast path -- only which S{n} string a refine-group
     turn ends up with.
 
-    num_clusters_hint (Round 9 Experiment A, docs/DIARIZATION_PLAN.md
+    num_clusters_hint (Round 9 Experiment A, docs/design/diarization.md
     section 19): "off" (default) is a no-op -- diarizer.process() is
     called with no override, exactly every prior round's behavior
     (FastClustering picks the cluster count itself, diarize.
@@ -569,7 +569,7 @@ def generate_diarize_hypothesis(wav_path: str, min_silence: float = 0.35,
         "global_recluster_time_s": global_recluster_time_s,
         "n_recluster_entries": n_recluster_entries,
         "n_recluster_clusters": n_recluster_clusters,
-        # docs/DIARIZATION_PLAN.md section 10.6 diagnostics: compare against
+        # docs/design/diarization.md section 10.6 diagnostics: compare against
         # realtime_transcribe.py's "session summary" refine_groups_closed /
         # centroid_open_counts lines for the same file -- this eval path has
         # no decoded text to force a language-boundary group split (see
@@ -593,13 +593,13 @@ def der_breakdown(ref: list[tuple[str, float, float]], hyp: list[tuple[str, floa
     """Miss/False-Alarm/Confusion breakdown via pyannote.metrics, as a
     fraction of total reference speech time (same units simpleder.DER's
     return value is in). Kept separate from score_meeting()'s simpleder
-    call (docs/DIARIZATION_PLAN.md section 4's two-tier plan: simpleder for
+    call (docs/design/diarization.md section 4's two-tier plan: simpleder for
     the fast day-to-day sweep loop, pyannote.metrics only when the error
     breakdown itself is needed -- iteration 5, to tell whether the
     remaining over-splitting after the section-8 threshold tuning is
     boundary noise (Miss/FA) or genuine speaker confusion).
 
-    skip_overlap (T2, docs/DIARIZATION_PLAN.md section 12): pass
+    skip_overlap (T2, docs/design/diarization.md section 12): pass
     skip_overlap=True to pyannote.metrics.DiarizationErrorRate, which
     excludes reference regions with >=2 concurrent speakers from scoring
     entirely. This is pyannote's own published-comparison convention and
@@ -696,15 +696,15 @@ def main():
                          "SileroVadModelConfig.threshold), same knob as realtime_transcribe.py's "
                          "build_vad(). Default 0.5 matches current production/sherpa_onnx "
                          "default. Lower values flag more low-energy speech as speech at the "
-                         "cost of more false alarms. docs/DIARIZATION_PLAN.md section 13 "
+                         "cost of more false alarms. docs/design/diarization.md section 13 "
                          "(Round 3). The installed sherpa_onnx has no speech-padding knob to "
                          "pair with this (checked: SileroVadModelConfig fields are threshold, "
                          "min_silence_duration, min_speech_duration, max_speech_duration, "
                          "window_size, neg_threshold -- no speech_pad_ms), so there is no "
                          "--vad-pad flag.")
     ap.add_argument("--method", choices=["baseline", "refine_diarize"], default="baseline",
-                    help="baseline: current --speakers (SpeakerLabeler only, docs/"
-                         "DIARIZATION_PLAN.md section 6). refine_diarize: iteration "
+                    help="baseline: current --speakers (SpeakerLabeler only, docs/design/"
+                         "diarization.md section 6). refine_diarize: iteration "
                          "3-4's Refiner-group offline diarization + global remap")
     ap.add_argument("--diar-threshold", type=float, default=None, metavar="T",
                     help="FastClusteringConfig.threshold for --method refine_diarize "
@@ -720,13 +720,13 @@ def main():
                          "--method refine_diarize's local-cluster-to-global remap "
                          "(match_embedding() calls in generate_diarize_hypothesis). Default: "
                          "speaker_id.REMAP_THRESHOLD (0.35), independent of --sim-threshold. "
-                         "See docs/DIARIZATION_PLAN.md section 8.")
+                         "See docs/design/diarization.md section 8.")
     ap.add_argument("--breakdown", action="store_true",
                     help="also report Miss/False-Alarm/Confusion via pyannote.metrics "
                          "(requirements-dev.txt). Slower and heavier than the default "
-                         "simpleder-only scoring -- see docs/DIARIZATION_PLAN.md section 4.")
+                         "simpleder-only scoring -- see docs/design/diarization.md section 4.")
     ap.add_argument("--merge-enabled", action=argparse.BooleanOptionalAction, default=None,
-                    help="iteration 6 (docs/DIARIZATION_PLAN.md section 9) mitigation A: "
+                    help="iteration 6 (docs/design/diarization.md section 9) mitigation A: "
                          "periodically fold global centroids that have drifted together back "
                          "into one speaker. Only meaningful with --method refine_diarize (the "
                          "merge point is once per closed group). Default: speaker_id."
@@ -737,7 +737,7 @@ def main():
                     help="cosine similarity above which two global centroids merge, when "
                          "--merge-enabled. Default: speaker_id.MERGE_THRESHOLD.")
     ap.add_argument("--hysteresis-enabled", action=argparse.BooleanOptionalAction, default=None,
-                    help="iteration 6 (docs/DIARIZATION_PLAN.md section 9) mitigation B: a "
+                    help="iteration 6 (docs/design/diarization.md section 9) mitigation B: a "
                          "newly opened global centroid displays under its nearest confirmed "
                          "speaker until it has matched --hysteresis-min-hits times. Applies to "
                          "both --method values. Default: speaker_id.SpeakerLabeler's own default "
@@ -752,16 +752,16 @@ def main():
                     help="diarize.GroupDiarizer's OfflineSpeakerDiarizationConfig."
                          "min_duration_on: drop speech turns shorter than this (seconds) "
                          "after segmentation. Only meaningful with --method refine_diarize. "
-                         "Default: diarize.DEFAULT_MIN_DURATION_ON (0.3). See docs/"
-                         "DIARIZATION_PLAN.md section 12 (Round 2).")
+                         "Default: diarize.DEFAULT_MIN_DURATION_ON (0.3). See docs/design/"
+                         "diarization.md section 12 (Round 2).")
     ap.add_argument("--min-duration-off", type=float, default=None, metavar="S",
                     help="diarize.GroupDiarizer's OfflineSpeakerDiarizationConfig."
                          "min_duration_off: bridge silence gaps shorter than this (seconds) "
                          "within one local speaker turn. Only meaningful with --method "
                          "refine_diarize. Default: diarize.DEFAULT_MIN_DURATION_OFF (0.5). "
-                         "See docs/DIARIZATION_PLAN.md section 12 (Round 2).")
+                         "See docs/design/diarization.md section 12 (Round 2).")
     ap.add_argument("--min-remap-update-s", type=float, default=0.0, metavar="S",
-                    help="Round 4 (docs/DIARIZATION_PLAN.md section 14) T2 experiment: a "
+                    help="Round 4 (docs/design/diarization.md section 14) T2 experiment: a "
                          "refine-group local cluster shorter than this many seconds remaps "
                          "READ-ONLY (can still match an existing global centroid, but never "
                          "folds its embedding into that centroid's mean and never opens a "
@@ -770,7 +770,7 @@ def main():
                          "refine_diarize. 0.0 (default) is a no-op, matching every earlier "
                          "round's behavior.")
     ap.add_argument("--joint-remap", action="store_true",
-                    help="Round 5 (docs/DIARIZATION_PLAN.md section 15) T1 experiment: within "
+                    help="Round 5 (docs/design/diarization.md section 15) T1 experiment: within "
                          "one refine group, solve the local-cluster-to-global remap jointly "
                          "(Hungarian assignment maximizing total similarity, scipy.optimize."
                          "linear_sum_assignment) instead of matching each local cluster "
@@ -778,7 +778,7 @@ def main():
                          "same global speaker. Only meaningful with --method refine_diarize. Off "
                          "by default. See speaker_id.SpeakerLabeler.match_embeddings_joint().")
     ap.add_argument("--exclude-provisional-remap", action="store_true",
-                    help="Round 5 (docs/DIARIZATION_PLAN.md section 15) T3 experiment: a global "
+                    help="Round 5 (docs/design/diarization.md section 15) T3 experiment: a global "
                          "centroid that hasn't yet been matched a second time (still provisional, "
                          "see speaker_id.PROVISIONAL_CONFIRM_HITS) is never chosen as a remap "
                          "target -- it may be 'stealing' a match that should have gone to a real, "
@@ -786,7 +786,7 @@ def main():
                          "Off by default. See speaker_id.SpeakerLabeler.match_embedding()'s "
                          "exclude_provisional docstring.")
     ap.add_argument("--global-recluster", action="store_true",
-                    help="Round 7 (docs/DIARIZATION_PLAN.md section 17) T1 experiment: at "
+                    help="Round 7 (docs/design/diarization.md section 17) T1 experiment: at "
                          "session end, re-cluster every refine group's local-cluster "
                          "embeddings together (two-stage constrained agglomerative, same "
                          "design as eval_diar_overlap.py's Round 6 prototype, via "
@@ -799,13 +799,13 @@ def main():
                          f"merge stage (default {DEFAULT_GLOBAL_RECLUSTER_THRESHOLD}, the "
                          f"value Round 6 found best on this same AMI subset).")
     ap.add_argument("--skip-overlap", action="store_true",
-                    help="T2 (docs/DIARIZATION_PLAN.md section 12): exclude reference regions "
+                    help="T2 (docs/design/diarization.md section 12): exclude reference regions "
                          "with >=2 concurrent speakers from DER scoring (pyannote.metrics "
                          "skip_overlap=True). Only affects --breakdown's der_breakdown; "
                          "the primary simpleder DER is unaffected.")
     ap.add_argument("--num-clusters-hint", choices=["off", "confirmed", "confirmed-capped"],
                     default="off",
-                    help="Round 9 (docs/DIARIZATION_PLAN.md section 19) Experiment A: pass a "
+                    help="Round 9 (docs/design/diarization.md section 19) Experiment A: pass a "
                          "num_clusters hint to diarize.GroupDiarizer's FastClustering, derived "
                          "from speaker_id.SpeakerLabeler.num_confirmed_speakers() at the moment "
                          "each refine group closes. 'off' (default) is a no-op. 'confirmed' uses "

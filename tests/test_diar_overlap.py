@@ -115,7 +115,7 @@ def test_assign_by_centroid_pulls_unreliable_points_to_nearest_cluster():
     assert labels[2] == 0  # the unreliable point lands with the point it resembles
 
 
-# ---- pool_audio_for_group (Round 8, docs/DIARIZATION_PLAN.md section 18 T1) -
+# ---- pool_audio_for_group (Round 8, docs/design/diarization.md section 18 T1) -
 
 def test_pool_audio_for_group_uses_diarizer_turns_when_present():
     # a single-speaker group where the diarizer still found real (filtered)

@@ -6,7 +6,7 @@ hayamimi の性能を、既存のASRモデル・サービスと比較する。�
 2. **公表値の突き合わせ** — 各ベンダー・プロジェクトの公表ベンチマーク。テストセット・採点条件が
    それぞれ異なるため、数値の直接比較はできない。「参考」として扱うこと。
 
-最終更新: 2026-08-27。hayamimi側の測定条件は `docs/SCORECARD.md` / `docs/BENCHMARKS.md` を参照。
+最終更新: 2026-08-27。hayamimi側の測定条件は `docs/results/scorecard.md` / `docs/results/benchmarks.md` を参照。
 
 ## 1. 直接対決: whisper-large-v3-turbo（同一クリップ・同一採点・CPU）
 
@@ -71,7 +71,7 @@ faster-whisper (INT8, CPU, 言語指定あり) と hayamimi 本番経路（言�
 
 ### 2.3 話者分離
 
-hayamimi の DER 13.9%（AMI 5会議、collar 0.25s、`docs/DIARIZATION_PLAN.md`）に対し、
+hayamimi の DER 13.9%（AMI 5会議、collar 0.25s、`docs/design/diarization.md`）に対し、
 pyannote.audio 3.1 の公表値は AMI 18.8%（IHM）/ 22.7%（SDM）。ただし pyannote の
 公表値は **collarなし・重複込み** という最も厳しい採点であり、collar 0.25s で
 再採点すれば数ポイント改善するはず。採点条件が揃った比較データが存在しないため、

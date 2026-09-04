@@ -64,7 +64,7 @@ void main() {
     });
   }, skip: vocabPath == null
       ? 'models/mojicast-punct-onnx/vocab.txt is missing — see '
-            'docs/PUNCT_JA.md for how to fetch the model directory'
+            'docs/design/punct_ja.md for how to fetch the model directory'
       : null);
 }
 

@@ -20,6 +20,7 @@ import re
 import sys
 import threading
 import time
+from typing import Callable
 
 import numpy as np
 import sherpa_onnx
@@ -37,14 +38,32 @@ PJA_MODEL_DIR = os.path.join(MODELS_DIR, "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b
 VAD_MODEL_PATH = os.path.join(MODELS_DIR, "silero_vad.onnx")
 
 # ReazonSpeech ja-en zipformer: on real broadcast Japanese it beats even
-# whisper-turbo (CER 8.6% vs 13.8%) at RTF 0.02. See docs/EVAL_REAL.md.
+# whisper-turbo (CER 8.6% vs 13.8%) at RTF 0.02. See docs/eval/eval_real.md.
 # English goes to v3 instead: rz outputs unpunctuated ALL-CAPS English
 # (WER 1.6% vs v3's 2.5%, but v3's casing/punctuation reads far better).
 RZ_LANGS = {"ja"}
 
+# The ja tier's sherpa-onnx OfflineRecognizerConfig values, hoisted out of
+# _build_reazon() so scripts/dump_ja_config.py can report the configuration a
+# ja-only re-implementation has to match WITHOUT loading a model (see
+# docs/spec/ja_pipeline.ja.md). _build_reazon() below is the only other reader; these
+# are the same literals it used before, moved rather than changed.
+RZ_MODEL_TYPE = "zipformer"
+RZ_DECODING_METHOD = "modified_beam_search"
+RZ_MODELING_UNIT = "cjkchar"
+RZ_HOTWORDS_SCORE = 2.0
+# The four files the recognizer is built from, as the glob patterns _find()
+# resolves them with, in the order from_transducer() takes them.
+RZ_MODEL_FILES = {
+    "encoder": "encoder-*.int8.onnx",
+    "decoder": "decoder-*.int8.onnx",
+    "joiner": "joiner-*.int8.onnx",
+    "tokens": "tokens.txt",
+}
+
 # Paraformer-zh beats SenseVoice on real Chinese (CER 5.6% vs 7.5%); the
 # dedicated Korean zipformer is worse (30%), so ko stays on SenseVoice.
-# See docs/EVAL_REAL_ZHKO.md.
+# See docs/eval/eval_real_zhko.md.
 PARA_LANGS = {"zh"}
 
 # SenseVoice small coverage (built-in ITN and punctuation).
@@ -55,6 +74,14 @@ V3_LANGS = {
     "bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu",
     "it", "lv", "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk",
 }
+
+# The language codes RoutedASR routes to a SPECIFIC tier (as opposed to
+# falling through to the 1600-language Omnilingual generalist, which has no
+# fixed code list of its own). set_forced_lang() (GitHub issue #29's runtime
+# API) validates against this set: forcing the session onto a code outside
+# it would silently ride the omni fallback for every segment, which is very
+# unlikely to be what a caller setting --lang/--mode single intended.
+ROUTABLE_LANGS = RZ_LANGS | PARA_LANGS | SV_LANGS | V3_LANGS
 
 LID_MAX_SECONDS = 4.0  # only feed the first N seconds of a segment to the LID model
 
@@ -202,20 +229,21 @@ def _find(model_dir: str, pattern: str) -> str:
     return hits[0] if hits else ""
 
 
-def _build_reazon(threads: int, hotwords_file: str = "", hotwords_score: float = 2.0):
+def _build_reazon(threads: int, hotwords_file: str = "",
+                  hotwords_score: float = RZ_HOTWORDS_SCORE):
     # modified_beam_search: CER 8.6% -> 5.8% on real broadcast ja for +25%
     # decode time (still 37x realtime). v3/en showed no gain and stays greedy.
     return sherpa_onnx.OfflineRecognizer.from_transducer(
-        encoder=_find(RZ_MODEL_DIR, "encoder-*.int8.onnx"),
-        decoder=_find(RZ_MODEL_DIR, "decoder-*.int8.onnx"),
-        joiner=_find(RZ_MODEL_DIR, "joiner-*.int8.onnx"),
-        tokens=os.path.join(RZ_MODEL_DIR, "tokens.txt"),
+        encoder=_find(RZ_MODEL_DIR, RZ_MODEL_FILES["encoder"]),
+        decoder=_find(RZ_MODEL_DIR, RZ_MODEL_FILES["decoder"]),
+        joiner=_find(RZ_MODEL_DIR, RZ_MODEL_FILES["joiner"]),
+        tokens=os.path.join(RZ_MODEL_DIR, RZ_MODEL_FILES["tokens"]),
         num_threads=threads,
-        model_type="zipformer",
-        decoding_method="modified_beam_search",
+        model_type=RZ_MODEL_TYPE,
+        decoding_method=RZ_DECODING_METHOD,
         hotwords_file=hotwords_file,
         hotwords_score=hotwords_score,
-        modeling_unit="cjkchar",
+        modeling_unit=RZ_MODELING_UNIT,
     )
 
 
@@ -305,7 +333,7 @@ def script_corrected_lang(tagged: str, text: str) -> str:
 # The 5 languages SenseVoice's own internal LID can arbitrate (its model
 # directory name: zh-en-ja-ko-yue). whisper-tiny can never actually emit
 # "yue" as a candidate (see the zh/yue arbitration in transcribe() below),
-# but it's listed here for documentation symmetry with docs/LID.md.
+# but it's listed here for documentation symmetry with docs/eval/lid.md.
 DUAL_CONFIRM_LANGS = {"ja", "en", "zh", "ko", "yue"}
 
 # A whisper-tiny candidate shorter than this is presumed non-speech noise
@@ -329,7 +357,7 @@ def resolve_dual_confirm(
 ) -> tuple[str, bool]:
     """Dual-LID switch confirmation for the 5 SenseVoice-covered languages.
 
-    docs/LID.md measured whisper-tiny alone at only 59-65% LID accuracy at
+    docs/eval/lid.md measured whisper-tiny alone at only 59-65% LID accuracy at
     2 seconds (far worse under babble noise -- 59%), but whisper-tiny AND
     SenseVoice's own internal LID AGREEING on the same language hits
     85-98% accuracy at the same length ("一致時正解率" in the LID.md
@@ -347,7 +375,7 @@ def resolve_dual_confirm(
     Session bootstrap (last_lang is None) has no current language to hold
     at while waiting for agreement, so it resolves directly to `sv_lang`:
     SenseVoice's own LID is already more accurate alone than whisper-tiny
-    alone (docs/LID.md table 2 vs table 1), and this is confirmed by
+    alone (docs/eval/lid.md table 2 vs table 1), and this is confirmed by
     agreement whenever sv_lang == lang too (this is the case tests exercise
     where whisper-tiny misfires "zh" but SenseVoice correctly says "ja" --
     the first segment must decode as "ja", not "zh", not silence).
@@ -392,7 +420,7 @@ def resolve_dual_confirm(
 # trusting it more than the fast path's per-segment vote because the group
 # is (usually) longer. But a Refiner "group" can be a single short segment
 # sitting alone between silence gaps -- not a real multi-segment utterance
-# -- so that assumption doesn't automatically hold. docs/LID.md's table 1
+# -- so that assumption doesn't automatically hold. docs/eval/lid.md's table 1
 # shows whisper-tiny-ALONE accuracy hasn't clearly separated from chance for
 # several languages below ~2.5s (babble_snr10 overall: 44% at 1.5s, 59% at
 # 2.0s, 65% at 2.5s); below that, a lone re-judgment is a coin flip that can
@@ -443,8 +471,8 @@ def resolve_sticky_lang(
     as a real language switch, or hold the session's current language.
 
     A single new-language detection can be a babble-noise misfire
-    (docs/NOISE.md -- whisper-tiny LID exposes no confidence score to
-    threshold on) or a jingle/SFX blip (docs/VIDEO_TEST.md) rather than a
+    (docs/eval/noise.md -- whisper-tiny LID exposes no confidence score to
+    threshold on) or a jingle/SFX blip (docs/eval/video_test.md) rather than a
     genuine switch. A real switch -- the speaker changing language, or a new
     speaker -- repeats the SAME new language on the next detection, while a
     misfire lands on a random one. `switch_confirm` CONSECUTIVE detections
@@ -481,7 +509,7 @@ def resolve_sticky_lang(
     detections, segments decode using bootstrap_probe_lang instead of
     blindly trusting whisper-tiny's possibly-wrong candidate, since
     SenseVoice alone already measures more accurate than whisper-tiny alone
-    (docs/LID.md table 2 vs table 1). If no probe was available
+    (docs/eval/lid.md table 2 vs table 1). If no probe was available
     (bootstrap_probe_lang falsy, e.g. --minimal install), this falls back
     to whisper-tiny's own candidate, same as before.
 
@@ -607,7 +635,7 @@ def _load_replacements(path: str) -> list[tuple[str, str]]:
 # a key file per model: checked BEFORE building, because sherpa-onnx's C++
 # layer exits the process (not a catchable exception) on an empty model path
 _KEY_FILES = {
-    "rz": (RZ_MODEL_DIR, "encoder-*.int8.onnx"),
+    "rz": (RZ_MODEL_DIR, RZ_MODEL_FILES["encoder"]),
     "pz": (PARA_ZH_DIR, "model*.onnx"),
     "sv": (SV_MODEL_DIR, "model*.onnx"),
     "v3": (V3_MODEL_DIR, "encoder*.onnx"),
@@ -675,7 +703,18 @@ class RoutedASR:
                  lid_switch_confirm: int = 2, dual_confirm: bool = True,
                  forced_lang: str | None = None,
                  ja_second_opinion: bool = False,
-                 agree_threshold: float = SECOND_OPINION_THRESHOLD):
+                 agree_threshold: float = SECOND_OPINION_THRESHOLD,
+                 on_event: "Callable[[dict], None] | None" = None):
+        # on_event (GitHub issue #29): the engine's structured-event sink.
+        # Set before ANY other construction step below so every model build
+        # in this constructor (the lid build a few lines down included) is
+        # observable, not just the ones reached later via _get(). Optional
+        # so every existing caller (eval scripts, tests) that constructs a
+        # RoutedASR without it keeps working unchanged -- _emit() below is a
+        # no-op when this is None. realtime_transcribe.main() passes
+        # hub.publish so model_load/model_fallback/warning events reach the
+        # same EventHub every other structured event goes through.
+        self._on_event = on_event
         self._threads = threads
         self.dual_confirm = dual_confirm  # --mode balanced (default); False = --mode fast
         self.forced_lang = forced_lang    # --mode single: skip all LID/switch logic
@@ -703,10 +742,15 @@ class RoutedASR:
         self._model_locks = {name: threading.Lock() for name in _BUILDERS}
         self.last_lang = None  # sticky language from the most recent final
         self._unavailable: set[str] = set()  # models missing on disk (--minimal installs)
+        self._fallback_warned: set[str] = set()  # requested names already model_fallback-reported
         self._pending_lang = None   # candidate new language awaiting confirmation
         self._pending_count = 0
         self.lid_switch_confirm = lid_switch_confirm  # consecutive detections to accept a switch
+        t0 = time.perf_counter()
+        self._emit({"type": "model_load", "model": "lid", "phase": "start", "ms": None})
         self.lid = _build_lid_guarded(threads)
+        self._emit({"type": "model_load", "model": "lid", "phase": "done",
+                    "ms": (time.perf_counter() - t0) * 1000})
         if warmup:
             # LID + tier-0 pay their one-time kernel/allocation costs here
             # so the first real segment isn't penalized.
@@ -718,8 +762,22 @@ class RoutedASR:
             # non-tier-0 utterance doesn't pay the ~2s model-load cost.
             threading.Thread(target=self._preload_rest, daemon=True).start()
 
-    @staticmethod
-    def _warn_hotwords_encodability(hotwords_file: str):
+    def _emit(self, event: dict) -> None:
+        """Forward a structured event (model_load/model_fallback/warning) to
+        the caller's on_event sink, if one was given. An event-hub failure
+        (a broken listener, a full queue, whatever) must never break
+        transcription, so any exception from the callback is swallowed
+        here -- EventHub.publish() already does its own once-per-listener
+        error reporting, so there is nothing useful left to do with it at
+        this call site besides not propagating it.
+        """
+        if self._on_event is not None:
+            try:
+                self._on_event(event)
+            except Exception:
+                pass
+
+    def _warn_hotwords_encodability(self, hotwords_file: str):
         """Print a loud, hard-to-miss warning if --hotwords entries can't be
         encoded against the ja (ReazonSpeech) tier's tokens.txt.
 
@@ -731,6 +789,10 @@ class RoutedASR:
         modeling_unit that encodes cjkchar-style hotwords against it; until
         that's fixed upstream (or hayamimi ships its own bpe.model), the
         best we can do is make the failure visible and point at --replace.
+
+        GitHub issue #29: also emits a `warning` event (code
+        "hotwords_unencodable") alongside the print, so an embedding app
+        without a terminal to read stderr from still finds out.
         """
         if not hotwords_file:
             return
@@ -739,14 +801,17 @@ class RoutedASR:
         if bad == 0:
             return
         if bad == total:
-            print(f"[hayamimi] WARNING: 0/{total} hotwords could be encoded for the ja "
-                  f"tier (ReazonSpeech uses byte-level BPE tokens, incompatible with "
-                  f"modeling_unit=cjkchar) -- --hotwords will have NO EFFECT on ja "
-                  f"output. Use --replace for post-hoc find/replace instead.")
+            message = (f"0/{total} hotwords could be encoded for the ja tier "
+                       f"(ReazonSpeech uses byte-level BPE tokens, incompatible with "
+                       f"modeling_unit=cjkchar) -- --hotwords will have NO EFFECT on ja "
+                       f"output. Use --replace for post-hoc find/replace instead.")
+            print(f"[hayamimi] WARNING: {message}")
         else:
-            print(f"[hayamimi] warning: {bad}/{total} hotwords cannot be encoded for "
-                  f"the ja tier (ReazonSpeech uses byte-level BPE tokens); --hotwords "
-                  f"will have no effect for these. Consider --replace instead.")
+            message = (f"{bad}/{total} hotwords cannot be encoded for the ja tier "
+                       f"(ReazonSpeech uses byte-level BPE tokens); --hotwords will "
+                       f"have no effect for these. Consider --replace instead.")
+            print(f"[hayamimi] warning: {message}")
+        self._emit({"type": "warning", "code": "hotwords_unencodable", "message": message})
 
     def _preload_rest(self):
         if self._punctuate:
@@ -770,12 +835,17 @@ class RoutedASR:
         if self._punct is None and self._punctuate:
             with self._load_lock:
                 if self._punct is None:
+                    t0 = time.perf_counter()
+                    self._emit({"type": "model_load", "model": "punct", "phase": "start",
+                               "ms": None})
                     try:
                         from punct_ja import PunctuatorJa
 
                         self._punct = PunctuatorJa()
                     except Exception:
                         self._punctuate = False  # missing model/deps: degrade quietly
+                    self._emit({"type": "model_load", "model": "punct", "phase": "done",
+                               "ms": (time.perf_counter() - t0) * 1000})
         return self._punct
 
     @property
@@ -808,6 +878,9 @@ class RoutedASR:
             with self._model_locks[name]:
                 rec = self._models.get(name)
                 if rec is None:
+                    t0 = time.perf_counter()
+                    self._emit({"type": "model_load", "model": name, "phase": "start",
+                               "ms": None})
                     try:
                         if name == "rz":
                             rec = _build_reazon(self._threads, self._hotwords_file)
@@ -820,6 +893,8 @@ class RoutedASR:
                               f"(minimal install?): routing falls back",
                               file=sys.stderr)
                         raise ModelUnavailable(name) from exc
+                    self._emit({"type": "model_load", "model": name, "phase": "done",
+                               "ms": (time.perf_counter() - t0) * 1000})
                     with self._load_lock:
                         self._evict_if_needed(incoming=name)
                         self._models[name] = rec
@@ -829,9 +904,19 @@ class RoutedASR:
     def _get_with_fallback(self, name: str) -> tuple[object, str]:
         for cand in (name, "rz", "sv", "v3", "pz", "omni"):
             try:
-                return self._get(cand), cand
+                rec = self._get(cand)
             except ModelUnavailable:
                 continue
+            if cand != name and name not in self._fallback_warned:
+                # Only reported once per distinct requested name per
+                # session (matching _get()'s own once-only stderr print,
+                # via self._unavailable) -- a whole missing tier would
+                # otherwise emit this event on every single segment for
+                # the rest of the session.
+                self._fallback_warned.add(name)
+                self._emit({"type": "model_fallback", "requested": name, "used": cand,
+                           "reason": f"'{name}' unavailable (minimal install?)"})
+            return rec, cand
         raise RuntimeError(
             "no ASR models found under models/ -- run scripts/download_models.py")
 
@@ -931,9 +1016,12 @@ class RoutedASR:
             return None, seconds
         if self._seg_vad_ok and not os.path.exists(VAD_MODEL_PATH):
             self._seg_vad_ok = False
-            print(f"[hayamimi] {os.path.basename(VAD_MODEL_PATH)} not found under "
-                  f"models/: long offline buffers fall back to fixed "
-                  f"{SEGMENT_FALLBACK_CHUNK_S:.0f}s chunking", file=sys.stderr)
+            message = (f"{os.path.basename(VAD_MODEL_PATH)} not found under models/: "
+                       f"long offline buffers fall back to fixed "
+                       f"{SEGMENT_FALLBACK_CHUNK_S:.0f}s chunking")
+            print(f"[hayamimi] {message}", file=sys.stderr)
+            self._emit({"type": "warning", "code": "segmentation_vad_unavailable",
+                       "message": message})
         if not self._seg_vad_ok:
             return self._fixed_chunks(samples, sample_rate), seconds
 
@@ -957,8 +1045,10 @@ class RoutedASR:
                     vad.pop()
         except Exception as exc:  # a VAD failure must never lose the audio
             self._seg_vad, self._seg_vad_ok = None, False
-            print(f"[hayamimi] offline segmentation VAD failed ({exc}): long "
-                  f"buffers fall back to fixed chunking", file=sys.stderr)
+            message = f"offline segmentation VAD failed ({exc}): long buffers fall back to fixed chunking"
+            print(f"[hayamimi] {message}", file=sys.stderr)
+            self._emit({"type": "warning", "code": "segmentation_vad_unavailable",
+                       "message": message})
             return self._fixed_chunks(samples, sample_rate), seconds
 
         speech_s = sum(count for _start, count in spans) / float(sample_rate)
@@ -1231,6 +1321,86 @@ class RoutedASR:
 
     min_switch_s = 2.0  # a shorter utterance can't establish a new language
 
+    # --- runtime setters (GitHub issue #29) -------------------------------
+    #
+    # These are all read from the decode thread (transcribe()/partial(),
+    # both called from realtime_transcribe.run_stream()'s single-threaded
+    # ingestion loop) and written from wherever an embedding app or the
+    # SubtitleServer's POST /config handler lives -- typically a different
+    # thread (an HTTP handler thread, or a GUI's own thread). Every setter
+    # below only does plain attribute assignment (or, for set_punctuate,
+    # one attribute assignment plus clearing a cached None), which is a
+    # single pointer store under the GIL: an in-flight transcribe() call
+    # sees either the old value or the new one for the remainder of that
+    # call, never a torn/partial update. No lock is taken for the same
+    # reason set_replacements()/set_itn_overrides() above don't take one.
+
+    def set_forced_lang(self, lang: str | None) -> None:
+        """--mode single / --lang runtime setter. `None` reverts to normal
+        auto-routing (LID-driven); any other value must be one of
+        ROUTABLE_LANGS (the codes this engine actually has a dedicated
+        tier for -- see that constant's docstring) or ValueError is raised.
+
+        Resets the sticky/pending LID state (reset_session()) either way:
+        turning single-language mode ON must not let a stale in-flight
+        switch-confirmation candidate from auto mode leak into the forced
+        regime, and turning it OFF must not resume auto-routing already
+        "sticky" on whatever language was forced a moment ago.
+        """
+        if lang is not None and lang not in ROUTABLE_LANGS:
+            raise ValueError(f"unsupported language code: {lang!r} "
+                             f"(must be one of {sorted(ROUTABLE_LANGS)} or None)")
+        self.forced_lang = lang
+        self.reset_session()
+
+    def set_dual_confirm(self, enabled: bool) -> None:
+        """--mode balanced/fast runtime setter: whether a language switch
+        for the 5 SenseVoice-covered languages (DUAL_CONFIRM_LANGS) needs
+        SenseVoice's own LID to agree before it's accepted (see
+        resolve_dual_confirm's docstring). No session-state reset needed --
+        unlike set_forced_lang, this only changes which resolution function
+        the NEXT switch decision uses, it doesn't invalidate the language
+        already established."""
+        self.dual_confirm = bool(enabled)
+
+    def set_punctuate(self, enabled: bool) -> None:
+        """Turn Japanese punctuation restoration on or off at runtime.
+
+        Turning it OFF just flips the flag the `punct` property checks;
+        the loaded PunctuatorJa instance (if any) is left in memory so
+        turning it back on later is free. Turning it ON while it was
+        already off -- including the failure-degrade case, where the
+        `punct` property itself set self._punctuate = False after a failed
+        load -- clears self._punct so the next `.punct` access retries the
+        load instead of treating this as still-degraded. A call that
+        merely confirms an already-on state (self._punctuate already True)
+        is a no-op and does NOT discard an already-loaded model.
+        """
+        enabled = bool(enabled)
+        if enabled and not self._punctuate:
+            self._punct = None  # retry the load on next `.punct` access
+        self._punctuate = enabled
+
+    def set_lid_switch_confirm(self, n: int) -> None:
+        """--lid-switch-confirm runtime setter: consecutive same-language
+        detections required before the fallback (non-dual-confirm) switch
+        hysteresis (resolve_sticky_lang) accepts a new language. Must be
+        >= 1 (0 would mean "never confirm anything")."""
+        n = int(n)
+        if n < 1:
+            raise ValueError(f"lid_switch_confirm must be >= 1, got {n}")
+        self.lid_switch_confirm = n
+
+    def set_min_switch_s(self, seconds: float) -> None:
+        """--lang-switch-guard runtime setter: a new-language candidate
+        shorter than this many seconds never counts toward confirming a
+        switch (see resolve_sticky_lang's docstring). Must be >= 0 (0
+        disables the guard, matching --mode fast's default)."""
+        seconds = float(seconds)
+        if seconds < 0:
+            raise ValueError(f"min_switch_s must be >= 0, got {seconds}")
+        self.min_switch_s = seconds
+
     def reset_session(self):
         """Clear the sticky/pending language state.
 
@@ -1260,9 +1430,12 @@ class RoutedASR:
             rec = self._get("pja")
         except ModelUnavailable:
             if not self._pja_warned:
-                print("[hayamimi] warning: ja second opinion requested but "
-                      f"{os.path.basename(PJA_MODEL_DIR)} is not installed; "
-                      "gate disabled (run download_models.py --eval-baselines).")
+                message = ("ja second opinion requested but "
+                          f"{os.path.basename(PJA_MODEL_DIR)} is not installed; "
+                          "gate disabled (run download_models.py --eval-baselines).")
+                print(f"[hayamimi] warning: {message}")
+                self._emit({"type": "warning", "code": "second_opinion_unavailable",
+                           "message": message})
                 self._pja_warned = True
             self._ja_second_opinion = False
             return text
@@ -1314,7 +1487,7 @@ class RoutedASR:
         else:
             if self.last_lang is None and self.dual_confirm:
                 # session bootstrap: whisper-tiny alone is unreliable at short
-                # lengths (docs/LID.md) and can guess a language SenseVoice
+                # lengths (docs/eval/lid.md) and can guess a language SenseVoice
                 # can't even arbitrate (a real-mic incident: whisper-tiny said
                 # "ru" on segment 1 of a Japanese session and it collapsed
                 # from there). Always confirm the very first segment against
@@ -1326,7 +1499,7 @@ class RoutedASR:
 
             if self.dual_confirm and lang in DUAL_CONFIRM_LANGS:
                 if lang != self.last_lang:
-                    # docs/LID.md: for the 5 SenseVoice-covered languages,
+                    # docs/eval/lid.md: for the 5 SenseVoice-covered languages,
                     # confirm a candidate switch with SenseVoice's own LID
                     # instead of the old length/repeat-count hysteresis (see
                     # resolve_dual_confirm). Reuse the bootstrap probe above
@@ -1443,7 +1616,7 @@ class RoutedASR:
 
         # Everything above is byte-identical to the pre-retry engine, and the
         # language decision is now FINAL. Only if that whole-buffer decode
-        # looks like it dropped its leading content (docs/BENCHMARKS.md, the
+        # looks like it dropped its leading content (docs/results/benchmarks.md, the
         # FLEURS ja head-dropout) is the buffer re-decoded one utterance at a
         # time, through the very recognizer that produced `text` -- and even
         # then the result is kept only if it looks like a recovery.
@@ -1472,7 +1645,7 @@ class RoutedASR:
         if lang == "ko" and text.strip() and self.ko_spacer is not None:
             try:
                 # SenseVoice emits a space between every token; Kiwi restores
-                # real Korean word spacing (docs/BENCHMARKS.md iteration 20)
+                # real Korean word spacing (docs/results/benchmarks.md iteration 20)
                 text = self.ko_spacer.space(text, reset_whitespace=True)
             except Exception:
                 pass

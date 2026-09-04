@@ -40,7 +40,7 @@ const Set<String> jaPunctuationCharacters = <String>{
 /// it misses a question asked by intonation alone, and it fires on a
 /// sentence that merely ends in the nominalizer `の`. It is carried over
 /// unchanged from the desktop pipeline so both produce the same text; see
-/// `docs/PUNCT_JA.md`, "Known limitations".
+/// `docs/design/punct_ja.md`, "Known limitations".
 const List<String> jaQuestionSuffixes = <String>[
   'ですか',
   'ますか',

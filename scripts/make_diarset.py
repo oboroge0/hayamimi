@@ -1,6 +1,6 @@
 """Build a small speaker-diarization evaluation set from the AMI Meeting Corpus.
 
-docs/DIARIZATION_PLAN.md iteration (1): DER scoring needs reference audio +
+docs/design/diarization.md iteration (1): DER scoring needs reference audio +
 reference speaker-turn labels. AMI ("headset-mix", CC BY 4.0) is the
 recommended starting point there -- a clean multi-speaker meeting-room
 recording with a standard reference RTTM maintained by BUT (the

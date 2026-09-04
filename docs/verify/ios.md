@@ -2,7 +2,7 @@
 
 `mobile/` (hayamimi_mobile) を iPhone 15 の実機に入れて動作確認するための手順。
 これまでの検証はすべて Windows + Android エミュレータで行われており
-(`docs/MOBILE.md`)、iOS 実機での検証は**まだ一度も行われていない** ——
+(`docs/design/mobile_quantization.md`)、iOS 実機での検証は**まだ一度も行われていない** ——
 このドキュメントはその最初の一歩を、迷わず再現できる形にするためのもの。
 
 対象読者:
@@ -22,7 +22,7 @@ Windows 側では Xcode の操作そのものを検証できないため、本�
 
 - **(a) Bench RTF**: 完了。ja int8, RTF **0.013**(PC int8 の 0.062 より
   約4.8倍速い — 想定通り ARM の int8 カーネルが効いた)。詳細・比較表は
-  `docs/MOBILE.md` の「On-device (iPhone 15) verification」節。
+  `docs/design/mobile_quantization.md` の「On-device (iPhone 15) verification」節。
 - **(b) マニフェスト一括評価**: 完了。`testdata/eval_real/`(15 ja + 15 en、
   `scripts/make_realset.py --skip-eval` で Mac 上で再生成可能、公開HF
   データセット経由なので Windows 側の元データ不要)を実機に push して完走。
@@ -90,7 +90,7 @@ Apple Developer Team ID (`DEVELOPMENT_TEAM = 9M9U5TB32V`) と
 2. リポジトリを取得してビルドする（無料 Apple ID 署名で実機へ）
 3. モデルファイルを実機の Documents に配置する
 4. 検証メニュー (a)〜(e) を優先順に実施する
-5. 結果を PC (Windows) 側の `docs/MOBILE.md` に持ち帰る
+5. 結果を PC (Windows) 側の `docs/design/mobile_quantization.md` に持ち帰る
 6. (任意) Mac 側で Claude Code を使う場合の注意
 
 ---
@@ -101,7 +101,7 @@ Apple Developer Team ID (`DEVELOPMENT_TEAM = 9M9U5TB32V`) と
   無料 Apple ID 署名を使う場合、Xcode 側のバージョンは特にこだわらず最新でよい。
 - **Flutter SDK** — `mobile/pubspec.yaml` の `environment.sdk: ^3.13.1`
   (Dart SDK 制約) を満たすもの。このリポジトリでの Windows/Android 検証は
-  Flutter **3.47.1** で行われている（`docs/MOBILE.md`）ので、同じマイナー系列
+  Flutter **3.47.1** で行われている（`docs/design/mobile_quantization.md`）ので、同じマイナー系列
   を Mac 側でも使うと差分要因を減らせる。`flutter doctor` で iOS 関連の項目
   (Xcode, CocoaPods) が緑になっていることを確認する。
 - **CocoaPods** — `sudo gem install cocoapods` (または Homebrew:
@@ -189,7 +189,7 @@ XCFramework を配布しており（`mobile/README.md` に既述）、`pod insta
 Mac 上で実行されたことがない**。sherpa_onnx の XCFramework 取得や
 Podfile の解決が机上の想定どおりに進むかは、このドキュメントに沿って
 最初に通した人（オーナー本人、または Mac 側の Claude Code セッション）が
-確認して `docs/MOBILE.md` に追記するのが望ましい（下記「5. 結果の持ち帰り方」
+確認して `docs/design/mobile_quantization.md` に追記するのが望ましい（下記「5. 結果の持ち帰り方」
 参照）。
 
 ---
@@ -204,7 +204,7 @@ Files アプリ経由**、または **Xcode の Devices and Simulators ウィン
 
 ### 3.1 必要ファイル一覧
 
-`mobile/README.md`・`docs/MOBILE.md`・`scripts/asr_engine.py` の実体から
+`mobile/README.md`・`docs/design/mobile_quantization.md`・`scripts/asr_engine.py` の実体から
 拾った、モデルディレクトリ名とファイル名（すべて `models/` 配下、
 `scripts/download_models.py` が取得するのと同じ構成）:
 
@@ -278,15 +278,15 @@ Files アプリ経由**、または **Xcode の Devices and Simulators ウィン
    `Documents/test.wav` に設定（デフォルトのままなら変更不要）。
 3. 実行して RTF (real-time factor = 処理時間 / 音声長) を記録する。
 
-`docs/MOBILE.md` の PC/エミュレータ数値との比較用テンプレ:
+`docs/design/mobile_quantization.md` の PC/エミュレータ数値との比較用テンプレ:
 
 | 環境 | RTF (ja int8, `modified_beam_search`) | 備考 |
 |---|---|---|
-| PC (Windows, x86-64) | 0.062 | `docs/MOBILE.md` INT8 量子化セクション |
+| PC (Windows, x86-64) | 0.062 | `docs/design/mobile_quantization.md` INT8 量子化セクション |
 | Android エミュレータ (x86_64, ホストPC上) | (informational only) | ホストCPU実行のため実機性能を反映しない |
 | **iPhone 15 (実機, ここに記入)** | | |
 
-`docs/MOBILE.md` が繰り返し強調している通り、エミュレータの数値は
+`docs/design/mobile_quantization.md` が繰り返し強調している通り、エミュレータの数値は
 「ホスト PC の CPU 上」の数値であり実機性能の代わりにならない。iPhone 15 の
 数値が初めての「本物の ARM 実機速度」になる。
 
@@ -298,17 +298,17 @@ Documents に配置した上で一括デコードし、結果 JSON
 (`wav`, `lang`, `ref`, `hyp`, `audio_s`, `decode_s`, `rtf`) を書き出す
 (`mobile/hayamimi_core/lib/bench/manifest_eval_runner.dart`)。
 
-- PC 側の `docs/MOBILE.md` 記載の CER: fp32/int8 とも 5.50%（full_int8）。
+- PC 側の `docs/design/mobile_quantization.md` 記載の CER: fp32/int8 とも 5.50%（full_int8）。
   Android エミュレータでの同一検証: 6.19%（+0.69pp）。
 - iPhone 実機の結果 JSON を PC に持ち帰り
   (`scripts/eval_accuracy.py` の `cer_ja`) でスコアリングし、この2つの
   数値と比較する。1〜2pp 程度のズレは onnxruntime のカーネル差として
-  想定内（`docs/MOBILE.md` の「On-emulator accuracy parity」節が同じ理屈で
+  想定内（`docs/design/mobile_quantization.md` の「On-emulator accuracy parity」節が同じ理屈で
   エミュレータの差を説明している）。
 
 言語ルーティングまで検証するなら「Routed multilingual manifest eval
 (debug only)」パネルで `testdata/eval_real/` + `testdata/eval_real_zhko/`
-のサブセットを使う（`docs/MOBILE.md` の "Multi-language routing on mobile"
+のサブセットを使う（`docs/design/mobile_quantization.md` の "Multi-language routing on mobile"
 節、20クリップでの参考値: ja 4/5, en/zh/ko 5/5 の言語判定正解）。
 
 ### (c) Live 実マイク（清書・自動清書）
@@ -333,7 +333,7 @@ Live 画面の「Language routing」ドロップダウンを `ja + SenseVoice
 (en/zh/ko/yue)` に切り替え、SenseVoice / LID モデルディレクトリのパスを
 入力してから同様に発話する。日本語→英語のように話す言語を切り替え、
 各行に付く言語バッジ（例: "JA", "EN"）が意図通りに切り替わるか確認する。
-`docs/MOBILE.md` の "Open items" に書かれている通り、これまでルーティング
+`docs/design/mobile_quantization.md` の "Open items" に書かれている通り、これまでルーティング
 はマニフェスト一括評価でしか検証されておらず、**実際のマイクでの言語切り替え
 はまだ一度も検証されていない** — この iOS 実機セッションが最初のライブ検証
 になる可能性がある。
@@ -355,7 +355,7 @@ Live 画面の「Language routing」ドロップダウンを `ja + SenseVoice
 ## 5. 結果の持ち帰り方
 
 - (a)/(b) の計測 JSON・数値は AirDrop（または他の任意の手段）で PC に転送する。
-- 追記先は `docs/MOBILE.md`:
+- 追記先は `docs/design/mobile_quantization.md`:
   - (a) の RTF は「On-emulator accuracy parity」節の後、もしくは新しい
     "On-device (iPhone 15) verification" 節を追加してそこに記載するのが
     自然（このドキュメントの表テンプレをそのまま埋める形で良い）。
@@ -364,7 +364,7 @@ Live 画面の「Language routing」ドロップダウンを `ja + SenseVoice
     言語切り替え検証」の結果は、"Open items" 節の該当項目を実測値で
     上書き・解消する形で追記する。
 - Mac 側でこのドキュメント自体の記述ミス（コマンド・パス・ファイル名が
-  実体と違う等）に気付いたら、このファイル (`docs/IOS_VERIFY.md`) 自体も
+  実体と違う等）に気付いたら、このファイル (`docs/verify/ios.md`) 自体も
   合わせて修正する。
 
 ---
@@ -383,7 +383,7 @@ Live 画面の「Language routing」ドロップダウンを `ja + SenseVoice
   (`agent/feature/mobile-app` 等) も同じ規則に従っている。
 - **検証ゲート** — モデル/ルーティング/デコードパラメータに触れる変更は、
   `CONTRIBUTING.md` の方針どおり実音声での再評価（この場合は本ドキュメントの
-  (a)〜(d)）を経てから統合する。テストだけでは不十分（`docs/BENCHMARKS.md`
+  (a)〜(d)）を経てから統合する。テストだけでは不十分（`docs/results/benchmarks.md`
   にある過去の regression 事例を参照）。
 - **worktree は独立させる** — 複数の作業を並行させる場合、同一ブランチ・
   同一ファイルを別々のエージェントに同時に触らせない。
