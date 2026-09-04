@@ -1,5 +1,7 @@
 # hayamimi_core
 
+日本語版: [README.ja.md](README.ja.md)
+
 Reusable core of [hayamimi](https://github.com/oboroge0/hayamimi)'s mobile
 speech recognition pipeline, extracted out of the `mobile/` demo app so
 other Flutter apps — e.g. a smart-glasses companion app — can embed live
