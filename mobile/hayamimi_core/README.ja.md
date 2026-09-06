@@ -161,8 +161,10 @@ int8 が最小かつ最速で、大きい fp16/fp32 を積む速度上の理由�
   (数値は英語版 README の "Pacing knobs" を参照)。
 - 日本語向けの句読点復元 (デスクトップ側の BERT-char モデル、fp16 で 181.8 MB) は
   refine パスに組み込まれているが (下記「日本語の句読点復元」参照)、**どちらのダウンロード
-  プロファイルにも含まれていない**。モデルファイルはまだローカルのビルド成果物で、
-  ホストアプリが自分で端末に置く必要がある (下記参照)。
+  プロファイルにも含まれていない**。モデルファイルは
+  [`oboroge0/hayamimi-punct-ja-fp16`](https://huggingface.co/oboroge0/hayamimi-punct-ja-fp16)
+  (Hugging Face) でホストされているので、ホストアプリがそこから取得して端末に置く
+  必要がある (下記参照)。
 
 ### ディレクトリ配置
 
@@ -177,6 +179,15 @@ int8 が最小かつ最速で、大きい fp16/fp32 を積む速度上の理由�
 | `<targetDir>/sense_voice/` | `RoutingProfile.jaSenseVoice` のみ | `model.int8.onnx` + `tokens.txt` |
 | `<targetDir>/lid/` | `RoutingProfile.jaSenseVoice` のみ | `tiny-encoder.int8.onnx` + `tiny-decoder.int8.onnx` |
 | `JaPunctuation` に渡す任意のパス | 日本語句読点、任意、全プロファイルで使える | `punct_bert.fp16.onnx` (181.8 MB) + `vocab.txt` (28 KB) |
+
+句読点モデルの 2 ファイルは Hugging Face の
+[`oboroge0/hayamimi-punct-ja-fp16`](https://huggingface.co/oboroge0/hayamimi-punct-ja-fp16)
+でホストされている (直接ダウンロードは `resolve/main/<file>`):
+
+| ファイル | サイズ | sha256 |
+|---|---:|---|
+| `punct_bert.fp16.onnx` | 181,803,211 バイト (181.8 MB) | `bca0d6cb9d35fbb27f2070e9b003ad277e9f7494b0dff69b1e164e84e793149a` |
+| `vocab.txt` | 27,928 バイト (28 KB) | `57411bcac5e9559f2aa4d316a2217289048cb40fe23187b02a81aeb3e5d61cf3` |
 
 ### 自動ダウンロード
 
@@ -199,10 +210,14 @@ await live.start(
 (既にディスクにあるものはチェックサムで再検証し、欠けているか壊れているものだけ再取得する)。
 
 日本語句読点モデル (`punct_bert.fp16.onnx` + `vocab.txt`) はダウンロードプロファイルの
-対象外で、ローカルの `python scripts/quantize_punct.py --variant fp16` (メインの hayamimi
-リポジトリ側) が作るビルド成果物。`ModelDownloader` にはまだエントリがないので、手動で
-`JaPunctuation(modelPath: ..., vocabPath: ...)` に渡す場所へコピーすること (詳細は
-[`docs/design/punct_ja.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/design/punct_ja.md))。
+対象外で、
+[`oboroge0/hayamimi-punct-ja-fp16`](https://huggingface.co/oboroge0/hayamimi-punct-ja-fp16)
+(Hugging Face) からダウンロードすること (サイズと sha256 は上の表を参照)。このファイルは
+`python scripts/quantize_punct.py --variant fp16` (メインの hayamimi リポジトリ側) が上流の
+fp32 モデルから作るもので、詳細は
+[`docs/design/punct_ja.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/design/punct_ja.md)
+を参照。`ModelDownloader` にはまだエントリがないので、手動で
+`JaPunctuation(modelPath: ..., vocabPath: ...)` に渡す場所へコピーすること。
 
 モデルファイルはすべてサードパーティの成果物で、それぞれ独自のライセンスを持つ (このパッケージ
 自体のコードは MIT)。公開元・ライセンス・出所は

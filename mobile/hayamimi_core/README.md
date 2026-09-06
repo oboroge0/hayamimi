@@ -793,9 +793,10 @@ Notes on the choice:
 - Punctuation restoration for ja (the desktop pipeline's BERT-char model,
   181.8 MB as fp16) is wired into the refine pass — see
   ["Japanese punctuation restoration"](#japanese-punctuation-restoration) —
-  but it is **not** part of either download profile: the model file is
-  still a local build artifact, so a host app has to put it on the device
-  itself (see below).
+  but it is **not** part of either download profile: it's hosted at
+  [`oboroge0/hayamimi-punct-ja-fp16`](https://huggingface.co/oboroge0/hayamimi-punct-ja-fp16)
+  on Hugging Face rather than bundled in a profile, so a host app has to
+  download it and put it on the device itself (see below).
 
 ### Directory layout each profile expects
 
@@ -811,6 +812,15 @@ Notes on the choice:
 | `<targetDir>/sense_voice/` | `RoutingProfile.jaSenseVoice` only | `model.int8.onnx` + `tokens.txt` |
 | `<targetDir>/lid/` | `RoutingProfile.jaSenseVoice` only | `tiny-encoder.int8.onnx` + `tiny-decoder.int8.onnx` |
 | any path you choose, passed to `JaPunctuation` | Japanese punctuation, optional, any profile | `punct_bert.fp16.onnx` (181.8 MB) + `vocab.txt` (28 KB) |
+
+The punctuation model's two files are hosted at
+[`oboroge0/hayamimi-punct-ja-fp16`](https://huggingface.co/oboroge0/hayamimi-punct-ja-fp16)
+on Hugging Face (`resolve/main/<file>` for direct download):
+
+| file | size | sha256 |
+|---|---:|---|
+| `punct_bert.fp16.onnx` | 181,803,211 bytes (181.8 MB) | `bca0d6cb9d35fbb27f2070e9b003ad277e9f7494b0dff69b1e164e84e793149a` |
+| `vocab.txt` | 27,928 bytes (28 KB) | `57411bcac5e9559f2aa4d316a2217289048cb40fe23187b02a81aeb3e5d61cf3` |
 
 Exact filenames inside `model/`/`sense_voice/`/`lid/` don't have to match
 this table character for character: `resolveZipformerTransducerFiles`/
@@ -888,9 +898,12 @@ If you'd rather manage the files by hand (a CI step, a custom CDN, …),
   probe doesn't need `tiny-tokens.txt` or the fp32 files also in that
   archive) into `<targetDir>/lid/`.
 - **Japanese punctuation (optional, any profile):** `punct_bert.fp16.onnx`
-  and its `vocab.txt` are not on the sherpa-onnx release page — they're a
-  local build artifact of `python scripts/quantize_punct.py --variant
-  fp16` in the main hayamimi repo, described in
+  and its `vocab.txt` are not on the sherpa-onnx release page — download
+  them from
+  [`oboroge0/hayamimi-punct-ja-fp16`](https://huggingface.co/oboroge0/hayamimi-punct-ja-fp16)
+  on Hugging Face (see the sizes and sha256 values in the table above).
+  That file is what `python scripts/quantize_punct.py --variant fp16` in
+  the main hayamimi repo produces from the upstream fp32 model, described in
   [`docs/design/punct_ja.md`](https://github.com/oboroge0/hayamimi/blob/main/docs/design/punct_ja.md).
   There is no `ModelDownloader` entry for it yet — copy both files to
   wherever you pass as `JaPunctuation(modelPath: ..., vocabPath: ...)`, no

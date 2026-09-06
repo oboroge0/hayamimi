@@ -150,11 +150,13 @@ into a standalone package a third-party Flutter app can embed.
   and loads in the decode worker isolate rather than the caller's, for the
   same reason every other decode moved there. New dependencies: `unorm_dart`
   (NFKC normalization, which `dart:core` has no equivalent of) and `ffi`.
-  The float16 model file (181.8 MB) is still not downloadable —
-  `ModelDownloader`/`downloadProfile` has no entry for it — so a host app
-  has to place it and its `vocab.txt` on the device itself; see "Japanese
-  punctuation restoration" in the README for the model-placement and
-  platform-status details, and "Known limitations" below.
+  The float16 model file (181.8 MB) is downloadable from
+  [`oboroge0/hayamimi-punct-ja-fp16`](https://huggingface.co/oboroge0/hayamimi-punct-ja-fp16)
+  on Hugging Face, but `ModelDownloader`/`downloadProfile` has no entry for
+  it — so a host app has to fetch it and its `vocab.txt` and place them on
+  the device itself; see "Japanese punctuation restoration" in the README
+  for the model-placement and platform-status details, and "Known
+  limitations" below.
 * **Segmentation and segment audio, after the first Android emulator run.**
   Running the live pipeline on an Android x86_64 emulator turned up two
   ways the mobile port produced worse text than the desktop pipeline on the
@@ -256,6 +258,11 @@ into a standalone package a third-party Flutter app can embed.
   manifest runs. Both are debug/dev tools, not part of the embedding
   surface a host app needs — see the `kDebugMode`-gated call sites in the
   `mobile/` reference app's Bench tab.
+* **Punctuation model now downloadable.** `punct_bert.fp16.onnx` and
+  `vocab.txt` are published at
+  [`oboroge0/hayamimi-punct-ja-fp16`](https://huggingface.co/oboroge0/hayamimi-punct-ja-fp16)
+  on Hugging Face, so a host app no longer has to build the fp16 file
+  itself to use Japanese punctuation restoration.
 
 ### Known limitations
 

@@ -516,9 +516,12 @@ int8-static/QDQ, fp16), **fp16 is the only one that clears the accuracy
 bar** — it is the recommended candidate *if* this model needs a
 smaller-than-fp32 footprint on a phone-deployable profile:
 `models/mojicast-punct-onnx/quantized_ort/punct_bert.fp16.onnx` (not
-committed; regenerate via `--variant fp16`), 181.8 MB vs fp32's 363.5 MB.
-Both INT8 approaches (dynamic and static/QDQ) are now considered
-exhausted for this model at default settings — see "if revisited" below.
+committed to this repo; regenerate via `--variant fp16`, or download the
+prebuilt file from
+[`oboroge0/hayamimi-punct-ja-fp16`](https://huggingface.co/oboroge0/hayamimi-punct-ja-fp16)
+on Hugging Face), 181.8 MB vs fp32's 363.5 MB. Both INT8 approaches
+(dynamic and static/QDQ) are now considered exhausted for this model at
+default settings — see "if revisited" below.
 
 As with the ASR-side fp16/int8 findings elsewhere in this document, **this
 does not change the PC default**: `scripts/punct_ja.py`'s `PunctuatorJa`
