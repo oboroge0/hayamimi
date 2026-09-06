@@ -1,0 +1,135 @@
+{
+  "_generated_by": "scripts/make_ja_golden.py",
+  "_purpose": "Pinned output of hayamimi's Japanese route (docs/JA_PIPELINE.md) on eight FLEURS ja clips. tests/test_ja_golden.py re-runs the pipeline and compares; see tests/golden/ja/README.md for the exact-match / CER two-level rule.",
+  "_source": "FLEURS (google/fleurs, ja_jp), Copyright Google, licensed CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/). Clips copied unmodified from testdata/fleurs_bench/ja/; the reference text is that set's manifest.json.",
+  "_recorded_on": {
+    "date": "2026-09-02",
+    "cpu": "AMD64 Family 25 Model 33 Stepping 2, AuthenticAMD",
+    "platform": "Windows-10-10.0.26200-SP0",
+    "python": "3.11.9",
+    "sherpa_onnx": "1.13.6"
+  },
+  "_settings": {
+    "cli": "scripts/realtime_transcribe.py --wav <clip> --no-realtime --mode single --lang ja --threads 4",
+    "threads": 4,
+    "mode": "single",
+    "lang": "ja",
+    "realtime": false,
+    "partials": true,
+    "refine": true,
+    "punctuate": true,
+    "itn": true,
+    "max_resident": 3
+  },
+  "_cer_tolerance": 0.01,
+  "clips": [
+    {
+      "wav": "ja_014.wav",
+      "sha256": "638d54e8eb6dcde05e1725eaef62ab0e542db7cd11893241632b55226ed10fd5",
+      "audio_s": 9.6,
+      "fleurs_id": 1669,
+      "reference": "警察のチャンドラ・シェカール・ソランキ総監によれば、被告人は顔を隠して法廷に出頭したそうです。",
+      "finals": [
+        "警察のチャンドラシェカール・ソランキ総監によれば被告人は顔を隠して法廷に出頭したそうです。"
+      ],
+      "refine": "警察のチャンドラシェカール・ソランキ総監によれば被告人は顔を隠して法廷に出頭したそうです。",
+      "cer_finals_vs_reference": 0.0222,
+      "cer_refine_vs_reference": 0.0222
+    },
+    {
+      "wav": "ja_024.wav",
+      "sha256": "738ada9dd3dc4c594b399b4405c74a6b1df857405e09f88f21485401c0986c58",
+      "audio_s": 8.7,
+      "fleurs_id": 1674,
+      "reference": "1分間で沸騰する地域もあれば、沸騰するまでに何分もかかる地域もあります。",
+      "finals": [
+        "あと。",
+        "一分間で沸騰する地域もあれば。沸騰するまでに何分もかかる地域もあります。"
+      ],
+      "refine": "一分間で沸騰する地域もあれば。沸騰するまでに何分もかかる地域もあります。",
+      "cer_finals_vs_reference": 0.0882,
+      "cer_refine_vs_reference": 0.0294
+    },
+    {
+      "wav": "ja_033.wav",
+      "sha256": "790e808712d69163e57e3875732cd57352623d96360e8ac4c153db47f27fa095",
+      "audio_s": 7.8,
+      "fleurs_id": 1677,
+      "reference": "現在、翅を折り返すことができない昆虫はトンボとカゲロウのみです。",
+      "finals": [
+        "あ。",
+        "現在羽根を折り返すことができない昆虫はトンボとカゲロウのみです。"
+      ],
+      "refine": "現在羽根を折り返すことができない昆虫はトンボとカゲロウのみです。",
+      "cer_finals_vs_reference": 0.1,
+      "cer_refine_vs_reference": 0.0667
+    },
+    {
+      "wav": "ja_036.wav",
+      "sha256": "5729b0cac23301db6083e31f4c142e715e2d4e7004d876fc9b37450011ce146d",
+      "audio_s": 6.48,
+      "fleurs_id": 1679,
+      "reference": "エアロスミスはツアーで予定していたコンサートを中止しました。",
+      "finals": [
+        "エアロスミスはツアーで予定していたコンサートを中止しました。"
+      ],
+      "refine": "エアロスミスはツアーで予定していたコンサートを中止しました。",
+      "cer_finals_vs_reference": 0.0,
+      "cer_refine_vs_reference": 0.0
+    },
+    {
+      "wav": "ja_044.wav",
+      "sha256": "2b52a2e5fbdac946fe2f094b5fe0911e291396e35bc3ef433963d3506a3a21bf",
+      "audio_s": 9.06,
+      "fleurs_id": 1684,
+      "reference": "アピアはサモアの首都です。この町はウポル島にあり、人口は4万人弱です。",
+      "finals": [
+        "あ。",
+        "この町はウポル島にあり人口は4万人弱です。"
+      ],
+      "refine": "この町はウポル島にあり人口は4万人弱です。",
+      "cer_finals_vs_reference": 0.375,
+      "cer_refine_vs_reference": 0.375
+    },
+    {
+      "wav": "ja_079.wav",
+      "sha256": "c3eeedb6db02dc6947f3664f1a0144c97157603e1c80dd92989fef4cd0538a86",
+      "audio_s": 9.9,
+      "fleurs_id": 1702,
+      "reference": "わずか2週間でアメリカ軍と自由フランス軍は南フランスを解放し、ドイツに向かっていました。",
+      "finals": [
+        "僅か二週間でアメリカ軍と自由フランス軍は南フランスを解放しドイツに向かっていました。"
+      ],
+      "refine": "僅か二週間でアメリカ軍と自由フランス軍は南フランスを解放しドイツに向かっていました。",
+      "cer_finals_vs_reference": 0.0714,
+      "cer_refine_vs_reference": 0.0714
+    },
+    {
+      "wav": "ja_085.wav",
+      "sha256": "11a15112d5e9f37d48dda5147a762d34e449af8072f5c5d6aac1eaffbd411f90",
+      "audio_s": 12.48,
+      "fleurs_id": 1705,
+      "reference": "1940年8月15日、連合国は南フランスに侵攻し、その侵攻は「ドラグーン作戦」と呼ばれました。",
+      "finals": [
+        "ああ。",
+        "1940年八月15日連合国は南フランスに侵攻しその侵攻はドラグーン作戦と呼ばれました。"
+      ],
+      "refine": "1940年八月15日連合国は南フランスに侵攻しその侵攻はドラグーン作戦と呼ばれました。",
+      "cer_finals_vs_reference": 0.0714,
+      "cer_refine_vs_reference": 0.0238
+    },
+    {
+      "wav": "ja_090.wav",
+      "sha256": "920d16c63c80a9bc20f842259bbf59b31d0a3573f803104a837d1a3e9a525579",
+      "audio_s": 11.22,
+      "fleurs_id": 1710,
+      "reference": "先週、経済産業省は、Appleが「深刻ではない」とする過熱事故を追加で34件報告したと発表しました。",
+      "finals": [
+        "先週経済産業省はアップルが深刻ではないとする過熱事項を追加で34件報告したと発表しました。"
+      ],
+      "refine": "先週経済産業省はアップルが深刻ではないとする過熱事項を追加で34件報告したと発表しました。",
+      "cer_finals_vs_reference": 0.1333,
+      "cer_refine_vs_reference": 0.1333
+    }
+  ]
+}
