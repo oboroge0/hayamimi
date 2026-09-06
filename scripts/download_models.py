@@ -24,6 +24,7 @@ not permissive like the rest.
 import argparse
 import io
 import os
+import shutil
 import sys
 import tarfile
 import urllib.request
@@ -115,23 +116,45 @@ def download_and_extract_tarbz2(url: str, dest_dir: str, label: str) -> None:
 def extract_members_only(url: str, dest_dir: str, wanted_basenames: set, label: str) -> None:
     """Like download_and_extract_tarbz2, but keeps only specific files from
     the tarball (used for omnilingual, where we only need the int8 weights
-    and tokens, not the README/test_wavs)."""
+    and tokens, not the README/test_wavs).
+
+    "Present" means every wanted file exists, not just the directory: an
+    earlier version skipped on the bare directory, so a tarball that lacked
+    one of the wanted files left a half-filled directory behind that every
+    later run then treated as complete (the 2026-09-04 omni incident: the
+    fp32 tarball has no model.int8.onnx, so models/omnilingual-300m-ctc-int8
+    held only tokens.txt and the live fallback route had no model to load).
+    A tarball missing a wanted file is now an error, and the partial
+    directory is removed so the next run retries instead of skipping."""
     target = os.path.join(MODELS_DIR, dest_dir)
-    if os.path.isdir(target):
+    have = {b for b in wanted_basenames if os.path.exists(os.path.join(target, b))}
+    if have == wanted_basenames:
         print(f"[skip] {label} (already present: {target})")
         return
+    if have:
+        print(f"  {target} is incomplete (has {sorted(have)}, "
+              f"needs {sorted(wanted_basenames)}): re-fetching")
     print(f"[get ] {label}")
     tmp = os.path.join(MODELS_DIR, f".{dest_dir}.tar.bz2.part")
     os.makedirs(target, exist_ok=True)
     _download_to(url, tmp)
     print(f"  extracting (selected files) -> {target}")
+    got = set()
     with tarfile.open(tmp, "r:bz2") as tf:
         for member in tf.getmembers():
             base = os.path.basename(member.name)
             if base in wanted_basenames:
                 member.name = base
                 tf.extract(member, target)
+                got.add(base)
     os.remove(tmp)
+    missing = wanted_basenames - got
+    if missing:
+        shutil.rmtree(target, ignore_errors=True)
+        raise RuntimeError(
+            f"{label}: the tarball at {url} does not contain {sorted(missing)} "
+            f"(it has no file by that name); refusing to leave a partial "
+            f"{target} behind. The URL or the wanted file list is wrong.")
 
 
 def download_hf_repo(repo: str, dest_dir: str, label: str, ignore_patterns=None) -> None:
@@ -220,11 +243,14 @@ def main():
         "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
         "Parakeet TDT 0.6B v3 (en + 24 EU languages)")
 
+    # The int8 weights live in their own "-int8-" tarball upstream; the
+    # plain "300M-ctc-2025-11-12" tarball is fp32 only (model.onnx, 1.3GB)
+    # and has no model.int8.onnx at all.
     extract_members_only(
-        f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-2025-11-12.tar.bz2",
+        f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-int8-2025-11-12.tar.bz2",
         "omnilingual-300m-ctc-int8",
         {"model.int8.onnx", "tokens.txt"},
-        "Meta Omnilingual ASR 300M CTC (~1600-language fallback)")
+        "Meta Omnilingual ASR 300M CTC int8 (~1600-language fallback)")
 
     download_file(
         f"{GITHUB_RELEASES}/{SPEAKER_TAG}/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
