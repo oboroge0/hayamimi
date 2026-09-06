@@ -33,7 +33,7 @@ get it.
 
 | Model | Publisher | License | Source |
 |---|---|---|---|
-| `mojicast-punct-onnx` (`punct_bert.fp16.onnx` + `vocab.txt`) | Base models: Tohoku NLP + bobfromjapan; ONNX export: Mojicast (ishiki-emo) | Apache-2.0 | [tohoku-nlp/bert-base-japanese-char-v3](https://huggingface.co/tohoku-nlp/bert-base-japanese-char-v3), [bobfromjapan/bert_japanese_punctuation](https://huggingface.co/bobfromjapan/bert_japanese_punctuation), export: [ishiki-emo/mojicast-punct-onnx](https://huggingface.co/ishiki-emo/mojicast-punct-onnx) |
+| `mojicast-punct-onnx` (`punct_bert.fp16.onnx` + `vocab.txt`) | Base models: Tohoku NLP + bobfromjapan; ONNX export: Mojicast (ishiki-emo) | Apache-2.0 | [tohoku-nlp/bert-base-japanese-char-v3](https://huggingface.co/tohoku-nlp/bert-base-japanese-char-v3), [bobfromjapan/bert_japanese_punctuation](https://huggingface.co/bobfromjapan/bert_japanese_punctuation), export: [ishiki-emo/mojicast-punct-onnx](https://huggingface.co/ishiki-emo/mojicast-punct-onnx); fp16 distribution: [oboroge0/hayamimi-punct-ja-fp16](https://huggingface.co/oboroge0/hayamimi-punct-ja-fp16) |
 
 ## Dart package dependencies
 
