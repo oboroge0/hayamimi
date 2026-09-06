@@ -58,6 +58,9 @@ class _FakeASR:
     def _decode(self, rec, samples, sr):
         return self._decode_impl(rec, samples, sr)
 
+    def _emit(self, event):
+        pass  # no on_event sink wired for this stub; just enough to not AttributeError
+
 
 def test_missing_model_warns_once_and_disables(capsys):
     def raise_unavailable(name):
