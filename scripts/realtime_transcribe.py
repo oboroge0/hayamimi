@@ -60,11 +60,11 @@ def build_vad(min_silence: float = 0.35,
               max_speech: float = 12.0,
               vad_threshold: float = 0.5) -> sherpa_onnx.VoiceActivityDetector:
     # 0.35s endpointing measured CER-neutral vs 0.5s on real broadcast ja
-    # (docs/BENCHMARKS.md iteration 9) and finalizes 150ms sooner. max_speech
+    # (docs/results/benchmarks.md iteration 9) and finalizes 150ms sooner. max_speech
     # force-splits breathless monologues (radio/game commentary hit 21s
     # segments) so finals stay timely; the refine pass re-merges the group.
     # vad_threshold is Silero's own speech-probability cutoff (sherpa_onnx's
-    # SileroVadModelConfig default is 0.5). docs/DIARIZATION_PLAN.md section
+    # SileroVadModelConfig default is 0.5). docs/design/diarization.md section
     # 13 (Round 3) swept 0.40/0.30/0.20 on the AMI eval set: miss did drop
     # as expected, but confusion grew far more (offline diarization gets
     # more/noisier low-energy segments to cluster), so mean DER got *worse*
@@ -395,7 +395,7 @@ class SessionStats:
         self.segments = 0
         self.latencies_ms: list[float] = []
         self.refine_lang_corrections = 0  # times the refine pass overruled the fast-path language
-        # docs/DIARIZATION_PLAN.md section 10.6 diagnostics: eval_diar.py's
+        # docs/design/diarization.md section 10.6 diagnostics: eval_diar.py's
         # generate_diarize_hypothesis() groups VAD segments purely on the
         # silence-gap/max-length "due" condition (see group_segments()'s
         # docstring) and has no decoded text to split groups on a language
@@ -509,7 +509,7 @@ def drain_segments(vad, sample_rate: int, asr: RoutedASR, stats: SessionStats,
         # refiner's spans -- majority voting and any other grouping logic
         # must only ever see the assignment SpeakerLabeler actually made.
         # display_speaker is the same label with issue #11's provisional
-        # "?" suffix applied (docs/DIARIZATION_PLAN.md section 10.8, option
+        # "?" suffix applied (docs/design/diarization.md section 10.8, option
         # B) and is used ONLY for what gets printed/published right here --
         # assignment is untouched.
         canonical_speaker = ""
@@ -779,7 +779,7 @@ class Refiner:
         # an `is not None` guard.
         self.translators = translators if translators is not None else TranslatorPool()
         self.stats = stats
-        # docs/DIARIZATION_PLAN.md iterations 3-4: when --speakers is on,
+        # docs/design/diarization.md iterations 3-4: when --speakers is on,
         # re-diarize each group's audio (group-local speaker turns) and
         # remap those local clusters onto speaker_labeler's session-global
         # S{n} centroids, so a refine group with a mid-group speaker change
@@ -790,20 +790,20 @@ class Refiner:
         # and the fast path's centroids double as the diarizer's anchor set.
         self.speaker_labeler = speaker_labeler
         self.diarizer = diarizer
-        # Round 4 (docs/DIARIZATION_PLAN.md section 14) T2 experiment: see
+        # Round 4 (docs/design/diarization.md section 14) T2 experiment: see
         # eval_diar.generate_diarize_hypothesis()'s min_remap_update_s
         # docstring. 0.0 (default) is a no-op.
         self.min_remap_update_s = min_remap_update_s
-        # Round 5 (docs/DIARIZATION_PLAN.md section 15) T1 experiment: see
+        # Round 5 (docs/design/diarization.md section 15) T1 experiment: see
         # speaker_id.SpeakerLabeler.match_embeddings_joint()'s docstring.
         # False (default) is a no-op -- every local cluster still remaps
         # independently via match_embedding(), same as before.
         self.joint_remap = joint_remap
-        # Round 5 (docs/DIARIZATION_PLAN.md section 15) T3 experiment: see
+        # Round 5 (docs/design/diarization.md section 15) T3 experiment: see
         # speaker_id.SpeakerLabeler.match_embedding()'s exclude_provisional
         # docstring. False (default) is a no-op.
         self.exclude_provisional_remap = exclude_provisional_remap
-        # Round 7 (docs/DIARIZATION_PLAN.md section 17): see
+        # Round 7 (docs/design/diarization.md section 17): see
         # eval_diar.generate_diarize_hypothesis()'s global_recluster
         # docstring for the full design. False (default) is a no-op: no
         # extra bookkeeping happens in _emit_turns() and live output is
@@ -820,7 +820,7 @@ class Refiner:
         # round.
         self.global_recluster = global_recluster
         self.global_recluster_threshold = global_recluster_threshold
-        # Round 9 (docs/DIARIZATION_PLAN.md section 19) Experiment A: see
+        # Round 9 (docs/design/diarization.md section 19) Experiment A: see
         # eval_diar.generate_diarize_hypothesis()'s num_clusters_hint
         # docstring -- same "off"/"confirmed"/"confirmed-capped" modes,
         # same min-speech-duration gate. "off" (default) is a no-op.
@@ -914,7 +914,7 @@ class Refiner:
     def _emit_turns(self, buf: np.ndarray, refine_lang: str, fast_joined: str,
                     majority_speaker: str = "", num_clusters_hint_value: int | None = None
                     ) -> bool:
-        """Multi-speaker refine path (docs/DIARIZATION_PLAN.md iterations 3-4).
+        """Multi-speaker refine path (docs/design/diarization.md iterations 3-4).
 
         Re-diarizes this group's audio and, if it finds a genuine speaker
         change, decodes and prints one [refine/S{n}] line per turn instead
@@ -929,7 +929,7 @@ class Refiner:
         fallback for a too-short local cluster when self.min_remap_update_s
         gates it (see that attribute's comment); ignored otherwise.
 
-        num_clusters_hint_value (Round 9, docs/DIARIZATION_PLAN.md section
+        num_clusters_hint_value (Round 9, docs/design/diarization.md section
         19): maybe_refine() precomputes this per self.num_clusters_hint/
         self.num_clusters_hint_min_s (see their docstrings) using this
         group's fast-path span count/duration and self.speaker_labeler's
@@ -958,7 +958,7 @@ class Refiner:
                                       "message": message})
             raw = []
 
-        # Round 8 (docs/DIARIZATION_PLAN.md section 18) T1: this helper
+        # Round 8 (docs/design/diarization.md section 18) T1: this helper
         # records a group-level pool entry (local_id=-1 sentinel) for
         # whichever `turns` view was live at the moment this group declines,
         # when global_recluster is on -- mirrors eval_diar.
@@ -1049,7 +1049,7 @@ class Refiner:
         joint_ids = [lid for lid in local_ids if lid not in short_ids]
         if joint_ids:
             if self.joint_remap:
-                # Round 5 (docs/DIARIZATION_PLAN.md section 15) T1: solve
+                # Round 5 (docs/design/diarization.md section 15) T1: solve
                 # this group's remaining clusters' assignment jointly so
                 # two distinct local clusters can't collapse onto the same
                 # global speaker. match_embeddings_joint() itself falls
@@ -1066,7 +1066,7 @@ class Refiner:
                         cluster_embs[local_id], update=True, threshold=self.speaker_labeler.remap_threshold,
                         source="remap", exclude_provisional=self.exclude_provisional_remap)
 
-        # iteration 6 (docs/DIARIZATION_PLAN.md section 9): this refine
+        # iteration 6 (docs/design/diarization.md section 9): this refine
         # group's remap is the natural "clean copy" boundary -- give
         # maybe_merge_centroids() a chance to fold any two global speakers
         # that have drifted together before the next group opens more.
@@ -1110,8 +1110,8 @@ class Refiner:
         return True
 
     def run_global_recluster(self) -> dict:
-        """Session-end (post-hoc) global re-cluster, Round 7 (docs/
-        DIARIZATION_PLAN.md section 17). No-op unless self.global_recluster.
+        """Session-end (post-hoc) global re-cluster, Round 7 (docs/design/
+        diarization.md section 17). No-op unless self.global_recluster.
 
         Re-clusters every (refine-group, local-cluster) embedding
         accumulated by _emit_turns() across the whole session with
@@ -1192,12 +1192,12 @@ class Refiner:
         # a genuinely mixed-language group must not be re-decoded in one
         # language: the per-segment finals already used the right model per
         # language, and a majority-language re-decode mangles the minority
-        # (docs/BENCHMARKS.md iteration 25). Keep the merge, skip the decode.
+        # (docs/results/benchmarks.md iteration 25). Keep the merge, skip the decode.
         mixed = len(set(langs)) > 1 and min(langs.count(l) for l in set(langs)) / len(langs) >= 0.25
         speakers = [sp for _, _, _, _, sp in self.spans if sp]
         speaker = max(set(speakers), key=speakers.count) if speakers else ""
         fast_joined = " ".join(t for _, _, _, t, _ in self.spans if t.strip())
-        # Round 9 (docs/DIARIZATION_PLAN.md section 19) Experiment A: same
+        # Round 9 (docs/design/diarization.md section 19) Experiment A: same
         # hint computation as eval_diar.generate_diarize_hypothesis(), done
         # here (before self.spans is cleared below) because this is the
         # only place both the group's own fast-path span list and
@@ -1232,7 +1232,7 @@ class Refiner:
             else:
                 # re-run LID on the merged (longer, higher-confidence)
                 # audio: the fast path's per-segment majority vote used
-                # only 2-4s clips, which docs/LID.md measured well below
+                # only 2-4s clips, which docs/eval/lid.md measured well below
                 # whisper-tiny's high-confidence length for several
                 # languages. But "longer" only holds when the group
                 # really is a multi-segment utterance -- a group can be
@@ -1298,7 +1298,7 @@ class Refiner:
                 self.stats.refine_lang_corrections += 1
                 print(f"[refine] language corrected {lang}->{refine_lang}", flush=True)
 
-            # docs/DIARIZATION_PLAN.md iterations 3-4: if the group actually
+            # docs/design/diarization.md iterations 3-4: if the group actually
             # contains a speaker change, prefer per-turn output over the
             # single majority-vote line below. mixed-language groups skip
             # this (their "text" is already the joined fast finals, not a
@@ -1568,7 +1568,7 @@ def main():
                     help="language-switch policy preset (default balanced). single: fixed to "
                          "--lang, no LID/switching at all. balanced: dual-LID switch "
                          "confirmation for ja/en/zh/ko/yue via SenseVoice, length+repeat-count "
-                         "hysteresis for other languages (docs/LID.md). fast: switch "
+                         "hysteresis for other languages (docs/eval/lid.md). fast: switch "
                          "immediately on any whisper-tiny detection, no confirmation "
                          "(equivalent to --lid-switch-confirm 1 --lang-switch-guard 0). "
                          "The individual --lang-switch-guard/--lid-switch-confirm flags below "
@@ -1595,9 +1595,9 @@ def main():
                     help="cosine similarity threshold for the refine-path local-cluster-to-"
                          "global remap (speaker_id.SpeakerLabeler.remap_threshold), independent "
                          "of the fast-path SIM_THRESHOLD. Default: same as the fast path "
-                         "(speaker_id.SIM_THRESHOLD). See docs/DIARIZATION_PLAN.md section 8.")
+                         "(speaker_id.SIM_THRESHOLD). See docs/design/diarization.md section 8.")
     ap.add_argument("--speaker-merge", action="store_true",
-                    help="iteration 6 (docs/DIARIZATION_PLAN.md section 9) mitigation for "
+                    help="iteration 6 (docs/design/diarization.md section 9) mitigation for "
                          "speaker-count overestimation: after each refine group's remap, fold "
                          "together any two global speaker centroids that have drifted close "
                          "enough to look like the same person. Off by default.")
@@ -1605,7 +1605,7 @@ def main():
                     help="cosine similarity above which two global centroids merge, when "
                          "--speaker-merge. Default: speaker_id.MERGE_THRESHOLD.")
     ap.add_argument("--speaker-hysteresis", action=argparse.BooleanOptionalAction, default=None,
-                    help="iteration 6 (docs/DIARIZATION_PLAN.md section 9) mitigation for "
+                    help="iteration 6 (docs/design/diarization.md section 9) mitigation for "
                          "speaker-count overestimation: a newly opened global speaker displays "
                          "under its nearest confirmed speaker's label until it has recurred "
                          "--speaker-hysteresis-min-hits times. Default: speaker_id."
@@ -1618,7 +1618,7 @@ def main():
                     help="hits required to confirm a provisional speaker, when "
                          "--speaker-hysteresis. Default: speaker_id.HYSTERESIS_MIN_HITS.")
     ap.add_argument("--speaker-min-remap-update-s", type=float, default=0.0, metavar="S",
-                    help="Round 4 (docs/DIARIZATION_PLAN.md section 14) T2 experiment: a "
+                    help="Round 4 (docs/design/diarization.md section 14) T2 experiment: a "
                          "refine-group local diarization cluster shorter than this many "
                          "seconds remaps READ-ONLY -- it can still match an existing global "
                          "speaker, but never folds its (likely noisier, since it's short) "
@@ -1626,14 +1626,14 @@ def main():
                          "S{n} on a miss, falling back to the group's majority fast-path label "
                          "instead. 0.0 (default) is a no-op.")
     ap.add_argument("--speaker-joint-remap", action="store_true",
-                    help="Round 5 (docs/DIARIZATION_PLAN.md section 15) T1 experiment: within "
+                    help="Round 5 (docs/design/diarization.md section 15) T1 experiment: within "
                          "one refine group, solve the local-cluster-to-global remap jointly "
                          "(Hungarian assignment maximizing total similarity) instead of matching "
                          "each local cluster independently, so two distinct local clusters "
                          "can't both land on the same global speaker. Off by default pending "
                          "measurement; see speaker_id.SpeakerLabeler.match_embeddings_joint().")
     ap.add_argument("--speaker-exclude-provisional-remap", action="store_true",
-                    help="Round 5 (docs/DIARIZATION_PLAN.md section 15) T3 experiment: a global "
+                    help="Round 5 (docs/design/diarization.md section 15) T3 experiment: a global "
                          "speaker centroid that hasn't yet been matched a second time (still "
                          "provisional, see speaker_id.PROVISIONAL_CONFIRM_HITS) is never chosen "
                          "as a remap target -- it may be 'stealing' a match that should have gone "
@@ -1641,7 +1641,7 @@ def main():
                          "speaker_id.SpeakerLabeler.match_embedding()'s exclude_provisional "
                          "docstring.")
     ap.add_argument("--speaker-global-recluster", action="store_true",
-                    help="Round 7 (docs/DIARIZATION_PLAN.md section 17) experiment: at "
+                    help="Round 7 (docs/design/diarization.md section 17) experiment: at "
                          "shutdown, re-cluster every refine group's local diarization cluster "
                          "embeddings accumulated over the whole session (two-stage constrained "
                          "agglomerative, same design as eval_diar_overlap.py's Round 6 "
@@ -1655,7 +1655,7 @@ def main():
                          "agglomerative merge stage (default 0.65).")
     ap.add_argument("--speaker-num-clusters-hint",
                     choices=["off", "confirmed", "confirmed-capped"], default="off",
-                    help="Round 9 (docs/DIARIZATION_PLAN.md section 19) Experiment A: pass a "
+                    help="Round 9 (docs/design/diarization.md section 19) Experiment A: pass a "
                          "num_clusters hint to diarize.GroupDiarizer's FastClustering, derived "
                          "from speaker_id.SpeakerLabeler.num_confirmed_speakers() at the moment "
                          "each refine group closes. 'off' (default) is a no-op. 'confirmed' uses "
@@ -1673,7 +1673,7 @@ def main():
                          "(zh, ko, es, fr, de, ...) is accepted if the model's vocabulary "
                          "supports it. Only zh/ko have measured translation quality so far "
                          "-- other targets print an 'unvalidated' note to stderr, see "
-                         "docs/TRANSLATE_M2M.md")
+                         "docs/design/translate_m2m.md")
     ap.add_argument("--input", choices=["mic", "wav", "ws"], default=None,
                     help="audio source; default is mic, or wav if --wav is given")
     ap.add_argument("--ws-host", default="127.0.0.1", metavar="HOST",
@@ -1903,20 +1903,20 @@ def main():
         if speaker_labeler is not None:
             merges = speaker_labeler.merge_history()
             if merges:
-                # docs/DIARIZATION_PLAN.md section 9 (design A): merges fold
+                # docs/design/diarization.md section 9 (design A): merges fold
                 # centroids together but don't retroactively rewrite labels
                 # already printed under the merged-away S{n} -- this table
                 # is how a reader reconciles those older lines by hand.
                 pairs = ", ".join(f"{old}->{new}" for old, new in sorted(merges.items()))
                 print(f"=== speaker merges (old->current label): {pairs} ===")
-            # docs/DIARIZATION_PLAN.md section 10.6 diagnostics: which path
+            # docs/design/diarization.md section 10.6 diagnostics: which path
             # (fast per-VAD-segment label() vs. refine-group remap
             # match_embedding()) opened each currently-live global centroid.
             print(f"=== speaker centroids opened by source: "
                   f"{speaker_labeler.centroid_open_counts()} ===")
             print(f"=== speaker centroid detail (label, opened_by, final_match_count): "
                   f"{speaker_labeler.centroid_summary()} ===")
-            # issue #11 / docs/DIARIZATION_PLAN.md section 10.8 option B: how
+            # issue #11 / docs/design/diarization.md section 10.8 option B: how
             # many labels never got past their provisional "S{n}?" display
             # (never matched a second time by session end) -- rows already
             # printed under that provisional form are not retroactively

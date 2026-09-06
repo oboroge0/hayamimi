@@ -36,7 +36,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS_DIR = os.path.join(ROOT, "scripts")
 EVAL_REAL_DIR = os.path.join(ROOT, "testdata", "eval_real_zhko")
 MANIFEST_PATH = os.path.join(EVAL_REAL_DIR, "manifest.json")
-DOCS_PATH = os.path.join(ROOT, "docs", "EVAL_REAL_ZHKO.md")
+DOCS_PATH = os.path.join(ROOT, "docs", "eval", "eval_real_zhko.md")
 
 sys.path.insert(0, SCRIPTS_DIR)
 
@@ -366,7 +366,7 @@ def write_markdown(results, agg):
         f"utterances ({n_zh} Mandarin Chinese + {n_ko} Korean, {total_audio:.1f}s total audio, "
         f"`testdata/eval_real_zhko/`). Goal: determine whether swapping SenseVoice for a "
         f"dedicated per-language model is worthwhile for zh and ko, mirroring the existing "
-        f"ja/en real-speech comparison in `docs/EVAL_REAL.md`.\n"
+        f"ja/en real-speech comparison in `docs/eval/eval_real.md`.\n"
     )
     lines.append(
         "## Data source\n\n"

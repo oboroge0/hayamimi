@@ -1,6 +1,6 @@
 # ASR Accuracy Evaluation — Real Speech
 
-Comparison of **Parakeet**, **SenseVoice**, **Omnilingual**, and **faster-whisper large-v3-turbo** (INT8, CPU) on a small set of **real, human-spoken** utterances (15 Japanese + 15 English, 166.0s total audio, `testdata/eval_real/`) — as opposed to the TTS-synthesized set in `testdata/eval/` (see `docs/EVAL.md`).
+Comparison of **Parakeet**, **SenseVoice**, **Omnilingual**, and **faster-whisper large-v3-turbo** (INT8, CPU) on a small set of **real, human-spoken** utterances (15 Japanese + 15 English, 166.0s total audio, `testdata/eval_real/`) — as opposed to the TTS-synthesized set in `testdata/eval/` (see `docs/eval/eval.md`).
 
 ## Data sources
 
@@ -59,7 +59,7 @@ Comparison of **Parakeet**, **SenseVoice**, **Omnilingual**, and **faster-whispe
 | Omnilingual | 0.0360 | 0.5120 | 0.0855 |
 | Whisper-turbo | 0.0216 | 0.1375 | 1.3877 |
 
-## Comparison to the TTS baseline (`docs/EVAL.md`)
+## Comparison to the TTS baseline (`docs/eval/eval.md`)
 
 TTS baseline (CER-ja% / WER-en%): Parakeet 9.1/13.7, SenseVoice 8.3/13.0, Omnilingual 10.3/15.1, Whisper-turbo 8.6/12.2. Real speech is expected to be harder across the board due to background noise/room acoustics, real prosody, disfluencies, and speaker variation absent from clean single-speaker TTS audio.
 

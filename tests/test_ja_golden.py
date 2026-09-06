@@ -1,6 +1,6 @@
 """Re-run the Japanese route over the golden clips and compare its output.
 
-docs/JA_PIPELINE.md specifies the ja route so another project can rebuild it;
+docs/spec/ja_pipeline.ja.md specifies the ja route so another project can rebuild it;
 tests/golden/ja/golden.json is what this project's own implementation of that
 specification actually produces. This test is what keeps the two honest: it
 runs the real pipeline (via scripts/make_ja_golden.py, the same code that

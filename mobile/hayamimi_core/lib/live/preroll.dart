@@ -7,7 +7,7 @@
 /// silence") reports a speech onset slightly after the speaker actually
 /// started, so the samples it hands over can begin partway into the first
 /// word. On the Android emulator run recorded in
-/// `docs/MOBILE.md`, `資料は昨日送りました` came back from the recognizer as
+/// `docs/verify/android_emulator.md`, `資料は昨日送りました` came back from the recognizer as
 /// `昨日は昨日送りました` and `あしたの会議は十時からです` lost its `あしたの`
 /// entirely — both utterance-initial words, both clipped by the onset.
 ///

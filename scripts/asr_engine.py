@@ -38,7 +38,7 @@ PJA_MODEL_DIR = os.path.join(MODELS_DIR, "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b
 VAD_MODEL_PATH = os.path.join(MODELS_DIR, "silero_vad.onnx")
 
 # ReazonSpeech ja-en zipformer: on real broadcast Japanese it beats even
-# whisper-turbo (CER 8.6% vs 13.8%) at RTF 0.02. See docs/EVAL_REAL.md.
+# whisper-turbo (CER 8.6% vs 13.8%) at RTF 0.02. See docs/eval/eval_real.md.
 # English goes to v3 instead: rz outputs unpunctuated ALL-CAPS English
 # (WER 1.6% vs v3's 2.5%, but v3's casing/punctuation reads far better).
 RZ_LANGS = {"ja"}
@@ -46,7 +46,7 @@ RZ_LANGS = {"ja"}
 # The ja tier's sherpa-onnx OfflineRecognizerConfig values, hoisted out of
 # _build_reazon() so scripts/dump_ja_config.py can report the configuration a
 # ja-only re-implementation has to match WITHOUT loading a model (see
-# docs/JA_PIPELINE.md). _build_reazon() below is the only other reader; these
+# docs/spec/ja_pipeline.ja.md). _build_reazon() below is the only other reader; these
 # are the same literals it used before, moved rather than changed.
 RZ_MODEL_TYPE = "zipformer"
 RZ_DECODING_METHOD = "modified_beam_search"
@@ -63,7 +63,7 @@ RZ_MODEL_FILES = {
 
 # Paraformer-zh beats SenseVoice on real Chinese (CER 5.6% vs 7.5%); the
 # dedicated Korean zipformer is worse (30%), so ko stays on SenseVoice.
-# See docs/EVAL_REAL_ZHKO.md.
+# See docs/eval/eval_real_zhko.md.
 PARA_LANGS = {"zh"}
 
 # SenseVoice small coverage (built-in ITN and punctuation).
@@ -333,7 +333,7 @@ def script_corrected_lang(tagged: str, text: str) -> str:
 # The 5 languages SenseVoice's own internal LID can arbitrate (its model
 # directory name: zh-en-ja-ko-yue). whisper-tiny can never actually emit
 # "yue" as a candidate (see the zh/yue arbitration in transcribe() below),
-# but it's listed here for documentation symmetry with docs/LID.md.
+# but it's listed here for documentation symmetry with docs/eval/lid.md.
 DUAL_CONFIRM_LANGS = {"ja", "en", "zh", "ko", "yue"}
 
 # A whisper-tiny candidate shorter than this is presumed non-speech noise
@@ -357,7 +357,7 @@ def resolve_dual_confirm(
 ) -> tuple[str, bool]:
     """Dual-LID switch confirmation for the 5 SenseVoice-covered languages.
 
-    docs/LID.md measured whisper-tiny alone at only 59-65% LID accuracy at
+    docs/eval/lid.md measured whisper-tiny alone at only 59-65% LID accuracy at
     2 seconds (far worse under babble noise -- 59%), but whisper-tiny AND
     SenseVoice's own internal LID AGREEING on the same language hits
     85-98% accuracy at the same length ("一致時正解率" in the LID.md
@@ -375,7 +375,7 @@ def resolve_dual_confirm(
     Session bootstrap (last_lang is None) has no current language to hold
     at while waiting for agreement, so it resolves directly to `sv_lang`:
     SenseVoice's own LID is already more accurate alone than whisper-tiny
-    alone (docs/LID.md table 2 vs table 1), and this is confirmed by
+    alone (docs/eval/lid.md table 2 vs table 1), and this is confirmed by
     agreement whenever sv_lang == lang too (this is the case tests exercise
     where whisper-tiny misfires "zh" but SenseVoice correctly says "ja" --
     the first segment must decode as "ja", not "zh", not silence).
@@ -420,7 +420,7 @@ def resolve_dual_confirm(
 # trusting it more than the fast path's per-segment vote because the group
 # is (usually) longer. But a Refiner "group" can be a single short segment
 # sitting alone between silence gaps -- not a real multi-segment utterance
-# -- so that assumption doesn't automatically hold. docs/LID.md's table 1
+# -- so that assumption doesn't automatically hold. docs/eval/lid.md's table 1
 # shows whisper-tiny-ALONE accuracy hasn't clearly separated from chance for
 # several languages below ~2.5s (babble_snr10 overall: 44% at 1.5s, 59% at
 # 2.0s, 65% at 2.5s); below that, a lone re-judgment is a coin flip that can
@@ -471,8 +471,8 @@ def resolve_sticky_lang(
     as a real language switch, or hold the session's current language.
 
     A single new-language detection can be a babble-noise misfire
-    (docs/NOISE.md -- whisper-tiny LID exposes no confidence score to
-    threshold on) or a jingle/SFX blip (docs/VIDEO_TEST.md) rather than a
+    (docs/eval/noise.md -- whisper-tiny LID exposes no confidence score to
+    threshold on) or a jingle/SFX blip (docs/eval/video_test.md) rather than a
     genuine switch. A real switch -- the speaker changing language, or a new
     speaker -- repeats the SAME new language on the next detection, while a
     misfire lands on a random one. `switch_confirm` CONSECUTIVE detections
@@ -509,7 +509,7 @@ def resolve_sticky_lang(
     detections, segments decode using bootstrap_probe_lang instead of
     blindly trusting whisper-tiny's possibly-wrong candidate, since
     SenseVoice alone already measures more accurate than whisper-tiny alone
-    (docs/LID.md table 2 vs table 1). If no probe was available
+    (docs/eval/lid.md table 2 vs table 1). If no probe was available
     (bootstrap_probe_lang falsy, e.g. --minimal install), this falls back
     to whisper-tiny's own candidate, same as before.
 
@@ -1487,7 +1487,7 @@ class RoutedASR:
         else:
             if self.last_lang is None and self.dual_confirm:
                 # session bootstrap: whisper-tiny alone is unreliable at short
-                # lengths (docs/LID.md) and can guess a language SenseVoice
+                # lengths (docs/eval/lid.md) and can guess a language SenseVoice
                 # can't even arbitrate (a real-mic incident: whisper-tiny said
                 # "ru" on segment 1 of a Japanese session and it collapsed
                 # from there). Always confirm the very first segment against
@@ -1499,7 +1499,7 @@ class RoutedASR:
 
             if self.dual_confirm and lang in DUAL_CONFIRM_LANGS:
                 if lang != self.last_lang:
-                    # docs/LID.md: for the 5 SenseVoice-covered languages,
+                    # docs/eval/lid.md: for the 5 SenseVoice-covered languages,
                     # confirm a candidate switch with SenseVoice's own LID
                     # instead of the old length/repeat-count hysteresis (see
                     # resolve_dual_confirm). Reuse the bootstrap probe above
@@ -1616,7 +1616,7 @@ class RoutedASR:
 
         # Everything above is byte-identical to the pre-retry engine, and the
         # language decision is now FINAL. Only if that whole-buffer decode
-        # looks like it dropped its leading content (docs/BENCHMARKS.md, the
+        # looks like it dropped its leading content (docs/results/benchmarks.md, the
         # FLEURS ja head-dropout) is the buffer re-decoded one utterance at a
         # time, through the very recognizer that produced `text` -- and even
         # then the result is kept only if it looks like a recovery.
@@ -1645,7 +1645,7 @@ class RoutedASR:
         if lang == "ko" and text.strip() and self.ko_spacer is not None:
             try:
                 # SenseVoice emits a space between every token; Kiwi restores
-                # real Korean word spacing (docs/BENCHMARKS.md iteration 20)
+                # real Korean word spacing (docs/results/benchmarks.md iteration 20)
                 text = self.ko_spacer.space(text, reset_whitespace=True)
             except Exception:
                 pass

@@ -103,12 +103,12 @@ class ManifestEvalRunner {
   /// `RoutingProfile.jaSenseVoice` routing (ReazonSpeech ja + SenseVoice
   /// en/zh/ko/yue, arbitrated per clip by the dual-LID policy in
   /// `../routing/`), so a multilingual manifest's language-routing accuracy
-  /// and CER can be compared against the PC pipeline's `docs/SCORECARD.md`.
+  /// and CER can be compared against the PC pipeline's `docs/results/scorecard.md`.
   ///
   /// Each entry is treated as its own isolated "session" (bootstrap: no
   /// prior language) since manifest clips are independent recordings, not
   /// a continuous conversation — this measures the dual-LID bootstrap path
-  /// specifically, which `docs/LID.md` table 3 shows is the harder case.
+  /// specifically, which `docs/eval/lid.md` table 3 shows is the harder case.
   ///
   /// Throws [BenchRunException] if the manifest or any model/wav file
   /// cannot be found/read.

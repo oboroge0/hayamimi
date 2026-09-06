@@ -79,7 +79,7 @@ class _BenchPageState extends State<BenchPage> {
   // same idea as the manifest eval above, but through RoutingProfile
   // .jaSenseVoice (ja + SenseVoice en/zh/ko/yue) instead of one recognizer,
   // so a mixed-language manifest's routing accuracy can be measured. See
-  // docs/MOBILE.md "Multi-language routing on mobile".
+  // docs/design/mobile_quantization.md "Multi-language routing on mobile".
   final _routedReazonDirController = TextEditingController();
   final _routedSenseVoiceDirController = TextEditingController();
   final _routedLidDirController = TextEditingController();

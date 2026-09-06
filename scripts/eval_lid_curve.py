@@ -18,7 +18,7 @@ SenseVoice's internal LID is read off the `<|xx|>` tag in its decode result
 arbitrate zh/yue (see asr_engine.py's transcribe()).
 
 Results are checkpointed to testdata/_lid_curve_cache.json (testdata/ is
-gitignored) so re-runs are cheap; pass --report to just rewrite docs/LID.md
+gitignored) so re-runs are cheap; pass --report to just rewrite docs/eval/lid.md
 from the existing cache.
 
 Usage:
@@ -40,7 +40,7 @@ from eval_common import load_manifest
 import eval_common
 
 WORKTREE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DOCS_PATH = os.path.join(WORKTREE_ROOT, "docs", "LID.md")
+DOCS_PATH = os.path.join(WORKTREE_ROOT, "docs", "eval", "lid.md")
 
 # Same 5 languages SenseVoice's own LID covers (see asr_engine.py SV_LANGS /
 # the "auto: SenseVoice has its own internal LID for its 5 langs" comment).
@@ -354,7 +354,7 @@ def main():
     ap.add_argument("--root", default=WORKTREE_ROOT,
                      help="repo root containing testdata/ (default: derived from script location)")
     ap.add_argument("--report", action="store_true",
-                     help="only (re)write docs/LID.md from the existing cache, no evaluation")
+                     help="only (re)write docs/eval/lid.md from the existing cache, no evaluation")
     args = ap.parse_args()
 
     cache = load_cache(args.root)

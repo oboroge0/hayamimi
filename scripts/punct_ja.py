@@ -1,7 +1,7 @@
 """Japanese punctuation restoration for ASR output.
 
 Standalone module: loads a small BERT-char token-classification ONNX model
-(from the OSS Mojicast project, see docs/PUNCT_JA.md) and inserts 、(comma)
+(from the OSS Mojicast project, see docs/design/punct_ja.md) and inserts 、(comma)
 and 。(period) into raw, unpunctuated Japanese text such as what a streaming
 ASR engine (e.g. ReazonSpeech k2 zipformer) typically emits.
 
@@ -36,12 +36,12 @@ DEFAULT_MODEL_DIR = SCRIPT_DIR.parent / "models" / "mojicast-punct-onnx"
 # --- the restorer's fixed configuration ------------------------------------
 # Named constants rather than bare literals in the signature below, so
 # scripts/dump_ja_config.py can report them without importing onnxruntime.
-# docs/JA_PIPELINE.md specifies the same values for the C++ port.
+# docs/spec/ja_pipeline.ja.md specifies the same values for the C++ port.
 PUNCT_COMMA_THRESHOLD = 0.5
 PUNCT_PERIOD_THRESHOLD = 0.5
 PUNCT_MAX_CHARS = 500          # under the model's 512 positions, incl. CLS/SEP
 PUNCT_FORCE_FINAL_PERIOD = True
-PUNCT_ONNX_FILENAME = "punct_bert.onnx"   # fp32; see docs/PUNCT_JA.md
+PUNCT_ONNX_FILENAME = "punct_bert.onnx"   # fp32; see docs/design/punct_ja.md
 PUNCT_INPUT_NAMES = ("input_ids", "attention_mask")
 PUNCT_OUTPUT_NAME = "logits"
 PUNCT_INTRA_OP_NUM_THREADS = 4
@@ -50,7 +50,7 @@ PUNCT_INTRA_OP_NUM_THREADS = 4
 _JA_PUNCT_CHARS = set("。、！？!?…「」『』（）()【】・,.\n")
 
 # Heuristic suffixes that strongly indicate a question -- the model only
-# predicts comma/period (see docs/PUNCT_JA.md), so "?" is added on top via
+# predicts comma/period (see docs/design/punct_ja.md), so "?" is added on top via
 # this simple rule-based check on the sentence-final mora, not by the model.
 _QUESTION_SUFFIXES = (
     "ですか", "ますか", "でしょうか", "かな", "かしら", "かい", "の",
@@ -91,8 +91,8 @@ class PunctuatorJa:
         # repo (punct_bert.int8.onnx) was verified to produce near-constant,
         # token-independent logits on this onnxruntime build (1.29.0) --
         # i.e. it does not actually restore punctuation. The fp32 file
-        # (punct_bert.onnx) is used by default. See docs/PUNCT_JA.md for
-        # details, and docs/MOBILE.md for a from-scratch INT8 requantization
+        # (punct_bert.onnx) is used by default. See docs/design/punct_ja.md for
+        # details, and docs/design/mobile_quantization.md for a from-scratch INT8 requantization
         # (scripts/quantize_punct.py) that IS verified functional -- pass
         # onnx_filename="quantized_ort/punct_bert.int8.onnx" (or wherever it
         # was written) to load that instead.
@@ -102,7 +102,7 @@ class PunctuatorJa:
             raise FileNotFoundError(
                 f"Punctuation model files not found under {model_dir}. "
                 "Expected punct_bert.int8.onnx and vocab.txt "
-                "(see docs/PUNCT_JA.md for download instructions)."
+                "(see docs/design/punct_ja.md for download instructions)."
             )
 
         self.comma_threshold = comma_threshold
@@ -208,7 +208,7 @@ class PunctuatorJa:
         """Rule-based post-pass: turn a sentence-final '。' into '？' when
         the sentence ends in a common question suffix. The ONNX model only
         classifies comma/period, so this is a simple heuristic layered on
-        top (see docs/PUNCT_JA.md, "known limitations")."""
+        top (see docs/design/punct_ja.md, "known limitations")."""
         segments = text.split("。")
         # split() on "a。b。" -> ["a", "b", ""]; a trailing "" means the
         # text ended with "。" (so there's nothing after the last mark).

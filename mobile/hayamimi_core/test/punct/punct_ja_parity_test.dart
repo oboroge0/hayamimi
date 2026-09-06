@@ -31,7 +31,7 @@ void main() {
     }
     if (vocabPath == null) {
       return 'models/mojicast-punct-onnx/vocab.txt is missing — see '
-          'docs/PUNCT_JA.md';
+          'docs/design/punct_ja.md';
     }
     if (libraryPath == null) {
       return 'no ONNX Runtime shared library was found (on Windows it comes '

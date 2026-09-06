@@ -1,13 +1,13 @@
 """Quantize the ja punctuation-restoration model (Mojicast BERT-char, see
-docs/PUNCT_JA.md) to INT8 and measure the accuracy / size tradeoff, as a
+docs/design/punct_ja.md) to INT8 and measure the accuracy / size tradeoff, as a
 follow-up mobile-sizing step to scripts/quantize_reazonspeech.py.
 
 Background: the INT8 file shipped upstream on HF (`punct_bert.int8.onnx`)
 was found non-functional in this environment (near-constant, token-
-independent logits -- see docs/PUNCT_JA.md, "Important deviation"). This
+independent logits -- see docs/design/punct_ja.md, "Important deviation"). This
 script instead requantizes the verified-correct fp32 file ourselves with
 `onnxruntime.quantization.quantize_dynamic`, the same technique that worked
-for the ReazonSpeech ASR encoder (docs/MOBILE.md), and checks whether our
+for the ReazonSpeech ASR encoder (docs/design/mobile_quantization.md), and checks whether our
 own INT8 export actually restores punctuation (unlike the upstream one).
 
 Produces:
@@ -48,7 +48,7 @@ QUANT_DIR = os.path.join(MODEL_DIR, "quantized_ort")
 INT8_NAME = "punct_bert.int8.onnx"
 INT8_PATH = os.path.join(QUANT_DIR, INT8_NAME)
 
-# Additional candidate variants (see docs/MOBILE.md, "Punctuation model
+# Additional candidate variants (see docs/design/mobile_quantization.md, "Punctuation model
 # INT8" -- dynamic INT8 failed the large-scale FLEURS re-verification, these
 # are the two follow-up candidates evaluated with the same harness).
 VARIANT_FILENAMES = {
@@ -64,7 +64,7 @@ MANIFEST_PATH = os.path.join(EVAL_DIR, "manifest.json")
 TARGET_MARKS = ("、", "。", "？")
 
 # FLEURS ja config/splits used for the larger re-verification eval set (see
-# docs/MOBILE.md, "Punctuation model INT8" -- the n=15 testdata/eval_real
+# docs/design/mobile_quantization.md, "Punctuation model INT8" -- the n=15 testdata/eval_real
 # sample was only ever a provisional check). FLEURS' ja_jp raw_transcription
 # already carries natural 、/。/？ punctuation (unlike the ASR-oriented
 # eval_real refs, FLEURS text wasn't written for this repo, so no filtering
@@ -245,7 +245,7 @@ def do_quantize_int8_static(calibration_texts):
     onnxruntime.quantization.quantize_static -- unlike quantize_dynamic
     (weights-only, activations computed in fp32 at runtime), this also
     quantizes activations using ranges observed over `calibration_texts`,
-    which is the natural next experiment flagged in docs/MOBILE.md after
+    which is the natural next experiment flagged in docs/design/mobile_quantization.md after
     dynamic INT8 failed the FLEURS re-verification (recall collapse)."""
     from onnxruntime.quantization import QuantFormat, QuantType, quantize_static
     from onnxruntime.quantization.shape_inference import quant_pre_process
@@ -439,7 +439,7 @@ def main():
                      help="quantization variant to produce/evaluate against fp32 "
                           "(default int8 = the original dynamic-INT8 recipe, which "
                           "already FAILED the fleurs n=250 re-verification -- see "
-                          "docs/MOBILE.md. fp16 and int8-static are the follow-up "
+                          "docs/design/mobile_quantization.md. fp16 and int8-static are the follow-up "
                           "candidates)")
     ap.add_argument("--source", choices=["eval_real", "fleurs"], default="eval_real",
                      help="reference set to evaluate against (default eval_real, the "

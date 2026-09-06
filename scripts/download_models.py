@@ -187,7 +187,7 @@ def main():
 
     # Punctuation model: only the fp32 export. The int8 export on this HF repo
     # (punct_bert.int8.onnx) was found non-functional (near-constant logits)
-    # on onnxruntime 1.29 CPU EP during development -- see docs/PUNCT_JA.md.
+    # on onnxruntime 1.29 CPU EP during development -- see docs/design/punct_ja.md.
     # Skipped here to save ~90MB and avoid confusion; punct_ja.py only ever
     # loads punct_bert.onnx.
     download_hf_repo(
@@ -208,7 +208,7 @@ def main():
         "Paraformer-zh (zh ASR)")
 
     # IMPORTANT: must be the 2024-07-17 export. The newer 2025-09-09 export
-    # was found broken during development (see docs/BENCHMARKS.md) -- do not
+    # was found broken during development (see docs/results/benchmarks.md) -- do not
     # substitute it.
     download_and_extract_tarbz2(
         f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2",
@@ -237,7 +237,7 @@ def main():
     # GroupDiarizer). Only used when --speakers is on; realtime_transcribe.py
     # degrades gracefully to fast-path-only labeling (majority-vote per
     # refine group, no per-turn split) if this directory is missing, so it's
-    # not fatal to skip. See docs/DIARIZATION_PLAN.md sections 2-3 and 7-8.
+    # not fatal to skip. See docs/design/diarization.md sections 2-3 and 7-8.
     download_and_extract_tarbz2(
         f"{GITHUB_RELEASES}/{SEGMENTATION_TAG}/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2",
         "sherpa-onnx-pyannote-segmentation-3-0",

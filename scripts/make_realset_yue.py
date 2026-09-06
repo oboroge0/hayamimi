@@ -44,7 +44,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS_DIR = os.path.join(ROOT, "scripts")
 EVAL_REAL_DIR = os.path.join(ROOT, "testdata", "eval_real_yue")
 MANIFEST_PATH = os.path.join(EVAL_REAL_DIR, "manifest.json")
-DOCS_PATH = os.path.join(ROOT, "docs", "EVAL_REAL_YUE.md")
+DOCS_PATH = os.path.join(ROOT, "docs", "eval", "eval_real_yue.md")
 
 sys.path.insert(0, SCRIPTS_DIR)
 
@@ -371,7 +371,7 @@ def write_markdown(results, agg, systems):
         f"of **real, human-spoken** Cantonese utterances ({n} clips, {total_audio:.1f}s total "
         f"audio, `testdata/eval_real_yue/`). Goal: determine whether SenseVoice's built-in "
         f"`yue` route is good enough, or whether a dedicated Cantonese model should be swapped "
-        f"in, mirroring the existing zh/ko real-speech comparison in `docs/EVAL_REAL_ZHKO.md`.\n"
+        f"in, mirroring the existing zh/ko real-speech comparison in `docs/eval/eval_real_zhko.md`.\n"
     )
     lines.append(
         "## Data source\n\n"

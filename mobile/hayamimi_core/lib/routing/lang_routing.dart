@@ -1,5 +1,5 @@
 /// Multilingual routing decisions, ported from the desktop pipeline's
-/// dual-LID policy (see `docs/LID.md` and `scripts/asr_engine.py`'s
+/// dual-LID policy (see `docs/eval/lid.md` and `scripts/asr_engine.py`'s
 /// `resolve_dual_confirm` / `resolve_sticky_lang` / `sv_lid_tag`).
 ///
 /// These are pure functions: no model calls, no I/O. Callers own running
@@ -10,7 +10,7 @@ library;
 /// The 5 languages SenseVoice's own internal LID can arbitrate (its model
 /// directory name: zh-en-ja-ko-yue). whisper-tiny can never actually emit
 /// "yue" as a candidate, but it's listed here for documentation symmetry
-/// with `docs/LID.md` and the desktop `DUAL_CONFIRM_LANGS`.
+/// with `docs/eval/lid.md` and the desktop `DUAL_CONFIRM_LANGS`.
 const Set<String> dualConfirmLangs = {'ja', 'en', 'zh', 'ko', 'yue'};
 
 /// A whisper-tiny candidate shorter than this is presumed non-speech noise
@@ -44,7 +44,7 @@ class DualConfirmResult {
 
 /// Dual-LID switch confirmation for the 5 SenseVoice-covered languages.
 ///
-/// `docs/LID.md` measured whisper-tiny alone at only 59-65% LID accuracy at
+/// `docs/eval/lid.md` measured whisper-tiny alone at only 59-65% LID accuracy at
 /// 2 seconds (far worse under babble noise), but whisper-tiny AND
 /// SenseVoice's own internal LID AGREEING on the same language hits
 /// 85-98% accuracy at the same length. So instead of gating a switch on
@@ -108,7 +108,7 @@ class StickyLangResult {
 /// A direct port of the desktop `resolve_sticky_lang`, for languages
 /// outside SenseVoice's 5-language coverage. It has **zero production
 /// callers today** — mobile currently has no tier for those languages (see
-/// `docs/MOBILE.md`), so [RoutedRecognizerSet] never reaches this path.
+/// `docs/design/mobile_quantization.md`), so [RoutedRecognizerSet] never reaches this path.
 /// It's kept, not deleted, as a faithful, tested port so a future
 /// non-SenseVoice language tier can reuse it without re-deriving the
 /// hysteresis rules from the desktop pipeline. Only `lang_routing_test.dart`

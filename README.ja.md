@@ -17,11 +17,11 @@ CPUだけでリアルタイム音声認識をやろうとすると、普通はWh
 その言語がいちばん得意なモデルに振り分けます。モデルはすべてINT8量子化のONNX形式で、
 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)の上で動くため、PyTorchもCUDAも要りません。
 
-実際のテレビ放送の日本語音声で測ると、この方式で**CER 3.8%**が出ます（2026-09-01再計測、冒頭欠落修正と数字正規化を含む現行パイプライン。`docs/SCORECARD.md`）。
+実際のテレビ放送の日本語音声で測ると、この方式で**CER 3.8%**が出ます（2026-09-01再計測、冒頭欠落修正と数字正規化を含む現行パイプライン。`docs/results/scorecard.md`）。
 同じ音声で`whisper-large-v3-turbo`は13.8%なので、誤りは半分以下。速度は6コアの
 デスクトップCPUで実時間の10〜50倍です。
 Whisper系・クラウドSTT API・他のローカルモデルとの比較（hayamimiが負けている言語も含めて）は
-`docs/COMPARISON.md`にまとめています。
+`docs/results/comparison.md`にまとめています。
 
 ## 機能
 
@@ -29,10 +29,10 @@ Whisper系・クラウドSTT API・他のローカルモデルとの比較（hay
 |---|---|
 | 5ルート言語カタログ | 日/中/韓/広東語/英+欧州24言語をそれぞれ最適な専用モデルへ。それ以外（約1600言語）はMeta Omnilingual ASRにフォールバック |
 | 速報字幕 | 発話中に約0.5秒ごとにドラフトテキストが更新される |
-| 高速確定 | 話し終えてから約100msで確定文が出る（日本語。他言語は`docs/GOALS.md`参照） |
+| 高速確定 | 話し終えてから約100msで確定文が出る（日本語。他言語は`docs/design/goals.md`参照） |
 | 二段パス補正 | 2秒の無音後、直近の発話群を一括再デコードし高精度な「清書」トランスクリプトを生成（実放送ja CER 15.5%→12.0%） |
 | 話者ラベル | `--speakers`でCAM++埋め込みによりリアルタイムにS1/S2/...をタグ付けし、清書パスでpyannote segmentation-3.0による本格的な再分離をかけ直して同じS{n}に対応付け（AMI 5会議でDER平均25.7%→13.9%、詳細はLimitations参照） |
-| 翻訳 | `--translate en,zh,ko,es,...`で日本語行をリアルタイム翻訳（en=FuguMT。それ以外はモデルの語彙が対応していれば任意のM2M-100ターゲット言語コードを受け付ける。zh/ko/esは品質を実測済み、詳細はdocs/TRANSLATE_M2M.md） |
+| 翻訳 | `--translate en,zh,ko,es,...`で日本語行をリアルタイム翻訳（en=FuguMT。それ以外はモデルの語彙が対応していれば任意のM2M-100ターゲット言語コードを受け付ける。zh/ko/esは品質を実測済み、詳細はdocs/design/translate_m2m.md） |
 | ホットワード/置換辞書 | `--hotwords`で固有名詞認識を強化（現状jaルートには効果なし。既知の制限を参照）、`--replace`は事後の検索置換でどのルートでも有効 |
 | 漢数字→算用数字変換 | 位取りの漢数字・点小数・桁読みの数字列を保守的に算用数字へ変換（日/中/広東語のみ）。慣用句・固有名詞（一番、一緒、九州など）は既定で変換しない（`scripts/itn_cjk.py`） |
 | 実行時辞書API | `RoutedASR.set_replacements()` / `set_itn_overrides()`でセッション中に置換辞書・ITN例外/強制指定を差し替え可能。`--serve`使用時は`GET`/`POST /replacements`・`/itn_overrides`でも同じことができる |
@@ -86,113 +86,15 @@ localhostからしかアクセスできません。LAN上の他端末を受け�
 
 ## 他アプリへの組み込み
 
-`scripts/realtime_transcribe.py`の各部品（`RoutedASR`、`build_vad`、`run_stream`）は
-CLI専用ではなくimportして使えます。`RoutedASR(...)`と`build_vad(...)`は、
-モデルパスが見つからない場合にsherpa-onnxのC++層が呼ぶ`exit()`（catchできない）
-の代わりに、catchできる`asr_engine.ModelUnavailable`を送出します。また
-`run_stream(..., stop_event=threading.Eventのインスタンス)`で`threading.Event`型の
-停止トークンを受け付けるので、ホストアプリが自前のスレッドでパイプラインを回している
-場合でも、CLIのプロセスにしか効かない`KeyboardInterrupt`に頼らず
-`stop_event.set()`だけできれいに止められます。
-
-## 組み込み: 実行時制御と構造化イベント
-
-上の仕組みだけでは埋まらない穴が二つ残っていました。ひとつは、どの言語に固定するか、
-翻訳するかどうか、VAD（音声区間検出。発話の開始と終了を判定する部品）の感度を
-どのくらいにするか、といったセッション設定がコンストラクタ時にしか渡せなかったこと
-です。ユーザーが途中で気が変わったホストアプリは、エンジンを丸ごと作り直すしか
-ありませんでした。もうひとつは、構造化されたセッションイベントが`--serve`を
-付けたときにしか存在しなかったことです。`--serve`なしでは、モデルの読み込みに
-失敗したことや、発話言語が切り替わったことをプログラムから知る手段がstderrと
-コンソールの自由形式の診断行を読み取るしかなく、これはプログラムから確実にパース
-できるものではありませんでした。
-
-どちらも同じ仕組みで解決しています。`realtime_transcribe.main()`（および
-`subtitle_server.EventHub`を直接組み立てるアプリ）は、`--serve`のHTTPサーバーの
-有無にかかわらず常にイベントハブを作るようになり、パイプラインの各段階はすべて
-そこへ発行されます。`--serve`は同じハブの上に追加のHTTPサーバーと、
-`subtitle_server.RuntimeControls`にひもづく3つのJSONエンドポイントを乗せる
-だけの存在になりました。
-
-**HTTPなしでイベントを受け取る。** このモジュールを直接importするアプリなら、
-`--serve`はおろか`SubtitleServer`すら要りません。`hub.add_listener(callback)`は、
-publishのたびに生のイベントdictを渡して同期的に呼び出すコールバックを登録します。
-`hub.subscribe()`（前述のダッシュボード/オーバーレイが`/events`のSSEとして内部で
-消費しているのと同じもので、`scripts/ws_ingest.py`はこれをそのままWebSocket
-クライアントへミラーしている）は、同じイベント列をJSON文字列の`queue.Queue`として
-返すので、コールバックではなくポーリングしたい側にはこちらが向いています。
-
-**イベントの種類。** すべてのイベントは`type`キーを持つJSONオブジェクトです。
-
-| `type` | 形 | いつ発行されるか |
-|---|---|---|
-| `session_start` | `{"type":"session_start"}` | セッション開始時に1回 |
-| `partial` | `{"type":"partial","text":str}` | 発話中のドラフトが更新されたとき（約0.5秒おき） |
-| `final` | `{"type":"final","text":str,"lang":str,"speaker":str,"latency_ms":float\|null,"tier":str,"audio_s":float,"lid_ms":float\|null,"decode_ms":float\|null,"switched":bool}` | VADのセグメントが確定したとき。`switched`は直前の確定文と`lang`が異なる場合だけtrue（セッション最初の確定文ではfalse） |
-| `translation` | `{"type":"translation","lang":str,"text":str}` | `--translate`のターゲット言語が日本語の確定文・清書行の翻訳を終えたとき |
-| `refine` | `{"type":"refine","text":str,"lang":str,"speaker":str,"audio_s":float}` | 発話群の二段目再デコード（清書）が出たとき |
-| `model_load` | `{"type":"model_load","model":str,"phase":"start"\|"done","ms":float\|null}` | 認識器/LID/句読点/翻訳モデルの読み込みが始まった・終わったとき。`model`はエンジン内部の短縮名（`rz`/`pz`/`sv`/`v3`/`omni`/`pja`/`lid`/`punct`、または`translator:<言語コード>`） |
-| `model_fallback` | `{"type":"model_fallback","requested":str,"used":str,"reason":str}` | 要求されたモデルが無く（`--minimal`インストールなど）別のティアに振り替えたとき。同じセッション内で同じ要求モデルについては1回だけ発行 |
-| `warning` | `{"type":"warning","code":str,"message":str}` | 致命的ではない劣化状態。`code`は`hotwords_unencodable`・`segmentation_vad_unavailable`・`second_opinion_unavailable`・`diarization_failed`のいずれか |
-| `session_summary` | `{"type":"session_summary","stats":{...},"speakers":{...}\|null}` | プロセス終了時、およびセッションリセット直前。`stats`はコンソールの`=== session summary: ... ===`行と同じ数値、`speakers`は`--speakers`使用時のみ話者診断行と同じ内容（それ以外は`null`） |
-| `recluster` | `{"type":"recluster","time_s":float,"n_entries":int,"n_clusters":int,"mapping":{...}}` | `--speaker-global-recluster`のセッション末診断が実際に走ったとき |
-| `session_reset` | `{"type":"session_reset"}` | `POST /reset`（または`reset_live_session()`の直接呼び出し）が完了したとき |
-
-**HTTP経由の実行時制御（`--serve`時のみ）。** 前述の`/replacements`・`/itn_overrides`に加えて
-3つのエンドポイントがあります。
-
-```bash
-# 現在のセッション設定を読む
-curl http://localhost:8833/config
-
-# セッションを英語に固定し、言語切替時にSenseVoice自身のLIDとの一致を
-# 必須としないようにする
-curl -X POST http://localhost:8833/config \
-  -d '{"lang": "en", "dual_confirm": false}'
-
-# 韓国語をリアルタイム翻訳の対象に追加する（ここに列挙しなかったターゲットは
-# 削除される。他の設定キーと同様、集合全体を置き換える動作）
-curl -X POST http://localhost:8833/config -d '{"translate": ["en", "ko"]}'
-
-# VADの感度を下げる: セグメントが確定するまで待つ無音時間を長くする
-curl -X POST http://localhost:8833/config -d '{"vad": {"min_silence": 0.6}}'
-
-# 会話をリセットする: 話者と言語切替の状態は忘れるが、モデルは常駐したまま
-# （再読み込みのコストなし）
-curl -X POST http://localhost:8833/reset
-```
-
-`GET /config`は`{"lang": null|str, "dual_confirm": bool, "punctuate": bool,
-"lid_switch_confirm": int, "min_switch_s": float, "translate": [str, ...],
-"vad": {"threshold": float, "min_silence": float, "max_speech": float}}`を
-返します。`POST /config`はこれらのキーの任意の部分集合を受け付け、対応する
-`RoutedASR`/`TranslatorPool`/VADのsetterへそれぞれ渡します。値が不正な場合
-（ルーティング不能な言語コード、負の`min_switch_s`、未対応の翻訳ターゲット
-など）は、そのsetter自身のエラーメッセージ付きで`400`を返し、部分的な適用や
-値の暗黙のクランプはしません。VADの感度だけは即座には反映されません。
-sherpa-onnxにはその場で設定を変えるAPIが無いため、`vad`の変更は検出器が
-発話区間の途中でないタイミングまで遅延され、そこで作り直されます。誰かが
-話している最中に来た変更要求は、リクエストの瞬間ではなく、その人が話し終えた
-タイミングで反映されます。
-
-`POST /reset`は実行中セッションの話者セントロイド、言語の確定/保留状態、
-清書・セッションの統計をクリアします。モデルは一切再読み込みしないので、
-次のセグメントはプロセスを起動し直したかのように始まります。1つの長時間
-プロセスの中で無関係な収録が切り替わる場面（配信のゲスト交代、来場者ごとに
-リセットするキオスク端末など）で、モデル再読み込みのコストを払わずに済みます。
-
-リセット処理自体はHTTPハンドラのスレッドでは実行されません。話者・言語の
-状態はデコードスレッドが自前のロックなしで読み書きしているため、別スレッド
-から直接リセットを走らせると、デコード中のスレッド側で例外が飛ぶ場合がある
-とレビューで判明しました。代わりにキューに積んでおき、そのスレッドが音声
-チャンクの間の安全なタイミングに達した時点で実行します。1チャンクは
-せいぜい数十ミリ秒なので、通常はほぼ瞬時に反映されます。`POST /reset`は
-リセットが実際に走った時点で`200 {"ok": true}`を返し、10秒経っても安全な
-タイミングが来なければ`202 {"ok": false, "pending": true}`を返します
-（まだキューに残っているだけで、後で必ず適用されます）。これが主に効いて
-くるのは`--input ws`のときです。音声を送っているクライアントがいなければ
-チャンク境界自体が発生しないので、そのあいだに要求したリセットは音声が
-再開するまで反映されません。
+`scripts/realtime_transcribe.py`の各部品（`RoutedASR`、`build_vad`、
+`run_stream`）はCLI専用ではなくimportして使えます。組み立てたセッションは
+動かしたまま設定変更と監視ができ、`hub.add_listener(callback)`はHTTPサーバー
+なしで構造化JSONイベント（`partial`・`final`・`refine`・`model_load`・
+`warning`など）をプロセス内で受け取れます。`--serve`を付けると同じセッションに
+`GET`/`POST /config`と`POST /reset`が生えます。イベント一覧、`/config`のキー、
+`POST /reset`の挙動といった詳細は
+[`docs/guide/embedding.ja.md`](docs/guide/embedding.ja.md)にあります。
+Flutter/Dart側は[`mobile/hayamimi_core/README.md`](mobile/hayamimi_core/README.md)。
 
 ## 動作環境
 
@@ -247,12 +149,12 @@ python -m venv .venv
 | `--transcript PATH` | なし | 清書済みトランスクリプト行をこのファイルに追記 |
 | `--hotwords PATH` | なし | 固有名詞側にデコードを寄せるホットワード一覧（1行1語）。**現状jaルートには効果なし**（ReazonSpeechのbyte-level BPEなtokens.txtはエンコードできず、起動時に失敗数を警告表示）。jaの固有名詞には`--replace`を使ってください |
 | `--replace PATH` | なし | ユーザー辞書。`誤=正`形式、1行1組。全出力に適用 |
-| `--mode {single,balanced,fast}` | `balanced` | 言語切替のプリセット。`balanced`は2つの言語判定器が一致した時だけ切り替える（`docs/LID.md`参照）。`single`は`--lang`で指定した言語に固定し自動切替を行わない。`fast`は判定のたびに即切り替えるv0.2.0以前相当の動作。下の個別フラグはプリセットより優先される |
+| `--mode {single,balanced,fast}` | `balanced` | 言語切替のプリセット。`balanced`は2つの言語判定器が一致した時だけ切り替える（`docs/eval/lid.md`参照）。`single`は`--lang`で指定した言語に固定し自動切替を行わない。`fast`は判定のたびに即切り替えるv0.2.0以前相当の動作。下の個別フラグはプリセットより優先される |
 | `--lang-switch-guard SEC` | 2.0 | この秒数未満の新言語判定はノイズとみなす：スイッチ確定（`--lid-switch-confirm`参照）には一切カウントされず、空デコード時のomnilingualフォールバックも抑制する（`0`で無効） |
 | `--lid-switch-confirm N` | 2 | セッション言語を実際に切り替えるのに必要な、連続した新言語判定の回数（各判定は`--lang-switch-guard`秒以上）。大きくするほど切り替えが粘る |
 | `--speakers` | オフ | 発話に話者ID（S1, S2, ...）をラベル付け。清書パスでpyannote segmentation-3.0による再分離をかけ直す |
 | `--speaker-remap-threshold T` | 0.35 | 清書パスの分離結果をセッション全体のS{n}ラベルへ対応付ける際のコサイン類似度閾値（速報パスは従来の0.45のまま） |
-| `--translate [LANGS]` | オフ、`en` | 日本語行をカンマ区切りの言語に翻訳。`en`は専用のFuguMTモジュール、それ以外（`zh`/`ko`/`es`/`fr`など）はモデルの語彙が対応していれば受け付ける。`zh`/`ko`/`es`以外は品質未実測の旨をnoteで表示、詳細はdocs/TRANSLATE_M2M.md |
+| `--translate [LANGS]` | オフ、`en` | 日本語行をカンマ区切りの言語に翻訳。`en`は専用のFuguMTモジュール、それ以外（`zh`/`ko`/`es`/`fr`など）はモデルの語彙が対応していれば受け付ける。`zh`/`ko`/`es`以外は品質未実測の旨をnoteで表示、詳細はdocs/design/translate_m2m.md |
 
 ## アーキテクチャ
 
@@ -299,7 +201,7 @@ python -m venv .venv
 ## 実測パフォーマンス
 
 本番と同じ経路（言語判定からデコード、日本語の句読点付与まで）を、実音声のクリップ単位で
-採点した結果です。`en`はWER、それ以外はCER。測り方の詳細は`docs/SCORECARD.md`にあります。
+採点した結果です。`en`はWER、それ以外はCER。測り方の詳細は`docs/results/scorecard.md`にあります。
 
 | 言語 | クリップ数 | LID正解率 | ルート | 平均誤り率 | 平均RTF |
 |---|---|---|---|---|---|
@@ -310,7 +212,7 @@ python -m venv .venv
 | yue | 12 | 12/12 | SenseVoice | 6.1% | 0.061 |
 
 どの言語もCPU単体で実時間の9〜16倍の速さです。開発中に何を試して何を捨てたかは、
-30回分の改善記録ごと`docs/BENCHMARKS.md`に残してあります。
+30回分の改善記録ごと`docs/results/benchmarks.md`に残してあります。
 
 主な実測値:
 
@@ -326,12 +228,12 @@ python -m venv .venv
 - **効果音やBGMの直後の短い発話は、言語判定を外すことがあります。** ガード機構
   （`--lang-switch-guard`と`--lid-switch-confirm`の組み合わせ）である程度抑えていますが、
   判定と文字化けが偶然「別言語っぽく」揃ってしまうケースは死角として残っています。
-  どの程度外すかは`docs/BENCHMARKS.md`のイテレーション#29に実測があります。
+  どの程度外すかは`docs/results/benchmarks.md`のイテレーション#29に実測があります。
   `--lid-switch-confirm 1 --lang-switch-guard 0`でこの粘着ヒステリシスを完全に
   無効化できます（判定ごとに即切り替え）。ノイズ耐性と引き換えに応答性を最大化する設定で、
   ロック機構自体が自分のセットアップに合っているか検証したいときに使えます。
 - **セッションの最初の発話は、必ずSenseVoiceで確認してから言語を決めます**
-  （`docs/NOISE.md`の二重判定ポリシー節を参照）。これにより、whisper-tinyの
+  （`docs/eval/noise.md`の二重判定ポリシー節を参照）。これにより、whisper-tinyの
   ブートストラップ誤判定が対応モデルの無い言語へセッションを丸投げすることは
   なくなりました。SenseVoice対応5言語（ja/en/zh/ko/yue）以外（欧州語や`--minimal`
   未対応言語）は、`--lang-switch-guard`長のセグメントが`--lid-switch-confirm`回
@@ -353,16 +255,16 @@ python -m venv .venv
   今は各グループをpyannote segmentation-3.0とリアルタイムパスと同じCAM++埋め込みで
   再分離し、そのローカルクラスタをセッション全体のグローバルS{n}へ対応付け直すため、
   1グループ内で複数回話者が入れ替わっても`[refine/S{n}]`の行ごとに正しく分かれます。
-  AMI会議データ（計50分、CC BY 4.0、collar 0.25秒、`docs/DIARIZATION_PLAN.md`§8）で
+  AMI会議データ（計50分、CC BY 4.0、collar 0.25秒、`docs/design/diarization.md`§8）で
   実測したところ、平均DERはリアルタイムパスのみの25.7%から13.9%まで下がりました。
   参照話者数は各会議4人ですが、hayamimiの推定はまだ過大（4〜8人）で、`--speakers`は
   「だいたい合っているターン分け」であって正確な話者数のソースとしては使えません。
   この過大表示を画面上で緩和するため、初出の話者は仮表示（`S5?`）で出て、2回目に
   再登場した時点で正式な`S{n}`に確定します。一度きりで終わった話者は`?`付きのまま
-  セッション終了まで残ります（詳細は`docs/DIARIZATION_PLAN.md`§11）。
+  セッション終了まで残ります（詳細は`docs/design/diarization.md`§11）。
 - **翻訳は小型モデルなりの品質です。** とくに中国語・韓国語への翻訳は数値や金額を
   間違えることがあるため、数字が壊れた訳文は原文をそのまま出す安全装置を入れています。
-  実際の失敗例を`docs/TRANSLATE.md`と`docs/TRANSLATE_M2M.md`に載せているので、
+  実際の失敗例を`docs/design/translate.md`と`docs/design/translate_m2m.md`に載せているので、
   数字が大事な用途では先に見てください。
 - **複数の文をまとめてデコードすると、先頭の文が失われることがあります。** オフライン
   認識器が複数発話のバッファを1発話に潰してしまう現象です。hayamimiは「話した長さの
@@ -404,6 +306,51 @@ hayamimiは次のプロジェクトの成果を借りて動いています。
   `--speakers`で使う話者埋め込みモデル。
 - [Kiwi](https://github.com/bab2min/kiwipiepy): 韓国語の分かち書きを直す形態素解析器。
 
+## ドキュメント
+
+[`docs/README.ja.md`](docs/README.ja.md)が索引です。組み込みガイド、既定値の
+根拠つきのチューニング一覧、現在の精度、そしてそれらの裏づけになった日付つきの
+実験記録と設計調査があります。
+
 ## Contributing
 
-`CONTRIBUTING.md`を見てください。
+`CONTRIBUTING.md`を見てください（英語）。ドキュメントの書き方だけ、日本語でも
+以下にまとめます。
+
+### ドキュメント
+
+`docs/`は「読み手が何を求めているか」で分けています。索引は
+[`docs/README.ja.md`](docs/README.ja.md)（英語版は`docs/README.md`）で、新しい
+文書は必ずここに追加してください。
+
+```
+docs/README.md, docs/README.ja.md   索引
+docs/guide/    組み込み方とチューニング
+docs/spec/     再実装できる粒度の日本語経路仕様
+docs/results/  現在の数字（最新に保つ）
+docs/eval/     実験の記録（日付つき。後から書き換えない）
+docs/design/   ある判断に至るまでの調査
+docs/verify/   実機で確かめる手順
+docs/research/ コードを書く前、2026-08-23時点のリサーチ
+docs/images/   READMEが使う画像
+```
+
+置き場所の決め方: 最新に保つつもりの数字は`results/`、それを出した実行は日付を
+題に入れて`eval/`。判断のためにやった調査は、結論が「不採用」でも`design/`。
+誰かがなぞる手順は`verify/`。使い方や設定の説明なら`design/`ではなく`guide/`です。
+
+**言語。** 英語を主、日本語を併記とし、`README.md` + `README.ja.md`の形をとります。
+英語の`x.md`に対する日本語版は`x.ja.md`です。この方針より前に日本語で書かれた文書は
+日本語のままにします。索引に各ファイルの言語を書いてあるので、開かなくても分かります。
+
+**書き方。** このリポジトリ全体で使っている型です。
+
+- 問題 → 変更 → 理由 → 効果の順で書く。何を変えたかの箇条書きだけにしない。
+  なぜやる価値があったのかが読み手に伝わること。
+- 用語は初出のとき一度だけ説明する（VAD、清書、LID、RTFなど）。
+- 数値は必ず条件つきで書く。どの音声、どのモデル、どのマシン、何サンプルか。
+- 不採用の結果も残す。「実測したうえで不採用」は数値つきなら成功と同じだけ価値が
+  あり、このプロジェクトの記録はそれで埋まっています。
+
+`docs/`の下で移動やリネームをしたら`python scripts/check_doc_links.py`を実行して
+ください。CIでは`tests/test_doc_links.py`が同じ検査をします。

@@ -2,7 +2,7 @@
 
 Uses M2M-100 418M (facebook/m2m100_418M), converted to CTranslate2 int8 by
 the Mojicast project (ishiki-emo/mojicast-m2m100-ct2, MIT license).
-See docs/TRANSLATE_M2M.md for model source, license, and measured latency.
+See docs/design/translate_m2m.md for model source, license, and measured latency.
 
 Target acceptance and validation tiers:
 - Any target language present in the model's own vocabulary (i.e. one with an
@@ -12,7 +12,7 @@ Target acceptance and validation tiers:
   languages without code changes.
 - Only a subset of those targets have been *measured* for translation
   quality against a reference (see `scripts/eval_translate.py` and
-  docs/TRANSLATE_M2M.md's "Validation tiers" section). `VALIDATED_TARGETS`
+  docs/design/translate_m2m.md's "Validation tiers" section). `VALIDATED_TARGETS`
   tracks that subset. Constructing a `TranslatorM2M` for a target outside
   `VALIDATED_TARGETS` prints a one-line note to stderr -- it still works
   (M2M-100 is trained on all these languages), just with unmeasured quality.
@@ -29,10 +29,10 @@ Design notes (mirroring scripts/translate_ja_en.py):
   this conversion it does NOT fully eliminate repetition (unlike the ja-en
   FuguMT module, which needed n=1) but it reliably prevents the catastrophic
   multi-second degenerate loops (e.g. 50+ repeated tokens) seen without it.
-  See docs/TRANSLATE_M2M.md for the measurements behind this choice.
+  See docs/design/translate_m2m.md for the measurements behind this choice.
 - beam_size differs per target: zh uses greedy (beam_size=1), ko uses
   beam_size=4 -- matching Mojicast's reported configuration, which held up
-  in measurement here (see docs/TRANSLATE_M2M.md).
+  in measurement here (see docs/design/translate_m2m.md).
 - Any exception, or empty/garbage output, falls back to returning the
   original Japanese text unchanged -- a subtitle line must never go blank.
 """
@@ -51,13 +51,13 @@ SOURCE_LANG_TOKEN = "__ja__"
 EOS_TOKEN = "</s>"
 
 # Targets with a *measured* chrF score against a FLEURS reference (see
-# scripts/eval_translate.py and docs/TRANSLATE_M2M.md's "Validation tiers"
+# scripts/eval_translate.py and docs/design/translate_m2m.md's "Validation tiers"
 # section). Any other M2M-100 target is still accepted (see
 # is_supported_target() below) but its quality has not been checked.
 VALIDATED_TARGETS = {"zh", "ko", "es"}
 
 # Per-target settings, matching Mojicast's reported configuration (zh:
-# greedy, ko: beam_size=4). See docs/TRANSLATE_M2M.md for the measurements
+# greedy, ko: beam_size=4). See docs/design/translate_m2m.md for the measurements
 # that confirmed these hold up on this specific model conversion. Targets not
 # listed here fall back to DEFAULT_BEAM_SIZE (untuned).
 BEAM_SIZE_BY_TARGET = {
@@ -68,7 +68,7 @@ BEAM_SIZE_BY_TARGET = {
 # Fallback beam size for a target not in BEAM_SIZE_BY_TARGET. Matches ko's
 # beam_size=4 (the more cautious of the two measured settings) rather than
 # zh's greedy beam_size=1, since it has not been re-measured per-target --
-# see docs/TRANSLATE_M2M.md.
+# see docs/design/translate_m2m.md.
 DEFAULT_BEAM_SIZE = 4
 
 _vocab_cache: "dict[str, set[str]]" = {}
@@ -109,7 +109,7 @@ def is_supported_target(lang: str, model_dir: str = _MODEL_DIR) -> bool:
 # ~2.6-3.0s without it, vs. a bounded, mostly-sane output in ~0.3-0.8s with
 # it. Kept at n=3 (unlike translate_ja_en.py's n=1) because a stricter value
 # did not measurably improve quality further in spot checks and n=3 is the
-# documented reference setting. See docs/TRANSLATE_M2M.md.
+# documented reference setting. See docs/design/translate_m2m.md.
 NO_REPEAT_NGRAM_SIZE = 3
 MAX_DECODING_LENGTH_CAP = 150
 MAX_DECODING_LENGTH_MIN = 30
@@ -135,7 +135,7 @@ class TranslatorM2M:
         if target_lang not in VALIDATED_TARGETS:
             print(
                 f"note: {target_lang!r} is an unvalidated translation target "
-                "(quality not yet measured; see docs/TRANSLATE_M2M.md)",
+                "(quality not yet measured; see docs/design/translate_m2m.md)",
                 file=sys.stderr,
             )
 

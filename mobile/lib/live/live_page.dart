@@ -40,7 +40,7 @@ class _LivePageState extends State<LivePage> {
   bool _isDecoding = false;
   String? _errorText;
 
-  // Multilingual routing (see docs/MOBILE.md "Multi-language routing on
+  // Multilingual routing (see docs/design/mobile_quantization.md "Multi-language routing on
   // mobile"): off by default (single ja model, unchanged prior behavior).
   // Switching this needs senseVoiceModelDir/lidModelDir filled in too.
   RoutingProfile _routingProfile = RoutingProfile.jaOnly;

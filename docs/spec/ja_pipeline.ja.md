@@ -12,7 +12,7 @@ ONNX Runtime を直接叩いて動かす構成である。
 「未検証事項」に分けて書く。
 
 対象は `--mode single --lang ja` の経路だけである。hayamimi 本体は 5 層の
-言語ルーティング (`docs/LID.md`) を持つが、日本語しか扱わない再実装にはそのどれも要らない。
+言語ルーティング (`docs/eval/lid.md`) を持つが、日本語しか扱わない再実装にはそのどれも要らない。
 `RoutedASR.forced_lang` が `"ja"` に設定されていると、言語判定 (LID)、言語切替の確認、
 zh/yue の仲裁、文字種による再デコードのすべてが `transcribe()` の中で丸ごと飛ばされる
 (`scripts/asr_engine.py` の `transcribe()` 冒頭と、その中の `if self.forced_lang is not None:`
@@ -34,7 +34,7 @@ zh/yue の仲裁、文字種による再デコードのすべてが `transcribe(
 
 日本語経路が読み込むファイルは 7 個。sha256 とバイト数は
 `scripts/dump_ja_config.py --with-models` が実ファイルから計算したもので、
-機械可読な形は `docs/ja_pipeline_spec.json` の `models` ブロックにある。
+機械可読な形は `docs/spec/ja_pipeline_spec.json` の `models` ブロックにある。
 
 | 役割 | ファイル (models/ 以下) | bytes | sha256 | ライセンス / 出所 |
 |---|---|---:|---|---|
@@ -55,7 +55,7 @@ Hugging Face の `ishiki-emo/mojicast-punct-onnx` は `punct_bert.int8.onnx` (�
 onnxruntime 1.29.0 の CPU EP 上で、乱数トークン列を入れても実文を入れても logits が
 ほぼ一定 (読点・句点の確率がどこでも 0.31〜0.36 の範囲) で、入力に反応しない。
 つまり句読点を復元しない。原因は特定していない (壊れたエクスポート、アップロードミス、
-特定の onnxruntime ビルドとの非互換のいずれか)。詳細は `docs/PUNCT_JA.md`。
+特定の onnxruntime ビルドとの非互換のいずれか)。詳細は `docs/design/punct_ja.md`。
 
 **再実装ではこのファイルを使わないこと。** 使うなら fp32 (`punct_bert.onnx`) か、
 下の fp16 のどちらかにする。
@@ -156,11 +156,11 @@ publish する (`RoutedASR._warn_hotwords_encodability`)。
 
 - **`min_silence` 0.35 秒**: 実放送 ja 15 クリップで 0.5 → 0.35 → 0.30 と振って
   CER が変わらなかった (分割数は 17 → 19 に増えた)。精度コストがゼロで確定表示が
-  一律 150 ms 早くなるので 0.35 を採用した (`docs/BENCHMARKS.md` 改善イテレーション#9)。
+  一律 150 ms 早くなるので 0.35 を採用した (`docs/results/benchmarks.md` 改善イテレーション#9)。
 - **`threshold` 0.5**: AMI 評価セットで 0.40 / 0.30 / 0.20 を掃引したところ、
   miss は期待どおり減ったが confusion がそれ以上に増え、平均 DER が全ての値で悪化した
   (14.1% → 15.6〜16.5%)。下げる案は却下し、Silero の既定 0.5 のままにしてある
-  (`docs/DIARIZATION_PLAN.md` section 13)。
+  (`docs/design/diarization.md` section 13)。
 - **`max_speech` 12 秒**: 息継ぎのない実況で 21 秒のセグメントが出て確定が遅れたので入れた。
   ただし Android エミュレータでの実測で、sherpa-onnx はこの値を強制分割ではなく
   「目安」として扱うことが分かっている (5.0 秒設定で 6.134 秒のセグメントが出た)。
@@ -172,7 +172,7 @@ publish する (`RoutedASR._warn_hotwords_encodability`)。
 
 ## 冒頭欠落と対策
 
-この節の発生率は `docs/HEAD_DROPOUT.md` の実測から転記している。測定手順・クリップ別の内訳・決定性チェックはそちらを参照。
+この節の発生率は `docs/eval/head_dropout.md` の実測から転記している。測定手順・クリップ別の内訳・決定性チェックはそちらを参照。
 
 ### 現象
 
@@ -185,15 +185,15 @@ hayamimi 側で観測した具体例:
   `東京の天気は晴れです` の `東京の` が丸ごと消えた (`_speech_pieces()` のコメント)。
 - ライブ経路の検証で、プリロールを 0 にすると `資料は昨日送りました` が
   `昨日は昨日送りました` になった。同じ観測が 3 か所に独立して残っている:
-  desktop の Python 経路 (`docs/BENCHMARKS.md` の 2026-09-01
+  desktop の Python 経路 (`docs/results/benchmarks.md` の 2026-09-01
   「ライブ経路の発話冒頭欠け疑いを実測」)、Android エミュレータ (下の項目)、
-  そして `docs/HEAD_DROPOUT.md` の条件グリッド
+  そして `docs/eval/head_dropout.md` の条件グリッド
   (`greedy`/対策なし・`beam`/対策なしの両方が `昨日は昨日送りました`、
   前置を入れた条件はすべて `資料は昨日送りました`)。
 - Android エミュレータでも同じことが再現した。プリロール 0 で
   `昨日は昨日送りました` / `会議は十時からです` (`あしたの` が欠落)、
   プリロール 1.0 秒でどちらも desktop と同じ `資料は昨日送りました` /
-  `あしたの会議は十時からです` になった (`docs/MOBILE.md`、`agent/feature/core-release`
+  `あしたの会議は十時からです` になった (`docs/verify/android_emulator.md`、`agent/feature/core-release`
   ブランチの "Android emulator verification, run 2")。この run は制御実験になっていて、
   VAD の値だけ直したパス (`r2-preroll0`) と両方直したパス (`r1-defaults`) を
   別々に走らせ、どちらの修正がどちらの効果を出したかを切り分けている。
@@ -222,7 +222,7 @@ want = max(seg_start - PREROLL_S * sr,   # 1 秒より前には遡らない
 (1.0 秒フルではない)。
 
 効果は大きい。実放送 ja 15 クリップの VAD 経由 CER が **プリロールなし 40.2% →
-プリロール 0.8 秒で 15.5%** (`docs/BENCHMARKS.md` 改善イテレーション#9。当時は 0.8 秒、
+プリロール 0.8 秒で 15.5%** (`docs/results/benchmarks.md` 改善イテレーション#9。当時は 0.8 秒、
 現在の実装は 1.0 秒)。クリップ丸ごとのオフラインデコード (参考上限) が 8.6% なので、
 残差 15.5% − 8.6% はストリーミング分割そのものによる文脈喪失で、これは別の問題である。
 
@@ -280,7 +280,7 @@ v0.3.1 で入れた。`_looks_truncated()` と `_split_retry()` (`scripts/asr_en
 
 ### 発生率の実測
 
-`docs/HEAD_DROPOUT.md` に全文がある。ここには仕様の判断に必要な数字だけ転記する。
+`docs/eval/head_dropout.md` に全文がある。ここには仕様の判断に必要な数字だけ転記する。
 
 **測定条件 (以下のすべての数字に共通)**: FLEURS ja test split 100 クリップ
 (朗読音声、16 kHz モノラル、CC BY 4.0)。1 クリップにつき**長さ 1.0 秒以上の最初の
@@ -400,7 +400,7 @@ python scripts/eval_head_dropout.py --multi-sentence --threads 4   # 3 区間 x 
 ```
 
 クリップ別の仮説・先頭削除数・CER・時間は
-`docs/eval/head_dropout_results.json` にある (`docs/HEAD_DROPOUT.md` と同じ PR)。
+`docs/eval/head_dropout_results.json` にある (`docs/eval/head_dropout.md` と同じ PR)。
 
 ## `forced_lang="ja"` の経路
 
@@ -719,10 +719,10 @@ FLEURS ja には疑問文が 1 つもないので、疑問符規則・空文字�
   JSON で出す。値はすべてモジュール定数か関数の宣言済み既定値から取っており
   (`inspect.signature` を使っている箇所もある)、`models/` がない環境でも動く。
   `--with-models` を付けると `models/` を読んで sha256 とバイト数も足す。
-- その出力を `docs/ja_pipeline_spec.json` に固定してある。再生成は:
+- その出力を `docs/spec/ja_pipeline_spec.json` に固定してある。再生成は:
 
   ```
-  python scripts/dump_ja_config.py --with-models --out docs/ja_pipeline_spec.json
+  python scripts/dump_ja_config.py --with-models --out docs/spec/ja_pipeline_spec.json
   ```
 
 - `tests/test_ja_pipeline_spec.py` が、その `config` ブロックを毎回ダンプし直して
@@ -740,7 +740,7 @@ FLEURS ja には疑問文が 1 つもないので、疑問符規則・空文字�
 
 この文書に書いてあることのうち、まだ測っていない・確かめていないもの。
 
-- **冒頭欠落の実測が届く範囲** (`docs/HEAD_DROPOUT.md`)。測ったのは
+- **冒頭欠落の実測が届く範囲** (`docs/eval/head_dropout.md`)。測ったのは
   FLEURS ja という**朗読音声**の 100 クリップ 1 データセット、1 言語、1 マシンで、
   しかも**各クリップの最初の発話区間 1 つだけ**である。放送・実況・雑談で同じ率になる
   保証はないし、2 番目以降の区間の冒頭については何も言えない

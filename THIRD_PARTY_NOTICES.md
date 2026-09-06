@@ -94,7 +94,7 @@ by the eval scripts.
 
 Several integration choices in this project (the FuguMT/M2M-100 CTranslate2
 conversions, the punctuation model export, and beam-size/repetition-control
-settings noted in `docs/TRANSLATE.md` and `docs/TRANSLATE_M2M.md`) are drawn
+settings noted in `docs/design/translate.md` and `docs/design/translate_m2m.md`) are drawn
 from or reuse artifacts published by the [Mojicast](https://github.com/ishiki-emo/mojicast)
 project (MIT-licensed offline captioning app) by ishiki-emo. Credit and thanks
 to that project -- see the README credits section.
