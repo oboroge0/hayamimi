@@ -1,0 +1,508 @@
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:hayamimi_core/hayamimi_core.dart';
+import 'package:record/record.dart';
+
+import 'fake_decode_worker.dart';
+import 'fake_live_vad.dart';
+import 'fake_record_platform.dart';
+
+/// A whole running session, microphone to transcript line, with no native
+/// library present.
+///
+/// Both FFI edges are stood in for — the decode worker and the VAD — so
+/// `isRunning` actually becomes true here. That is what makes the parts
+/// which only exist while a session is live observable: segments becoming
+/// transcript lines in order, drafts being skipped and discarded, a refine
+/// pass folding, a reset landing behind the work it must not race, the
+/// worker dying with the microphone open, and a reply arriving after
+/// `stop()`.
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  late RecordPlatform originalPlatform;
+  late _Harness h;
+
+  setUp(() {
+    originalPlatform = RecordPlatform.instance;
+    h = _Harness()..install();
+  });
+
+  tearDown(() async {
+    await h.dispose();
+    RecordPlatform.instance = originalPlatform;
+  });
+
+  group('finals', () {
+    test('two segments become two transcript lines, in order and fully populated', () async {
+      await h.start();
+      expect(h.transcriber.isRunning, isTrue);
+
+      await h.endSegment(seconds: 0.5);
+      await h.endSegment(seconds: 1.0);
+
+      // Only one is at the worker; the second waits its turn.
+      expect(h.worker.decodeRequests, hasLength(1));
+
+      h.worker.reply('first line', lang: 'ja');
+      await settle();
+      h.worker.reply('second line', lang: 'en', switched: true);
+      await settle();
+
+      expect(h.entries.map((e) => e.text), <String>[
+        'first line',
+        'second line',
+      ]);
+      expect(h.entries[0].audioSeconds, closeTo(0.5, 1e-9));
+      expect(h.entries[1].audioSeconds, closeTo(1.0, 1e-9));
+      expect(h.entries[0].lang, 'ja');
+      expect(h.entries[0].switched, isFalse);
+      expect(h.entries[1].lang, 'en');
+      expect(h.entries[1].switched, isTrue);
+      expect(h.entries[0].latencyMs, 12.5);
+
+      expect(h.transcriber.currentLang, 'en');
+      // Both segments' audio is buffered for the next refine pass.
+      expect(h.transcriber.refineBufferedSeconds, closeTo(1.5, 1e-9));
+      // One busy transition for the burst, not one per decode.
+      expect(h.decoding, <bool>[true, false]);
+    });
+
+    test('a segment that decodes to nothing produces no line and buffers no audio', () async {
+      await h.start();
+      await h.endSegment(seconds: 1.0);
+
+      h.worker.reply('   ');
+      await settle();
+
+      expect(h.entries, isEmpty);
+      expect(h.transcriber.refineBufferedSeconds, 0);
+    });
+
+    test('a segment too short to be worth decoding never reaches the worker', () async {
+      await h.start();
+
+      await h.endSegment(seconds: 0.05);
+
+      expect(h.worker.decodeRequests, isEmpty);
+    });
+  });
+
+  group('drafts', () {
+    test('one goes out while the speaker is still talking', () async {
+      await h.start();
+
+      h.vad.speechActive = true;
+      await h.pushFrames(1);
+
+      expect(h.worker.lastRequest.kind, DecodeRequestKind.draft);
+      h.worker.reply('in progr');
+      await settle();
+
+      expect(h.drafts.single.text, 'in progr');
+      // A draft is provisional: it is never measured for duration.
+      expect(h.drafts.single.audioSeconds, isNull);
+    });
+
+    test('none is even queued while a final is still outstanding', () async {
+      await h.start();
+      await h.endSegment(seconds: 1.0);
+
+      h.vad.speechActive = true;
+      await h.pushFrames(3);
+
+      // Nothing but the final has been sent -- but that alone would also be
+      // true of a draft merely waiting its turn, so let the final finish
+      // and check that nothing follows it out. A draft is dropped, not
+      // queued: queued, it would only delay the line about to replace it.
+      expect(h.worker.decodeRequests, hasLength(1));
+      expect(h.worker.lastRequest.kind, DecodeRequestKind.finalSegment);
+
+      h.worker.reply('the whole utterance');
+      await settle();
+
+      expect(h.worker.decodeRequests, hasLength(1));
+      expect(h.drafts, isEmpty);
+      expect(h.entries.single.text, 'the whole utterance');
+    });
+
+    test('one whose segment ended while it was decoding is discarded', () async {
+      await h.start();
+
+      h.vad.speechActive = true;
+      await h.pushFrames(1);
+      expect(h.worker.lastRequest.kind, DecodeRequestKind.draft);
+
+      // The speaker paused: the segment closed and queued its own final.
+      await h.endSegment(seconds: 1.0);
+
+      // Only now does the draft come back, describing audio the session has
+      // already moved past.
+      h.worker.reply('in progr');
+      await settle();
+      expect(h.drafts, isEmpty);
+
+      // ...and the final that superseded it goes out and is emitted.
+      expect(h.worker.lastRequest.kind, DecodeRequestKind.finalSegment);
+      h.worker.reply('in progress, finished');
+      await settle();
+      expect(h.entries.single.text, 'in progress, finished');
+    });
+  });
+
+  group('refineNow', () {
+    // The "second call returns the *same* future" half of coalescing is
+    // only visible on DecodeSession (see decode_session_test.dart);
+    // LiveTranscriber.refineNow is an async wrapper, so it necessarily
+    // hands out a fresh future. What is observable here is the effect:
+    // one pass, over both segments, and the buffer emptied once.
+    test('two calls yield a single pass covering everything buffered', () async {
+      await h.start();
+
+      await h.endSegment(seconds: 1.0);
+      h.worker.reply('hello');
+      await settle();
+      expect(h.transcriber.refineBufferedSeconds, closeTo(1.0, 1e-9));
+
+      // A final in flight, so both refine calls queue behind it.
+      await h.endSegment(seconds: 1.0);
+      final first = h.transcriber.refineNow();
+      final second = h.transcriber.refineNow();
+
+      h.worker.reply('second');
+      await settle();
+
+      // The refine claimed the buffer only now, so it covers both segments
+      // — including the one that was still decoding when the caller asked.
+      expect(h.worker.lastRequest.kind, DecodeRequestKind.refine);
+      expect(h.worker.lastRequest.samples.length, 32000);
+
+      h.worker.reply('hello second, refined');
+      await settle();
+      await first;
+      await second;
+
+      expect(h.refines, hasLength(1));
+      expect(
+        h.worker.decodeRequests
+            .where((r) => r.kind == DecodeRequestKind.refine),
+        hasLength(1),
+      );
+      expect(h.refines.single.text, 'hello second, refined');
+      expect(h.refines.single.audioSeconds, closeTo(2.0, 1e-9));
+      expect(h.transcriber.refineBufferedSeconds, 0);
+    });
+
+    test('with nothing buffered emits nothing and reaches no worker', () async {
+      await h.start();
+
+      await h.transcriber.refineNow();
+      await settle();
+
+      expect(h.worker.decodeRequests, isEmpty);
+      expect(h.refines, isEmpty);
+    });
+  });
+
+  group('resetSession', () {
+    test('lands behind the segment still decoding, then clears and reports', () async {
+      await h.start();
+      await h.endSegment(seconds: 1.0);
+
+      final reset = h.transcriber.resetSession();
+      await settle();
+      // Still queued: the transcript line comes first.
+      expect(h.worker.commands, hasLength(1));
+
+      h.worker.reply('last words', lang: 'ja');
+      await settle();
+      expect(h.entries.single.text, 'last words');
+      expect(h.transcriber.currentLang, 'ja');
+
+      h.worker.ack();
+      await settle();
+      await reset;
+
+      expect(h.resets, hasLength(1));
+      expect(h.transcriber.currentLang, isNull);
+      expect(h.transcriber.refineBufferedSeconds, 0);
+    });
+  });
+
+  group('the decode worker dying', () {
+    test('reports once, stops the session, frees the VAD, and stays restartable', () async {
+      await h.start();
+      expect(h.transcriber.isRunning, isTrue);
+      final vad = h.vad;
+      final worker = h.worker;
+
+      worker.die('the isolate exited');
+      await h.pump();
+
+      expect(h.errors, hasLength(1));
+      expect(
+        h.errors.single.message,
+        contains('decode worker stopped unexpectedly'),
+      );
+      expect(h.transcriber.isRunning, isFalse);
+      expect(vad.freed, isTrue);
+      expect(worker.shutdownCount, 1);
+
+      // A second death report from the same, already-torn-down session must
+      // not produce a second error.
+      worker.die('and again');
+      await h.pump();
+      expect(h.errors, hasLength(1));
+
+      // Still usable: a fresh start builds a new worker and a new VAD.
+      await h.start();
+      expect(h.transcriber.isRunning, isTrue);
+      expect(h.workers, hasLength(2));
+      expect(h.vads.built, hasLength(2));
+    });
+
+    test('a decode that fails is reported without stopping the session', () async {
+      await h.start();
+      await h.endSegment(seconds: 1.0);
+
+      h.worker.failRequest('sherpa-onnx blew up');
+      await settle();
+
+      expect(h.errors.single.message, contains('sherpa-onnx blew up'));
+      expect(h.transcriber.isRunning, isTrue);
+
+      // And the next segment is still transcribed.
+      await h.endSegment(seconds: 1.0);
+      h.worker.reply('still here');
+      await settle();
+      expect(h.entries.single.text, 'still here');
+    });
+  });
+
+  group('stop', () {
+    test('emits the segment its VAD flush produces before returning', () async {
+      h.vads.setUp = (vad) => vad.flushSegment = _samples(1.0);
+      await h.start();
+
+      final stopping = h.transcriber.stop();
+      await h.pump();
+
+      expect(h.vad.flushCount, 1);
+      expect(h.worker.decodeRequests, hasLength(1));
+      h.worker.reply('last words');
+      await stopping;
+
+      expect(h.entries.map((e) => e.text), <String>['last words']);
+      expect(h.transcriber.isRunning, isFalse);
+    });
+
+    test('a reply that arrives afterwards emits nothing and throws nothing', () async {
+      // Keep the worker's reply stream open past shutdown, so a message
+      // that crossed the session's teardown can actually be delivered.
+      h.workerSetUp = (worker) => worker.closeOnShutdown = false;
+      await h.start();
+
+      await h.endSegment(seconds: 1.0);
+      final request = h.worker.lastRequest;
+      h.worker.reply('in time');
+      await settle();
+      expect(h.entries, hasLength(1));
+
+      await h.transcriber.stop();
+      expect(h.transcriber.isRunning, isFalse);
+
+      h.worker.replyTo(request, 'too late');
+      await h.pump();
+
+      expect(h.entries, hasLength(1));
+    });
+  });
+
+  group('startDebugWavStream', () {
+    test('feeds the whole file through and flushes its last segment', () async {
+      h.workerSetUp = (worker) => worker.autoReplyText = 'flushed line';
+      h.vads.setUp = (vad) => vad.flushSegment = _samples(1.0);
+      final wavPath = h.writeWav(sampleCount: 4096);
+
+      await h.transcriber.startDebugWavStream(
+        modelKind: ModelKind.zipformerTransducer,
+        modelDir: h.modelDir.path,
+        vadModelPath: h.vadModelPath,
+        wavPath: wavPath,
+        realtime: false,
+      );
+
+      expect(h.vad.frames, hasLength(4096 ~/ 512));
+      expect(h.vad.flushCount, 1);
+      expect(h.entries.map((e) => e.text), <String>['flushed line']);
+      expect(h.transcriber.isDebugStreaming, isFalse);
+      expect(h.worker.shutdownCount, 1);
+      expect(h.vad.freed, isTrue);
+    });
+
+    test('a wav at the wrong sample rate is rejected and leaves nothing running', () async {
+      final wavPath = h.writeWav(sampleCount: 1024, sampleRate: 8000);
+
+      await expectLater(
+        h.transcriber.startDebugWavStream(
+          modelKind: ModelKind.zipformerTransducer,
+          modelDir: h.modelDir.path,
+          vadModelPath: h.vadModelPath,
+          wavPath: wavPath,
+          realtime: false,
+        ),
+        throwsA(
+          isA<LiveTranscriberException>().having(
+            (e) => e.message,
+            'message',
+            contains('8000Hz != required 16000Hz'),
+          ),
+        ),
+      );
+
+      expect(h.transcriber.isDebugStreaming, isFalse);
+      expect(h.worker.shutdownCount, 1);
+      expect(h.vad.freed, isTrue);
+    });
+  });
+}
+
+/// One `LiveTranscriber` with both of its native edges replaced, plus the
+/// plumbing to feed it audio and read what came out.
+class _Harness {
+  late FakeRecordPlatform platform;
+  late Directory modelDir;
+  late String vadModelPath;
+  late LiveTranscriber transcriber;
+
+  final FakeVadSource vads = FakeVadSource();
+  final List<FakeDecodeWorker> workers = <FakeDecodeWorker>[];
+
+  /// Applied to each worker as it is built, so a test can script one before
+  /// the session that will use it exists.
+  void Function(FakeDecodeWorker worker)? workerSetUp;
+
+  final List<LiveTranscriptEntry> entries = <LiveTranscriptEntry>[];
+  final List<LiveTranscriptEntry> drafts = <LiveTranscriptEntry>[];
+  final List<LiveTranscriptEntry> refines = <LiveTranscriptEntry>[];
+  final List<LiveTranscriberException> errors = <LiveTranscriberException>[];
+  final List<bool> decoding = <bool>[];
+  final List<void> resets = <void>[];
+
+  FakeDecodeWorker get worker => workers.last;
+  FakeLiveVad get vad => vads.last;
+
+  void install() {
+    platform = FakeRecordPlatform();
+    RecordPlatform.instance = platform;
+    modelDir = Directory.systemTemp.createTempSync('hayamimi_session');
+    vadModelPath = '${modelDir.path}${Platform.pathSeparator}vad.onnx';
+    File(vadModelPath).writeAsBytesSync(<int>[0]);
+
+    transcriber = LiveTranscriber(
+      decodeWorkerFactory: _newWorker,
+      vadFactory: vads.build,
+      // A draft on every frame, so the draft rules can be exercised without
+      // waiting out the production pacing.
+      draftIntervalSeconds: 0.001,
+      minDraftAudioSeconds: 0.01,
+    );
+    transcriber.entries.listen(entries.add);
+    transcriber.drafts.listen(drafts.add);
+    transcriber.refineEntries.listen(refines.add);
+    transcriber.errors.listen(errors.add);
+    transcriber.decoding.listen(decoding.add);
+    transcriber.sessionResets.listen(resets.add);
+  }
+
+  DecodeWorker _newWorker() {
+    final worker = FakeDecodeWorker();
+    workerSetUp?.call(worker);
+    workers.add(worker);
+    return worker;
+  }
+
+  Future<void> start() => transcriber.start(
+    modelKind: ModelKind.zipformerTransducer,
+    modelDir: modelDir.path,
+    vadModelPath: vadModelPath,
+  );
+
+  /// Delivers [count] frames' worth of microphone audio.
+  Future<void> pushFrames(int count) async {
+    platform.micController.add(Uint8List(count * vad.frameSize * 2));
+    await settle();
+  }
+
+  /// Ends a speech segment carrying [seconds] of audio, the way a speaker
+  /// pausing does.
+  Future<void> endSegment({required double seconds}) async {
+    vad.segmentsPerFrame.add(_samples(seconds));
+    await pushFrames(1);
+  }
+
+  /// Writes a 16-bit PCM wav file and returns its path.
+  String writeWav({required int sampleCount, int sampleRate = 16000}) {
+    final path = '${modelDir.path}${Platform.pathSeparator}test_$sampleRate.wav';
+    File(path).writeAsBytesSync(
+      _wavBytes(sampleCount: sampleCount, sampleRate: sampleRate),
+    );
+    return path;
+  }
+
+  /// Several turns of the event loop — enough for the teardown paths, which
+  /// await a handful of things in sequence.
+  Future<void> pump() => Future<void>.delayed(const Duration(milliseconds: 20));
+
+  Future<void> dispose() async {
+    // Anything a test left outstanding gets answered now, so dispose()'s
+    // drain finishes promptly instead of waiting out its timeout. Answers
+    // for requests that were already settled no longer match anything the
+    // session is waiting on, so they are ignored.
+    for (final worker in workers) {
+      worker.autoReplyText ??= 'teardown';
+      worker.answerAll();
+    }
+    await transcriber.dispose();
+    await platform.close();
+    if (modelDir.existsSync()) {
+      modelDir.deleteSync(recursive: true);
+    }
+  }
+}
+
+Float32List _samples(double seconds, {int sampleRate = 16000}) =>
+    Float32List((seconds * sampleRate).round());
+
+/// A canonical 44-byte-header, 16-bit PCM wav of silence.
+Uint8List _wavBytes({
+  required int sampleCount,
+  int sampleRate = 16000,
+  int channels = 1,
+}) {
+  final dataSize = sampleCount * channels * 2;
+  final bytes = Uint8List(44 + dataSize);
+  final header = ByteData.sublistView(bytes);
+  void ascii(int offset, String text) {
+    for (var i = 0; i < text.length; i++) {
+      header.setUint8(offset + i, text.codeUnitAt(i));
+    }
+  }
+
+  ascii(0, 'RIFF');
+  header.setUint32(4, 36 + dataSize, Endian.little);
+  ascii(8, 'WAVE');
+  ascii(12, 'fmt ');
+  header.setUint32(16, 16, Endian.little);
+  header.setUint16(20, 1, Endian.little); // PCM
+  header.setUint16(22, channels, Endian.little);
+  header.setUint32(24, sampleRate, Endian.little);
+  header.setUint32(28, sampleRate * channels * 2, Endian.little);
+  header.setUint16(32, channels * 2, Endian.little);
+  header.setUint16(34, 16, Endian.little);
+  ascii(36, 'data');
+  header.setUint32(40, dataSize, Endian.little);
+  return bytes;
+}

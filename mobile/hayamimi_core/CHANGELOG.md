@@ -21,6 +21,62 @@
   refine buffer, draft state, and (for a `RoutingProfile.jaSenseVoice`
   session) the routed language lock, without reloading any native model —
   useful for a host app's "start a new conversation" action.
+* Decoding no longer runs on the caller's isolate. Every per-utterance
+  decode used to be a synchronous FFI call made on whichever isolate drove
+  the microphone stream — for a host app, Flutter's UI isolate — so the app
+  stopped painting for the length of each decode, and for much longer
+  during a refine ("清書") pass over a whole buffered group. Each session
+  now spawns one persistent decode worker isolate that owns that session's
+  recognizers (for `RoutingProfile.jaSenseVoice`, all three of them,
+  including the whisper-tiny language identification and the sticky-language
+  state) from first load to last free; requests reach it as messages
+  carrying the audio. What is left on the caller's isolate is microphone
+  capture, one Silero VAD `acceptWaveform` per 32 ms frame, and event
+  dispatch. Decode latency itself is unchanged — the work moved, it did not
+  shrink — and no on-device jank measurement was taken for this change.
+* Because decodes are now answered later rather than inline, the queue in
+  front of the worker follows explicit rules: finals are always queued,
+  never dropped, and emitted in the order their segments closed; drafts are
+  skipped while anything is outstanding and discarded on arrival if their
+  segment has since produced a final; refine passes coalesce, and claim
+  their audio when the request is actually sent rather than when it was
+  asked for (so a segment still decoding when you tap 清書 joins that
+  group). `refineNow()`'s future now completes once that pass's result has
+  been emitted, and a second call while one is still queued awaits the same
+  pass. `resetSession()` now round-trips the clear through the worker and
+  completes on its acknowledgement. `decoding` reports whether *anything*
+  is outstanding, so it emits one `true`/`false` pair per burst rather than
+  one per decode.
+* Added handling for the decode worker isolate dying mid-session: a
+  `LiveTranscriberException` on `LiveTranscriber.errors` (an
+  `ErrorSubtitleEvent` on `HayamimiLive.events`), microphone capture torn
+  down, and the object left ready to `start` again — the same handling a
+  revoked microphone gets. A single decode failing inside the worker is
+  reported the same way but does not stop the session. `stop`/`dispose`
+  wait for the worker's shutdown acknowledgement and kill the isolate if it
+  does not answer; see "Threading / known limitations" in the README for
+  why nothing is freed by force in that case.
+* New exported building blocks for the above, none of which a caller of
+  `HayamimiLive`/`LiveTranscriber` has to touch: `decode_protocol.dart`
+  (the worker message types and their encoding), `decode_scheduler.dart`
+  (`DecodeScheduler`, the pure queue policy), `decode_session.dart`
+  (`DecodeSession`, the caller's-isolate half) and `decode_worker.dart`
+  (`DecodeWorker`/`IsolateDecodeWorker`), and `live_vad.dart` (`LiveVad`,
+  the voice-activity detector a session feeds, plus the
+  Silero-via-sherpa-onnx implementation). `LiveTranscriber`'s constructor
+  gained `decodeWorkerFactory` and `vadFactory` parameters, and
+  `RoutedRecognizerSet.build` a `loadOffIsolate` one — all three exist so a
+  whole session can be exercised without a device, and all three default to
+  production behaviour.
+* `isSegmentWorthDecoding` now takes the segment's `Float32List` samples
+  rather than a `sherpa_onnx.SpeechSegment`, so neither it nor
+  `LiveTranscriber`'s segment handling depends on the FFI-backed package's
+  types any more.
+* `startDebugWavStream` reads its wav file with this package's own
+  pure-Dart PCM16 parser instead of sherpa-onnx's `readWave`. The accepted
+  format is unchanged (16-bit PCM), a wrong channel count is now reported
+  explicitly rather than as a generic read failure, and the debug streaming
+  path no longer touches FFI outside the models themselves.
 * `LiveTranscriptEntry`/`FinalSubtitleEvent`/`RefineSubtitleEvent` gained
   `audioSeconds` (wire: `audio_s`) — the segment's or refined group's audio
   duration — and `FinalSubtitleEvent` gained `switched` — whether this
