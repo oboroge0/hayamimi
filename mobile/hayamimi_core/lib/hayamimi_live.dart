@@ -1,7 +1,10 @@
 import 'dart:async';
 
 import 'bench/model_kind.dart';
+import 'live/draft_pass.dart';
 import 'live/live_transcriber.dart';
+import 'live/refine_pass.dart';
+import 'live/vad_sensitivity.dart';
 import 'routing/routing_profile.dart';
 import 'server/subtitle_event.dart';
 
@@ -26,8 +29,33 @@ import 'server/subtitle_event.dart';
 /// await live.dispose();
 /// ```
 class HayamimiLive {
-  HayamimiLive({LiveTranscriber? transcriber, this.textTransform})
-    : _transcriber = transcriber ?? LiveTranscriber() {
+  /// If [transcriber] is omitted, the six pacing-knob parameters
+  /// ([draftIntervalSeconds] through [refineBufferMaxSeconds]) seed the
+  /// [LiveTranscriber] this facade creates for itself -- see that class's
+  /// constructor for what each one does and its `default*` constant
+  /// (`draft_pass.dart`/`refine_pass.dart`) for the value a caller who
+  /// passes nothing gets. They're ignored if [transcriber] is given
+  /// instead: configure an injected transcriber directly (its own
+  /// constructor, or its runtime setters, both mirrored on this class).
+  HayamimiLive({
+    LiveTranscriber? transcriber,
+    this.textTransform,
+    double draftIntervalSeconds = defaultDraftIntervalSeconds,
+    double draftWindowSeconds = defaultDraftWindowSeconds,
+    double minDraftAudioSeconds = defaultMinDraftAudioSeconds,
+    double autoRefineSilenceSeconds = defaultAutoRefineSilenceSeconds,
+    double autoRefineMaxBufferedSeconds = defaultAutoRefineMaxBufferedSeconds,
+    double refineBufferMaxSeconds = defaultRefineBufferMaxSeconds,
+  }) : _transcriber =
+           transcriber ??
+           LiveTranscriber(
+             draftIntervalSeconds: draftIntervalSeconds,
+             draftWindowSeconds: draftWindowSeconds,
+             minDraftAudioSeconds: minDraftAudioSeconds,
+             autoRefineSilenceSeconds: autoRefineSilenceSeconds,
+             autoRefineMaxBufferedSeconds: autoRefineMaxBufferedSeconds,
+             refineBufferMaxSeconds: refineBufferMaxSeconds,
+           ) {
     _entriesSubscription = _transcriber.entries.listen((entry) {
       final entryLang = entry.lang ?? lang;
       _eventsController.add(
@@ -35,6 +63,8 @@ class HayamimiLive {
           text: _transform(entry.text, entryLang),
           lang: entryLang,
           latencyMs: entry.latencyMs,
+          audioSeconds: entry.audioSeconds,
+          switched: entry.switched,
         ),
       );
     });
@@ -45,6 +75,7 @@ class HayamimiLive {
           text: _transform(entry.text, entryLang),
           lang: entryLang,
           latencyMs: entry.latencyMs,
+          audioSeconds: entry.audioSeconds,
         ),
       );
     });
@@ -60,6 +91,14 @@ class HayamimiLive {
     _errorsSubscription = _transcriber.errors.listen((error) {
       _eventsController.add(ErrorSubtitleEvent(message: error.message));
     });
+    _modelLoadsSubscription = _transcriber.modelLoads.listen((event) {
+      _eventsController.add(
+        ModelLoadSubtitleEvent(model: event.model, phase: event.phase, ms: event.ms),
+      );
+    });
+    _sessionResetsSubscription = _transcriber.sessionResets.listen((_) {
+      _eventsController.add(const SessionResetSubtitleEvent());
+    });
   }
 
   final LiveTranscriber _transcriber;
@@ -70,6 +109,8 @@ class HayamimiLive {
   late final StreamSubscription _decodingSubscription;
   late final StreamSubscription _draftsSubscription;
   late final StreamSubscription _errorsSubscription;
+  late final StreamSubscription _modelLoadsSubscription;
+  late final StreamSubscription _sessionResetsSubscription;
   bool _disposed = false;
 
   /// Optional text-postprocessing hook applied to every draft/final/refine
@@ -109,9 +150,12 @@ class HayamimiLive {
 
   /// Finalized transcript lines ([FinalSubtitleEvent]), two-pass "refine"
   /// results ([RefineSubtitleEvent]), in-progress drafts
-  /// ([PartialSubtitleEvent]), and session failures
-  /// ([ErrorSubtitleEvent] — e.g. the OS killing mic capture mid-session,
-  /// after which [isRunning] is false again), in arrival order.
+  /// ([PartialSubtitleEvent]), session failures ([ErrorSubtitleEvent] —
+  /// e.g. the OS killing mic capture mid-session, after which [isRunning]
+  /// is false again), native model loading progress
+  /// ([ModelLoadSubtitleEvent], around each [start]/[startDebugWavStream]
+  /// build and each [setVadSensitivity] rebuild), and [resetSession]
+  /// completions ([SessionResetSubtitleEvent]), in arrival order.
   Stream<SubtitleEvent> get events => _eventsController.stream;
 
   /// Emits `true` right before a segment starts decoding and `false` right
@@ -129,11 +173,54 @@ class HayamimiLive {
   bool get autoRefineEnabled => _transcriber.autoRefineEnabled;
   set autoRefineEnabled(bool value) => _transcriber.autoRefineEnabled = value;
 
+  /// How often (seconds) a draft re-decode fires while a VAD segment is in
+  /// progress. See [LiveTranscriber.draftIntervalSeconds] -- same default,
+  /// same runtime-settable, no-native-rebuild behavior.
+  double get draftIntervalSeconds => _transcriber.draftIntervalSeconds;
+  set draftIntervalSeconds(double value) =>
+      _transcriber.draftIntervalSeconds = value;
+
+  /// Trailing-audio cap (seconds) a draft decode re-processes. See
+  /// [LiveTranscriber.draftWindowSeconds].
+  double get draftWindowSeconds => _transcriber.draftWindowSeconds;
+  set draftWindowSeconds(double value) =>
+      _transcriber.draftWindowSeconds = value;
+
+  /// Minimum accumulated audio (seconds) before a draft decode runs. See
+  /// [LiveTranscriber.minDraftAudioSeconds].
+  double get minDraftAudioSeconds => _transcriber.minDraftAudioSeconds;
+  set minDraftAudioSeconds(double value) =>
+      _transcriber.minDraftAudioSeconds = value;
+
+  /// Silence gap (seconds) that fires an auto-refine. See
+  /// [LiveTranscriber.autoRefineSilenceSeconds].
+  double get autoRefineSilenceSeconds => _transcriber.autoRefineSilenceSeconds;
+  set autoRefineSilenceSeconds(double value) =>
+      _transcriber.autoRefineSilenceSeconds = value;
+
+  /// Buffered-duration ceiling (seconds) that fires an auto-refine even
+  /// without a silence gap. See
+  /// [LiveTranscriber.autoRefineMaxBufferedSeconds].
+  double get autoRefineMaxBufferedSeconds =>
+      _transcriber.autoRefineMaxBufferedSeconds;
+  set autoRefineMaxBufferedSeconds(double value) =>
+      _transcriber.autoRefineMaxBufferedSeconds = value;
+
+  /// Hard cap (seconds) on how much audio the refine buffer holds. See
+  /// [LiveTranscriber.refineBufferMaxSeconds].
+  double get refineBufferMaxSeconds => _transcriber.refineBufferMaxSeconds;
+  set refineBufferMaxSeconds(double value) =>
+      _transcriber.refineBufferMaxSeconds = value;
+
   /// Starts capturing mic audio and transcribing it.
   ///
   /// [modelDir] must contain a zipformer transducer model.
   /// [vadModelPath] must point at a Silero VAD onnx model file (e.g.
   /// `silero_vad.onnx`).
+  ///
+  /// See [LiveTranscriber.start] for what [decodingMethod]/
+  /// [vadSensitivity]/[hotwordsFile]/[hotwordsScore] do and their defaults
+  /// -- forwarded through unchanged.
   Future<void> start({
     required String modelDir,
     required String vadModelPath,
@@ -141,6 +228,10 @@ class HayamimiLive {
     RoutingProfile routingProfile = RoutingProfile.jaOnly,
     String? senseVoiceModelDir,
     String? lidModelDir,
+    String? decodingMethod,
+    VadSensitivity? vadSensitivity,
+    String? hotwordsFile,
+    double hotwordsScore = 1.5,
   }) {
     return _transcriber.start(
       modelKind: modelKind,
@@ -149,6 +240,10 @@ class HayamimiLive {
       routingProfile: routingProfile,
       senseVoiceModelDir: senseVoiceModelDir,
       lidModelDir: lidModelDir,
+      decodingMethod: decodingMethod,
+      vadSensitivity: vadSensitivity,
+      hotwordsFile: hotwordsFile,
+      hotwordsScore: hotwordsScore,
     );
   }
 
@@ -161,6 +256,21 @@ class HayamimiLive {
   /// nothing if there's too little buffered audio.
   Future<void> refineNow() => _transcriber.refineNow();
 
+  /// Rebuilds Silero VAD off-isolate with [sensitivity] and swaps it in at
+  /// the next safe point (never mid-segment) -- see
+  /// [LiveTranscriber.setVadSensitivity]. If no session is running, just
+  /// remembers [sensitivity] for the next [start].
+  Future<void> setVadSensitivity(VadSensitivity sensitivity) =>
+      _transcriber.setVadSensitivity(sensitivity);
+
+  /// Clears the current "conversation" -- refine buffer, draft state, and
+  /// (for a routed session) which language it's locked to -- without
+  /// reloading any native model, then emits a [SessionResetSubtitleEvent]
+  /// on [events]. See [LiveTranscriber.resetSession] for the full
+  /// behavior, including what happens if a decode is in flight. A no-op
+  /// (no event emitted) when no session is running.
+  Future<void> resetSession() => _transcriber.resetSession();
+
   /// Whether [startDebugWavStream] is currently paced-streaming a wav file
   /// through the pipeline instead of the mic.
   bool get isDebugStreaming => _transcriber.isDebugStreaming;
@@ -172,7 +282,8 @@ class HayamimiLive {
   /// Exists so this facade can be exercised end to end without a real
   /// microphone -- e.g. on an Android emulator, which has none. Awaits
   /// until the whole file has been fed through and any in-progress segment
-  /// has been flushed and decoded.
+  /// has been flushed and decoded. See [start] for [decodingMethod]/
+  /// [vadSensitivity]/[hotwordsFile]/[hotwordsScore].
   Future<void> startDebugWavStream({
     required String modelDir,
     required String vadModelPath,
@@ -182,6 +293,10 @@ class HayamimiLive {
     String? senseVoiceModelDir,
     String? lidModelDir,
     bool realtime = true,
+    String? decodingMethod,
+    VadSensitivity? vadSensitivity,
+    String? hotwordsFile,
+    double hotwordsScore = 1.5,
   }) {
     return _transcriber.startDebugWavStream(
       modelKind: modelKind,
@@ -192,6 +307,10 @@ class HayamimiLive {
       senseVoiceModelDir: senseVoiceModelDir,
       lidModelDir: lidModelDir,
       realtime: realtime,
+      decodingMethod: decodingMethod,
+      vadSensitivity: vadSensitivity,
+      hotwordsFile: hotwordsFile,
+      hotwordsScore: hotwordsScore,
     );
   }
 
@@ -212,6 +331,8 @@ class HayamimiLive {
     await _decodingSubscription.cancel();
     await _draftsSubscription.cancel();
     await _errorsSubscription.cancel();
+    await _modelLoadsSubscription.cancel();
+    await _sessionResetsSubscription.cancel();
     await _transcriber.dispose();
     await _eventsController.close();
     await _decodingController.close();

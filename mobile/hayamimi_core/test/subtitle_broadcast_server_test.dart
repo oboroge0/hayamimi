@@ -137,4 +137,83 @@ void main() {
       expect(server.boundPort, isNull);
     });
   });
+
+  group('SubtitleBroadcastServer bindAddress/allowOrigin', () {
+    test(
+      'a server given bindAddress: InternetAddress.loopbackIPv4 is '
+      'reachable on 127.0.0.1',
+      () async {
+        final loopbackServer = SubtitleBroadcastServer(
+          port: 0,
+          bindAddress: InternetAddress.loopbackIPv4,
+        );
+        addTearDown(loopbackServer.stop);
+        await loopbackServer.start();
+
+        final client = HttpClient();
+        try {
+          final request = await client.get(
+            '127.0.0.1',
+            loopbackServer.boundPort!,
+            '/',
+          );
+          final response = await request.close();
+          expect(response.statusCode, 200);
+        } finally {
+          client.close(force: true);
+        }
+      },
+    );
+
+    test('the /events response sends Access-Control-Allow-Origin: * by default', () async {
+      final defaultServer = SubtitleBroadcastServer(port: 0);
+      addTearDown(defaultServer.stop);
+      await defaultServer.start();
+
+      final client = HttpClient();
+      try {
+        final request = await client.get(
+          '127.0.0.1',
+          defaultServer.boundPort!,
+          '/events',
+        );
+        // request.close()'s future resolves once the response headers have
+        // arrived, before the (never-ending, for an SSE stream) body -- no
+        // need to read/drain the body to inspect headers.
+        final response = await request.close();
+        expect(response.headers.value('access-control-allow-origin'), '*');
+      } finally {
+        client.close(force: true);
+      }
+    });
+
+    test(
+      'the /events response sends a custom Access-Control-Allow-Origin '
+      'when allowOrigin is set',
+      () async {
+        final customServer = SubtitleBroadcastServer(
+          port: 0,
+          allowOrigin: 'https://example.com',
+        );
+        addTearDown(customServer.stop);
+        await customServer.start();
+
+        final client = HttpClient();
+        try {
+          final request = await client.get(
+            '127.0.0.1',
+            customServer.boundPort!,
+            '/events',
+          );
+          final response = await request.close();
+          expect(
+            response.headers.value('access-control-allow-origin'),
+            'https://example.com',
+          );
+        } finally {
+          client.close(force: true);
+        }
+      },
+    );
+  });
 }

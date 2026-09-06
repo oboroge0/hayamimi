@@ -11,16 +11,38 @@ import 'subtitle_event.dart';
 /// `/` suitable for an OBS browser source. Any device on the same LAN
 /// (OBS, a browser) can subscribe to this phone's live transcript.
 ///
-/// Binds to `0.0.0.0` (all interfaces) rather than loopback, since the
-/// whole point is reachability from other devices on the network.
+/// Binds to [bindAddress], which defaults to `0.0.0.0` (all interfaces)
+/// rather than loopback, since the whole point of this server is
+/// reachability from *other* devices on the network — a phone streaming
+/// subtitles to OBS or a browser running on a different machine on the same
+/// Wi-Fi. Pass a narrower [bindAddress] (e.g.
+/// `InternetAddress.loopbackIPv4`) if a host app wants to restrict this to
+/// same-device consumers only, though that defeats the LAN-broadcast use
+/// case this class exists for.
 class SubtitleBroadcastServer {
-  SubtitleBroadcastServer({this.port = defaultPort});
+  SubtitleBroadcastServer({
+    this.port = defaultPort,
+    InternetAddress? bindAddress,
+    this.allowOrigin = '*',
+  }) : bindAddress = bindAddress ?? InternetAddress.anyIPv4;
 
   static const int defaultPort = 8833;
 
   /// Requested port. Pass `0` (used by tests) to bind an OS-assigned
   /// ephemeral port instead — read the actual port back via [boundPort].
   final int port;
+
+  /// Interface to bind the listener to. Defaults to
+  /// [InternetAddress.anyIPv4] — see the class doc for why.
+  final InternetAddress bindAddress;
+
+  /// Value sent as the `/events` response's `Access-Control-Allow-Origin`
+  /// header. Defaults to `'*'` (any origin may fetch the SSE stream cross-
+  /// origin), matching the desktop `subtitle_server.py`'s behavior and
+  /// keeping a browser-based OBS source or a web dashboard on another
+  /// origin working without extra configuration. Narrow this if a host app
+  /// needs to restrict which origins may read its transcript.
+  final String allowOrigin;
 
   HttpServer? _httpServer;
   // [isRunning] only flips once the bind completes, so without this a
@@ -44,7 +66,7 @@ class SubtitleBroadcastServer {
     }
     _starting = true;
     try {
-      final server = await HttpServer.bind(InternetAddress.anyIPv4, port);
+      final server = await HttpServer.bind(bindAddress, port);
       _httpServer = server;
       server.listen(_handleRequest, onError: (_) {});
     } finally {
@@ -98,7 +120,7 @@ class SubtitleBroadcastServer {
       'text/event-stream; charset=utf-8',
     );
     response.headers.set(HttpHeaders.cacheControlHeader, 'no-cache');
-    response.headers.set('Access-Control-Allow-Origin', '*');
+    response.headers.set('Access-Control-Allow-Origin', allowOrigin);
     response.bufferOutput = false;
 
     // Send an initial SSE comment line (ignored by EventSource, per spec)

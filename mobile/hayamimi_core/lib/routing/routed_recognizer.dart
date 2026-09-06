@@ -68,15 +68,35 @@ class RoutedRecognizerSet {
   /// resolves one (bootstrap). Exposed for the UI's language badge.
   String? currentLang;
 
-  /// Builds the ja (ReazonSpeech, `modified_beam_search` — matches desktop
-  /// production, see `bench_runner.dart`) + SenseVoice + whisper-tiny LID
+  /// Builds the ja (ReazonSpeech) + SenseVoice + whisper-tiny LID
   /// recognizer set from their model directories.
+  ///
+  /// [decodingMethod] applies only to the ja tier (SenseVoice's own decode
+  /// doesn't use it) and defaults to `'modified_beam_search'` — matches
+  /// desktop production, see `bench_runner.dart` — so a caller that doesn't
+  /// care about decoding method gets today's behavior unchanged.
+  /// [hotwordsFile]/[hotwordsScore] likewise only bias the ja tier; `null`
+  /// (the default) leaves hotwords off, same as before this parameter
+  /// existed.
+  ///
+  /// [onModelLoad], if given, is called `('ja'|'sensevoice'|'lid', 'start',
+  /// null)` right before each of the three background-isolate builds below
+  /// and `(..., 'done', elapsedMs)` right after — see
+  /// `LiveTranscriber.modelLoads`, which is what actually consumes this.
+  /// Kept as a plain callback (rather than this class depending on a
+  /// `SubtitleEvent`/event-type from another layer) so this file stays free
+  /// of any dependency beyond sherpa-onnx and its own model-resolving
+  /// helpers.
   static Future<RoutedRecognizerSet> build({
     required String reazonModelDir,
     required String senseVoiceModelDir,
     required String lidModelDir,
     int numThreads = 2,
     int sampleRate = 16000,
+    String decodingMethod = 'modified_beam_search',
+    String? hotwordsFile,
+    double hotwordsScore = 1.5,
+    void Function(String model, String phase, double? ms)? onModelLoad,
   }) async {
     final reazonDir = Directory(reazonModelDir);
     if (!await reazonDir.exists()) {
@@ -96,6 +116,8 @@ class RoutedRecognizerSet {
       throw RoutedRecognizerException(e.message);
     }
     final sep = Platform.pathSeparator;
+    onModelLoad?.call('ja', 'start', null);
+    final reazonStopwatch = Stopwatch()..start();
     final reazon = await buildOfflineRecognizerOffIsolate(
       sherpa_onnx.OfflineRecognizerConfig(
         model: sherpa_onnx.OfflineModelConfig(
@@ -109,9 +131,13 @@ class RoutedRecognizerSet {
           debug: false,
           provider: 'cpu',
         ),
-        decodingMethod: 'modified_beam_search',
+        decodingMethod: decodingMethod,
+        hotwordsFile: hotwordsFile ?? '',
+        hotwordsScore: hotwordsScore,
       ),
     );
+    reazonStopwatch.stop();
+    onModelLoad?.call('ja', 'done', reazonStopwatch.elapsedMicroseconds / 1000);
 
     final svDir = Directory(senseVoiceModelDir);
     if (!await svDir.exists()) {
@@ -144,6 +170,8 @@ class RoutedRecognizerSet {
         'SenseVoice model/tokens not found in: $senseVoiceModelDir',
       );
     }
+    onModelLoad?.call('sensevoice', 'start', null);
+    final svStopwatch = Stopwatch()..start();
     final senseVoice = await buildOfflineRecognizerOffIsolate(
       sherpa_onnx.OfflineRecognizerConfig(
         model: sherpa_onnx.OfflineModelConfig(
@@ -159,6 +187,8 @@ class RoutedRecognizerSet {
         ),
       ),
     );
+    svStopwatch.stop();
+    onModelLoad?.call('sensevoice', 'done', svStopwatch.elapsedMicroseconds / 1000);
 
     final lidDir = Directory(lidModelDir);
     if (!await lidDir.exists()) {
@@ -191,6 +221,8 @@ class RoutedRecognizerSet {
         'whisper-tiny LID encoder/decoder not found in: $lidModelDir',
       );
     }
+    onModelLoad?.call('lid', 'start', null);
+    final lidStopwatch = Stopwatch()..start();
     final lid = await buildSpokenLanguageIdentificationOffIsolate(
       sherpa_onnx.SpokenLanguageIdentificationConfig(
         whisper: sherpa_onnx.SpokenLanguageIdentificationWhisperConfig(
@@ -200,6 +232,8 @@ class RoutedRecognizerSet {
         numThreads: numThreads,
       ),
     );
+    lidStopwatch.stop();
+    onModelLoad?.call('lid', 'done', lidStopwatch.elapsedMicroseconds / 1000);
 
     return RoutedRecognizerSet._(
       reazonRecognizer: reazon,
@@ -207,6 +241,18 @@ class RoutedRecognizerSet {
       lidRecognizer: lid,
       sampleRate: sampleRate,
     );
+  }
+
+  /// Clears this session's routing state -- currently just [currentLang] --
+  /// without touching any of the three loaded native models, so a caller
+  /// can start a fresh "conversation" (the next segment resolves the
+  /// language from scratch, same as session bootstrap) without paying to
+  /// reload up to 396 MB of weights. [resolveStickyLang]'s pending/count
+  /// state isn't reset here because [RoutedRecognizerSet] never populates
+  /// it in the first place (see that function's doc: it has no production
+  /// callers on mobile today).
+  void reset() {
+    currentLang = null;
   }
 
   /// Decodes one VAD-bounded [samples] segment, routing it to ReazonSpeech

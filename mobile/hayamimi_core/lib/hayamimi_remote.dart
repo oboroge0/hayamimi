@@ -14,7 +14,10 @@ import 'server/subtitle_event.dart';
 /// can treat on-device and remote-PC transcription interchangeably.
 /// Protocol-only frames ([RemoteReadyEvent], [RemoteSessionStartEvent],
 /// [RemoteUnknownEvent]) carry no subtitle content and are dropped from
-/// [events]; use [rawEvents] if you need them.
+/// [events]; use [rawEvents] if you need them. [RemoteUnknownEvent] also
+/// covers a handful of server event types this package doesn't have a
+/// typed [RemoteEvent] for yet (`model_fallback`/`warning`/
+/// `session_summary`/`recluster`) — see [parseRemoteEvent]'s doc.
 ///
 /// ```dart
 /// final remote = HayamimiRemote();
@@ -38,7 +41,8 @@ class HayamimiRemote {
   bool _disposed = false;
 
   /// Subtitle content received from the server: partials, finals,
-  /// translations, refines, and errors, normalized to [SubtitleEvent].
+  /// translations, refines, errors, model-load progress, and session
+  /// resets, normalized to [SubtitleEvent].
   Stream<SubtitleEvent> get events => _eventsController.stream;
 
   /// The unmodified protocol stream, including handshake/session frames
@@ -72,20 +76,44 @@ class HayamimiRemote {
   void _onRawEvent(RemoteEvent event) {
     final mapped = switch (event) {
       RemotePartialEvent(:final text) => PartialSubtitleEvent(text),
-      RemoteFinalEvent(:final text, :final lang, :final speaker, :final latencyMs) =>
+      RemoteFinalEvent(
+        :final text,
+        :final lang,
+        :final speaker,
+        :final latencyMs,
+        :final audioSeconds,
+        :final switched,
+      ) =>
         FinalSubtitleEvent(
           text: text,
           lang: lang,
           speaker: speaker,
           latencyMs: latencyMs,
+          audioSeconds: audioSeconds,
+          switched: switched,
         ),
       RemoteTranslationEvent(:final lang, :final text) =>
         TranslationSubtitleEvent(lang: lang, text: text),
-      RemoteRefineEvent(:final text, :final lang, :final speaker) =>
-        RefineSubtitleEvent(text: text, lang: lang, speaker: speaker),
+      RemoteRefineEvent(
+        :final text,
+        :final lang,
+        :final speaker,
+        :final latencyMs,
+        :final audioSeconds,
+      ) =>
+        RefineSubtitleEvent(
+          text: text,
+          lang: lang,
+          speaker: speaker,
+          latencyMs: latencyMs,
+          audioSeconds: audioSeconds,
+        ),
       RemoteErrorEvent(:final message) => ErrorSubtitleEvent(
         message: message,
       ),
+      RemoteModelLoadEvent(:final model, :final phase, :final ms) =>
+        ModelLoadSubtitleEvent(model: model, phase: phase, ms: ms),
+      RemoteSessionResetEvent() => const SessionResetSubtitleEvent(),
       RemoteReadyEvent() || RemoteSessionStartEvent() || RemoteUnknownEvent() =>
         null,
     };

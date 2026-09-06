@@ -103,7 +103,12 @@ class _RemotePageState extends State<RemotePage> {
         setState(() => _errorText = message);
       case RemoteReadyEvent():
       case RemoteSessionStartEvent():
+      case RemoteModelLoadEvent():
+      case RemoteSessionResetEvent():
       case RemoteUnknownEvent():
+        // No UI for these yet on this screen (model-load progress, session
+        // resets, and anything this package doesn't have a typed
+        // RemoteEvent for) -- same as the other protocol-only frames above.
         break;
     }
   }
