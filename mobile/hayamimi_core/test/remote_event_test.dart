@@ -24,7 +24,7 @@ void main() {
       final event = parseRemoteEvent(
         '{"type": "final", "text": "こんにちは", "lang": "ja", '
         '"speaker": "spk1", "latency_ms": 123.5, "tier": "fast", '
-        '"audio_s": 2.5, "switched": true}',
+        '"audio_s": 2.5, "switched": true, "punctuated": true}',
       );
       expect(event, isA<RemoteFinalEvent>());
       final finalEvent = event as RemoteFinalEvent;
@@ -35,6 +35,7 @@ void main() {
       expect(finalEvent.tier, 'fast');
       expect(finalEvent.audioSeconds, 2.5);
       expect(finalEvent.switched, isTrue);
+      expect(finalEvent.punctuated, isTrue);
     });
 
     test('parses a final event with missing optional fields as defaults', () {
@@ -46,6 +47,9 @@ void main() {
       expect(finalEvent.tier, '');
       expect(finalEvent.audioSeconds, isNull);
       expect(finalEvent.switched, isFalse);
+      // No real server sends `punctuated` on a final frame yet -- the field
+      // exists so the two paths agree, not because one is filling it in.
+      expect(finalEvent.punctuated, isFalse);
     });
 
     test('parses a translation event', () {

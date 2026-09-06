@@ -4,7 +4,10 @@ Flutter app (Android + iOS, shared codebase) for prototyping hayamimi's
 speech recognition on phones. The recognition logic itself lives in the
 sibling [`hayamimi_core`](hayamimi_core/) package (path dependency, see
 `pubspec.yaml`) so other apps — e.g. a smart-glasses companion app — can
-embed the same live/remote transcription pipeline without this demo UI. See
+embed the same live/remote transcription pipeline without this demo UI.
+`hayamimi_core` is also published on
+[pub.dev](https://pub.dev/packages/hayamimi_core), so a third-party app can
+depend on it directly instead of a path/git dependency. See
 [`hayamimi_core/README.md`](hayamimi_core/README.md) for the embedding API.
 This app has three screens:
 

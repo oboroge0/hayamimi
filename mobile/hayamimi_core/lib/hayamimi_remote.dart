@@ -30,6 +30,9 @@ import 'server/subtitle_event.dart';
 /// await remote.dispose();
 /// ```
 class HayamimiRemote {
+  /// Creates a client with no active connection. Pass [transcriber] only
+  /// to inject a fake [RemoteTranscriber] in tests; a real host app should
+  /// leave it unset.
   HayamimiRemote({RemoteTranscriber? transcriber})
     : _transcriber = transcriber ?? RemoteTranscriber() {
     _rawSubscription = _transcriber.events.listen(_onRawEvent);
@@ -49,9 +52,15 @@ class HayamimiRemote {
   /// [events] drops. Most callers want [events] instead.
   Stream<RemoteEvent> get rawEvents => _transcriber.events;
 
+  /// Fires whenever [state] changes, e.g. connecting -> connected, or a
+  /// dropped socket -> reconnecting.
   Stream<RemoteConnectionState> get connectionState =>
       _transcriber.connectionState;
+
+  /// This client's current connection lifecycle state.
   RemoteConnectionState get state => _transcriber.state;
+
+  /// Shorthand for `state == RemoteConnectionState.connected`.
   bool get isConnected => _transcriber.isConnected;
 
   /// Connects to [url] (e.g. `ws://192.168.1.10:8766/ingest`), sends the
@@ -83,6 +92,7 @@ class HayamimiRemote {
         :final latencyMs,
         :final audioSeconds,
         :final switched,
+        :final punctuated,
       ) =>
         FinalSubtitleEvent(
           text: text,
@@ -91,6 +101,7 @@ class HayamimiRemote {
           latencyMs: latencyMs,
           audioSeconds: audioSeconds,
           switched: switched,
+          punctuated: punctuated,
         ),
       RemoteTranslationEvent(:final lang, :final text) =>
         TranslationSubtitleEvent(lang: lang, text: text),

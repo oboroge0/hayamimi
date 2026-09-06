@@ -9,6 +9,9 @@ import 'remote_event.dart';
 import 'remote_handshake.dart';
 import 'wav_pcm_reader.dart';
 
+/// Thrown by [RemoteTranscriber.connect]/[RemoteTranscriber.sendTestWavFile]
+/// for a connection or microphone-permission failure -- a rejected
+/// handshake, an unreachable server, or a denied `RECORD_AUDIO` request.
 class RemoteTranscriberException implements Exception {
   RemoteTranscriberException(this.message);
   final String message;
@@ -35,8 +38,13 @@ const _reconnectDelay = Duration(seconds: 2);
 /// microphone (see `scripts/ws_mic_client.py`, the desktop-side reference
 /// client this mirrors).
 class RemoteTranscriber {
+  /// Creates a client with no active connection. Pass [recorder] only to
+  /// inject a fake `AudioRecorder` in tests; a real host app should leave
+  /// it unset.
   RemoteTranscriber({AudioRecorder? recorder}) : _recorder = recorder ?? AudioRecorder();
 
+  /// The mic capture rate this client records at and streams to the
+  /// server, in Hz. Fixed -- not configurable per session.
   static const int sampleRate = 16000;
 
   final AudioRecorder _recorder;
@@ -62,9 +70,14 @@ class RemoteTranscriber {
   /// or a [sendTestWavFile] debug send.
   Stream<RemoteEvent> get events => _eventsController.stream;
 
+  /// Fires whenever [state] changes, e.g. connecting -> connected, or a
+  /// dropped socket -> reconnecting.
   Stream<RemoteConnectionState> get connectionState => _stateController.stream;
+
+  /// This client's current connection lifecycle state.
   RemoteConnectionState get state => _state;
 
+  /// Shorthand for `state == RemoteConnectionState.connected`.
   bool get isConnected => _state == RemoteConnectionState.connected;
 
   /// Connects to [url] (e.g. `ws://10.0.2.2:8833/ingest`), sends the

@@ -23,9 +23,7 @@ SOFTWARE.
 ---
 
 This license covers this package's source code only. It bundles no model
-weights; the pretrained models a host app puts on the device are
-third-party artifacts distributed under their own licenses -- see
-THIRD_PARTY_NOTICES.md, shipped alongside this file in the package. In
-particular, the ja->en translation model used by the desktop hayamimi
-pipeline (FuguMT / mojicast-fugumt-ja-en-ct2) is CC BY-SA 4.0
-(share-alike), not MIT.
+weights; the pretrained models a host app puts on the device (ReazonSpeech,
+SenseVoice, whisper-tiny, Silero VAD, and the optional Japanese punctuation
+model) are third-party artifacts distributed under their own licenses --
+see THIRD_PARTY_NOTICES.md, shipped alongside this file in the package.

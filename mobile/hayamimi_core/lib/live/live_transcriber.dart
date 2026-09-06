@@ -7,6 +7,7 @@ import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa_onnx;
 
 import '../bench/model_file_resolver.dart';
 import '../bench/model_kind.dart';
+import '../punct/punct_ja_text.dart';
 import '../remote/wav_pcm_reader.dart';
 import '../routing/routed_recognizer.dart';
 import '../routing/routing_profile.dart';
@@ -14,11 +15,13 @@ import 'decode_protocol.dart';
 import 'decode_session.dart';
 import 'decode_worker.dart';
 import 'draft_pass.dart';
+import 'ja_punctuation.dart';
 import 'live_transcript_entry.dart';
 import 'live_vad.dart';
 import 'model_load_event.dart';
 import 'native_model_loader.dart';
 import 'pcm_frame_buffer.dart';
+import 'preroll.dart';
 import 'refine_pass.dart';
 import 'speech_segment_filter.dart';
 import 'vad_sensitivity.dart';
@@ -40,10 +43,21 @@ const _autoRefineCheckInterval = Duration(seconds: 1);
 /// close.
 const _decodeDrainTimeout = Duration(seconds: 10);
 
+/// The least audio a refine ("清書") pass is worth running over, in
+/// seconds. Mirrors the desktop `Refiner`'s own `len(buf) < sr // 2`
+/// guard: re-decoding a fraction of a second of speech as a "group" costs
+/// a full decode and cannot produce a better result than the final that
+/// already covered it.
+const _minRefineAudioSeconds = 0.5;
+
 /// Builds the real, isolate-backed decode worker. Swapped out only by
 /// tests (see [LiveTranscriber]'s `decodeWorkerFactory`).
 DecodeWorker _spawnDecodeWorker() => IsolateDecodeWorker();
 
+/// A [LiveTranscriber] failure: thrown by `start`/`startDebugWavStream`
+/// for a bad configuration (e.g. a missing model file), and emitted on
+/// [LiveTranscriber.errors] for a failure mid-session -- e.g. the OS
+/// revoking microphone access, or the decode worker isolate dying.
 class LiveTranscriberException implements Exception {
   LiveTranscriberException(this.message);
   final String message;
@@ -59,8 +73,9 @@ class LiveTranscriberException implements Exception {
 /// This class owns the mic stream, the native VAD/recognizer handles, and
 /// the glue between them, so it isn't unit-testable on its own (it needs a
 /// real device/emulator mic and the sherpa-onnx native libs). The pure
-/// pieces it's built from — [pcm16BytesToFloat32], [PcmFrameBuffer], and
-/// [isSegmentWorthDecoding] — are unit tested separately.
+/// pieces it's built from — [pcm16BytesToFloat32], [PcmFrameBuffer],
+/// [isSegmentWorthDecoding] and [PrerollHistory] — are unit tested
+/// separately.
 ///
 /// Threading: neither model loading nor decoding runs on the caller's
 /// isolate. Loading happens on short-lived background isolates (see
@@ -81,6 +96,10 @@ class LiveTranscriber {
   /// unchanged. All six must be positive and finite; an out-of-range value
   /// throws [ArgumentError] here (and from the property setters) rather
   /// than silently misbehaving mid-session.
+  ///
+  /// [prerollSeconds] (see `preroll.dart`) is the seventh knob and the one
+  /// exception to that rule: it may be 0, which turns pre-roll off, and
+  /// only a negative or non-finite value throws.
   ///
   /// Validation runs before [recorder] is defaulted to a fresh
   /// `AudioRecorder()` (Dart evaluates an initializer list left to right):
@@ -106,7 +125,12 @@ class LiveTranscriber {
     double autoRefineSilenceSeconds = defaultAutoRefineSilenceSeconds,
     double autoRefineMaxBufferedSeconds = defaultAutoRefineMaxBufferedSeconds,
     double refineBufferMaxSeconds = defaultRefineBufferMaxSeconds,
-  }) : _draftIntervalSeconds = _requirePositive(
+    double prerollSeconds = defaultPrerollSeconds,
+  }) : _prerollSeconds = _requireNonNegative(
+         prerollSeconds,
+         'prerollSeconds',
+       ),
+       _draftIntervalSeconds = _requirePositive(
          draftIntervalSeconds,
          'draftIntervalSeconds',
        ),
@@ -137,11 +161,26 @@ class LiveTranscriber {
        _vadFactory = vadFactory ?? buildSileroLiveVad,
        _recorder = recorder ?? AudioRecorder();
 
+  /// The mic capture / VAD / recognizer sample rate this transcriber uses
+  /// throughout, in Hz. Fixed -- not configurable per session.
   static const int sampleRate = 16000;
 
   static double _requirePositive(double value, String name) {
     if (!value.isFinite || value <= 0) {
       throw ArgumentError.value(value, name, 'must be a positive, finite number');
+    }
+    return value;
+  }
+
+  /// Same as [_requirePositive] but allows zero, for [prerollSeconds]: zero
+  /// is the meaningful "no pre-roll at all" setting, not a mistake.
+  static double _requireNonNegative(double value, String name) {
+    if (!value.isFinite || value < 0) {
+      throw ArgumentError.value(
+        value,
+        name,
+        'must be a non-negative, finite number',
+      );
     }
     return value;
   }
@@ -160,6 +199,18 @@ class LiveTranscriber {
   final _sessionResetController = StreamController<void>.broadcast();
 
   LiveVad? _vad;
+  // The audio a segment's pre-roll is taken from: every frame fed to the
+  // VAD is also pushed here, so a segment can be extended backwards past
+  // the onset the VAD reported (see preroll.dart for why that is needed).
+  // Built alongside the VAD, dropped with it.
+  PrerollHistory? _prerollHistory;
+  // How much audio this session has fed its VAD(s) in total, and how much
+  // it had fed when the CURRENT VAD instance was installed. A VAD counts
+  // samples from its own first frame, so a mid-session sensitivity swap
+  // resets that count to zero; adding the origin back is what keeps
+  // segment positions on one continuous session clock.
+  int _samplesFedToVad = 0;
+  int _vadSampleOrigin = 0;
   // The worker isolate that owns this session's recognizer(s), and the
   // queue in front of it. Null between sessions; built by
   // _buildNativeState, shut down by _teardownNativeState.
@@ -221,6 +272,7 @@ class LiveTranscriber {
   double _minDraftAudioSeconds;
   double _autoRefineSilenceSeconds;
   double _autoRefineMaxBufferedSeconds;
+  double _prerollSeconds;
   bool _debugStreaming = false;
   bool _debugStreamCancelRequested = false;
   // Set synchronously by [start]/[startDebugWavStream] before their first
@@ -235,10 +287,11 @@ class LiveTranscriber {
   // demand, re-decode the whole group together for a cleaner result than
   // any single segment got on its own (same effect the desktop pipeline's
   // `Refiner` gets from re-decoding across segment boundaries — see
-  // `scripts/realtime_transcribe.py`). No punctuation-restoration model is
-  // layered on top of this; it's re-decode only. Built in the constructor
-  // initializer list above (its cap comes from the refineBufferMaxSeconds
-  // constructor parameter).
+  // `scripts/realtime_transcribe.py`). When start() was given a
+  // `punctuation` model, the worker also restores 、 and 。 into the result
+  // before sending it back; without one this stays re-decode only. Built in
+  // the constructor initializer list above (its cap comes from the
+  // refineBufferMaxSeconds constructor parameter).
   final RefineBuffer _refineBuffer;
   DateTime? _lastSegmentAt;
   Timer? _autoRefineTimer;
@@ -285,6 +338,26 @@ class LiveTranscriber {
         'autoRefineMaxBufferedSeconds',
       );
 
+  /// How much audio from before a segment's detected onset is prepended to
+  /// it before decoding, in seconds. Defaults to [defaultPrerollSeconds].
+  ///
+  /// Silero VAD reports a speech onset slightly late, so the samples it
+  /// hands over can start partway into the first word and the recognizer
+  /// then transcribes that word wrong (`資料は` came back as `昨日は` on the
+  /// Android emulator). Prepending the audio recorded just before the
+  /// onset gives the recognizer the run-up it needs. That audio counts as
+  /// part of the segment: it is what gets decoded, what
+  /// [LiveTranscriptEntry.audioSeconds] reports, and what the refine
+  /// ("清書") buffer stores.
+  ///
+  /// Runtime-settable, applying from the next segment onward, without
+  /// touching any native model. Unlike the other knobs, `0` is allowed and
+  /// means "no pre-roll", i.e. decode exactly what the VAD delimited;
+  /// negative or non-finite values throw [ArgumentError].
+  double get prerollSeconds => _prerollSeconds;
+  set prerollSeconds(double value) =>
+      _prerollSeconds = _requireNonNegative(value, 'prerollSeconds');
+
   /// Hard cap (seconds) on how much audio the refine buffer holds before it
   /// starts dropping the oldest segment. Defaults to
   /// [defaultRefineBufferMaxSeconds]. Runtime-settable: applies from the
@@ -294,6 +367,12 @@ class LiveTranscriber {
       _requirePositive(value, 'refineBufferMaxSeconds');
 
   /// Finalized transcript lines, one per detected speech segment.
+  ///
+  /// When [start] was given a `punctuation` model, a line here can carry
+  /// 、 。 ？ the recognizer never produced, and says so through
+  /// [LiveTranscriptEntry.punctuated] — see `JaPunctuation.applyToFinals`,
+  /// which turns that off for this stream while leaving [refineEntries]
+  /// punctuated.
   Stream<LiveTranscriptEntry> get entries => _entriesController.stream;
 
   /// Emits `true` when the decode worker has work outstanding and `false`
@@ -308,6 +387,12 @@ class LiveTranscriber {
   /// Refine ("清書") results: one entry per manual or automatic refine
   /// pass, each covering everything buffered since the previous refine (or
   /// since the session started).
+  ///
+  /// When [start] was given a `punctuation` model, an entry here carries
+  /// 、 。 ？ that the recognizer never produced, and says so through
+  /// [LiveTranscriptEntry.punctuated] — including when the pass falls back
+  /// to the finals' own text, since those are punctuated too unless
+  /// `JaPunctuation.applyToFinals` said not to.
   Stream<LiveTranscriptEntry> get refineEntries => _refineEntriesController.stream;
 
   /// In-progress ("draft") decodes: one per draft re-decode while a VAD
@@ -345,6 +430,8 @@ class LiveTranscriber {
   /// `events` stream).
   Stream<void> get sessionResets => _sessionResetController.stream;
 
+  /// Whether a session is currently active: microphone capture is running
+  /// and the decode worker is loaded.
   bool get isRunning => _micSubscription != null;
 
   /// Whether [startDebugWavStream] is currently paced-streaming a wav file
@@ -361,7 +448,7 @@ class LiveTranscriber {
   /// Total audio currently buffered for the next refine pass, in seconds.
   double get refineBufferedSeconds => _refineBuffer.totalDurationSeconds;
 
-  /// Whether auto-refine (silence-triggered, see [refine_pass.dart]) is on.
+  /// Whether auto-refine (silence-triggered, see `refine_pass.dart`) is on.
   /// Defaults to off: on a phone every refine is a full re-decode burning
   /// battery and generating heat, so firing it automatically is opt-in —
   /// the manual "清書" button always works regardless of this setting.
@@ -372,7 +459,7 @@ class LiveTranscriber {
     if (!value) {
       _autoRefineTimer?.cancel();
       _autoRefineTimer = null;
-    } else if (isRunning) {
+    } else if (isRunning || _debugStreaming) {
       _startAutoRefineTimer();
     }
   }
@@ -408,10 +495,10 @@ class LiveTranscriber {
   ///
   /// [vadSensitivity] configures Silero VAD's speech/silence detection
   /// (threshold, minimum silence/speech durations, max segment duration —
-  /// see [VadSensitivity]); `null` (the default) uses sherpa-onnx's own
-  /// defaults, same as before this parameter existed. Change it after
-  /// [start] via [setVadSensitivity] instead of stopping and restarting the
-  /// session.
+  /// see [VadSensitivity], whose defaults are the desktop pipeline's tuned
+  /// values rather than sherpa-onnx's stock ones, and which explains why).
+  /// `null` (the default) uses those defaults. Change it after [start] via
+  /// [setVadSensitivity] instead of stopping and restarting the session.
   ///
   /// [hotwordsFile]/[hotwordsScore] bias the recognizer toward a wordlist
   /// (sherpa-onnx's own hotwords feature) on the plain path and the routed
@@ -419,6 +506,30 @@ class LiveTranscriber {
   /// knobs and [vadSensitivity], hotwords have no runtime setter — they're
   /// baked into the recognizer at build time, so changing them requires a
   /// fresh [start] (or [stop] + [start]).
+  ///
+  /// [punctuation] turns on Japanese punctuation restoration for this
+  /// session: the recognizer emits a bare run of characters, and the model
+  /// named here puts 、 and 。 (and ？ after a question ending) back into
+  /// it, the way the desktop pipeline's `scripts/punct_ja.py` does. `null`
+  /// (the default) leaves it off, which is what this method did before the
+  /// parameter existed. What changes when it is set:
+  ///
+  ///  * [refineEntries] and [entries] are affected; [drafts] carry the
+  ///    recognizer's text unchanged (see `decode_worker.dart` for why).
+  ///    `JaPunctuation.applyToFinals: false` narrows this back to
+  ///    [refineEntries] alone;
+  ///  * a routed session punctuates what came back as Japanese and leaves
+  ///    the rest alone; a plain session punctuates everything, so **only
+  ///    pass this to a plain session whose model is Japanese**;
+  ///  * each affected entry carries [LiveTranscriptEntry.punctuated];
+  ///  * the model is loaded in the decode worker, after the recognizers,
+  ///    and reported on [modelLoads] as `model: 'punct'`. It is another
+  ///    181.8 MB of memory for the life of the session, and a failure to
+  ///    load it fails this call rather than starting a session that
+  ///    quietly produces unpunctuated text.
+  ///
+  /// Like hotwords, it is fixed for the session: changing it means a fresh
+  /// [start].
   Future<void> start({
     required ModelKind modelKind,
     required String modelDir,
@@ -430,6 +541,7 @@ class LiveTranscriber {
     VadSensitivity? vadSensitivity,
     String? hotwordsFile,
     double hotwordsScore = 1.5,
+    JaPunctuation? punctuation,
   }) async {
     if (isRunning || _debugStreaming || _starting) {
       return;
@@ -455,6 +567,7 @@ class LiveTranscriber {
           vadSensitivity: vadSensitivity ?? _vadSensitivity,
           hotwordsFile: hotwordsFile,
           hotwordsScore: hotwordsScore,
+          punctuation: punctuation,
         );
       } catch (_) {
         // _buildNativeState can throw after already building the
@@ -557,6 +670,7 @@ class LiveTranscriber {
     required VadSensitivity vadSensitivity,
     String? hotwordsFile,
     double hotwordsScore = 1.5,
+    JaPunctuation? punctuation,
   }) async {
     // A new generation starts the moment this build begins, not once it
     // succeeds: any setVadSensitivity rebuild already in flight for the
@@ -590,6 +704,22 @@ class LiveTranscriber {
       );
     }
 
+    if (punctuation != null) {
+      // Checked here, alongside the recognizer and VAD paths, so a missing
+      // 182 MB model is reported before an isolate is spawned and up to
+      // 396 MB of recognizer weights are loaded for a session that is about
+      // to fail anyway. The worker checks again -- it is the one that can
+      // tell a file that exists from a file it can actually load.
+      for (final (label, path) in <(String, String)>[
+        ('Japanese punctuation model', punctuation.modelPath),
+        ('Japanese punctuation vocabulary', punctuation.vocabPath),
+      ]) {
+        if (!await File(path).exists()) {
+          throw LiveTranscriberException('$label not found: $path');
+        }
+      }
+    }
+
     // Captured before the worker is started and stamped on every callback
     // below (see [_ifCurrent]): a worker replies on its own schedule, so
     // this is what tells a reply whether the session it belongs to is
@@ -609,6 +739,16 @@ class LiveTranscriber {
           hotwordsFile: hotwordsFile,
           hotwordsScore: hotwordsScore,
           sampleRate: sampleRate,
+          punctModelPath: punctuation?.modelPath,
+          punctVocabPath: punctuation?.vocabPath,
+          punctLibraryPath: punctuation?.libraryPath,
+          punctNumThreads: punctuation?.numThreads ?? defaultPunctNumThreads,
+          punctuateFinals: punctuation?.applyToFinals ?? true,
+          // punctuatePlainSession is left at the default (true): for a plain
+          // single-model session there is no language tag to test, and
+          // passing a Japanese punctuation model to one is itself the
+          // statement that its model transcribes Japanese. See
+          // DecodeWorkerConfig.punctuatePlainSession.
         ),
         buildRefinePayload: () => _buildRefinePayload(generation),
         onFinal: (samples, result) =>
@@ -668,6 +808,9 @@ class LiveTranscriber {
       ms: vadStopwatch.elapsedMicroseconds / 1000,
     );
     _frameBuffer = PcmFrameBuffer(frameSize: vad.frameSize);
+    _prerollHistory = PrerollHistory(sampleRate: sampleRate);
+    _samplesFedToVad = 0;
+    _vadSampleOrigin = 0;
   }
 
   void _emitModelLoad({
@@ -736,6 +879,11 @@ class LiveTranscriber {
     if (vad == null) {
       return;
     }
+    // Recorded before the VAD sees it, on the same clock the VAD counts
+    // on, so a segment the VAD reports can be extended backwards into the
+    // audio that preceded it.
+    _prerollHistory?.push(frame);
+    _samplesFedToVad += frame.length;
     vad.acceptWaveform(frame);
 
     // Accumulate this VAD window for the draft pass while a segment is in
@@ -782,24 +930,53 @@ class LiveTranscriber {
       return;
     }
     while (vad.hasSegment) {
-      final samples = vad.takeSegment();
+      final segment = vad.takeSegment();
       // The segment just taken supersedes whatever the draft pass had
       // accumulated for it -- the real (properly routed/decoded) final is
       // about to replace any draft the UI was showing.
       _clearDraftFrames();
       _draftSegmentActive = false;
-      _decodeSegment(samples);
+      _decodeSegment(segment);
     }
   }
 
-  void _decodeSegment(Float32List samples) {
-    if (!isSegmentWorthDecoding(samples, sampleRate: sampleRate)) {
+  void _decodeSegment(LiveSpeechSegment segment) {
+    // Judged on what the VAD actually delimited, before any pre-roll is
+    // added: pre-roll is context, not speech, and letting a second of it
+    // pad a 0.1s blip past the minimum would send near-silence to the
+    // recognizer for no reason.
+    final worthDecoding = isSegmentWorthDecoding(
+      segment.samples,
+      sampleRate: sampleRate,
+    );
+    // Extended even when the segment is about to be dropped, because this
+    // call is also what moves the history's "do not reach back past here"
+    // marker: skipping it would let the NEXT segment's pre-roll cover this
+    // one's audio. Same order the desktop pipeline's drain_segments uses.
+    final samples = _withPreroll(segment);
+    if (!worthDecoding) {
       return;
     }
     // Queued at the worker, never dropped, and answered in the order the
     // segments closed -- so the transcript keeps the order the speaker
     // said things in even when several segments finish back to back.
     _decode?.submitFinal(samples);
+  }
+
+  /// Gives [segment] the audio recorded just before the VAD noticed it,
+  /// which is what stops an utterance-initial word being clipped (see
+  /// `preroll.dart`). Returns the segment's own samples unchanged when
+  /// [prerollSeconds] is 0, or when there is no history to draw on.
+  Float32List _withPreroll(LiveSpeechSegment segment) {
+    final history = _prerollHistory;
+    if (history == null) {
+      return segment.samples;
+    }
+    return history.withPreroll(
+      segmentStartSample: _vadSampleOrigin + segment.startSample,
+      samples: segment.samples,
+      prerollSeconds: _prerollSeconds,
+    );
   }
 
   /// Turns one finished segment's decode into a transcript line and files
@@ -824,12 +1001,21 @@ class LiveTranscriber {
           lang: result.lang,
           audioSeconds: samples.length / sampleRate,
           switched: result.switched,
+          punctuated: result.punctuated,
         ),
       );
     }
     _lastSegmentAt = now;
+    // The buffered text is the punctuated one when the worker punctuated it,
+    // because this is what a refine falls back to when its merged re-decode
+    // is rejected -- see _onRefineDecoded.
     _refineBuffer.add(
-      RefineSegment(samples: samples, text: text, capturedAt: now),
+      RefineSegment(
+        samples: samples,
+        text: text,
+        capturedAt: now,
+        punctuated: result.punctuated,
+      ),
     );
   }
 
@@ -855,11 +1041,27 @@ class LiveTranscriber {
     DecodeWorkerResult result,
   ) {
     var text = result.text.trim();
+    var punctuated = result.punctuated;
     // A merged re-decode must never LOSE content: if it comes back much
     // shorter than the fast finals combined, trust those instead (mirrors
     // scripts/realtime_transcribe.py's Refiner).
-    if (isRefineTextTooShort(text, payload.fastText)) {
+    //
+    // The lengths compared are WITHOUT the marks the punctuation model
+    // wrote: it runs in the worker, before this, so by here a punctuated
+    // text is several characters longer than what was actually said, and
+    // crediting either side for those would tilt a comparison that is meant
+    // to be about words. Both sides can be punctuated now that finals are
+    // too, so each is stripped when it says it is.
+    if (isRefineTextTooShort(
+      punctuated ? withoutRestoredMarks(text) : text,
+      payload.fastTextPunctuated
+          ? withoutRestoredMarks(payload.fastText)
+          : payload.fastText,
+    )) {
       text = payload.fastText;
+      // The fallback is the finals' own text, so it is punctuated exactly
+      // when they were.
+      punctuated = payload.fastTextPunctuated;
     }
     if (text.isEmpty) {
       return;
@@ -872,6 +1074,7 @@ class LiveTranscriber {
           latencyMs: result.latencyMs,
           lang: result.lang,
           audioSeconds: payload.samples.length / sampleRate,
+          punctuated: punctuated,
         ),
       );
     }
@@ -894,12 +1097,13 @@ class LiveTranscriber {
     }
     final segments = _refineBuffer.takeAll();
     final combined = combineSegmentSamples(segments);
-    if (combined.length < sampleRate ~/ 2) {
+    if (combined.length < sampleRate * _minRefineAudioSeconds) {
       return null;
     }
     return RefineRequestPayload(
       samples: combined,
       fastText: combineSegmentFastText(segments),
+      fastTextPunctuated: isCombinedFastTextPunctuated(segments),
     );
   }
 
@@ -1090,6 +1294,7 @@ class LiveTranscriber {
     // safe swap point.
     _pendingVadInstall?.free();
     _pendingVadInstall = null;
+    _prerollHistory = null;
     _vadModelPath = null;
     // The decode worker owns this session's recognizer handles and is the
     // only isolate allowed to free them, so ending the session means
@@ -1256,6 +1461,11 @@ class LiveTranscriber {
     _pendingVadInstall = null;
     final old = _vad;
     _vad = pending;
+    // The replacement has been fed nothing yet, so its own sample counter
+    // starts at zero here. Remembering where "here" falls on the session
+    // clock keeps segment positions -- and therefore pre-roll -- correct
+    // across the swap.
+    _vadSampleOrigin = _samplesFedToVad;
     old?.free();
   }
 
@@ -1294,11 +1504,32 @@ class LiveTranscriber {
   /// [realtime] paces delivery to roughly the wav's own duration (one VAD
   /// window's worth of audio every ~32ms at 16kHz); pass `false` to stream
   /// as fast as decoding allows instead, e.g. for a quick smoke test.
-  /// Awaits until the whole file has been fed through and any in-progress
-  /// segment has been flushed and decoded -- same shutdown behavior [stop]
-  /// gives a live session.
+  ///
+  /// **What "awaits until done" covers.** The whole file is fed through,
+  /// any in-progress segment is flushed and decoded, and then -- unlike
+  /// [stop], which drops whatever was buffered -- one last refine ("清書")
+  /// pass runs over the finals this stream produced, provided they add up
+  /// to at least half a second of audio. That refine is awaited before the
+  /// session is torn down, so by the time this future completes,
+  /// [refineEntries] has already carried it.
+  ///
+  /// That closing refine is deliberate, and it is the difference between
+  /// this method and [start]. The session is gone before the future
+  /// resolves (the same teardown [stop] performs), so a caller who awaits
+  /// this and *then* calls [refineNow] gets nothing: there is no longer a
+  /// worker to run it. Without the closing pass, a default-configured debug
+  /// stream would produce no refine at all -- which is the one thing this
+  /// method exists to demonstrate on a device with no usable microphone.
+  ///
+  /// [autoRefineEnabled] also works here, not only for microphone
+  /// sessions: set it to `true` before calling this and refines fire on
+  /// silence gaps during the stream, the same way they would live. Setting
+  /// it while a stream is already running works too.
+  ///
   /// See [start] for what [decodingMethod]/[vadSensitivity]/[hotwordsFile]/
-  /// [hotwordsScore] do -- identical meaning and defaults here.
+  /// [hotwordsScore]/[punctuation] do -- identical meaning and defaults
+  /// here, which is what makes this the way to see punctuated refine output
+  /// on an emulator.
   Future<void> startDebugWavStream({
     required ModelKind modelKind,
     required String modelDir,
@@ -1312,6 +1543,7 @@ class LiveTranscriber {
     VadSensitivity? vadSensitivity,
     String? hotwordsFile,
     double hotwordsScore = 1.5,
+    JaPunctuation? punctuation,
   }) async {
     if (isRunning || _debugStreaming || _starting) {
       return;
@@ -1331,6 +1563,7 @@ class LiveTranscriber {
         vadSensitivity: vadSensitivity ?? _vadSensitivity,
         hotwordsFile: hotwordsFile,
         hotwordsScore: hotwordsScore,
+        punctuation: punctuation,
       );
     } finally {
       _starting = false;
@@ -1350,6 +1583,7 @@ class LiveTranscriber {
     required VadSensitivity vadSensitivity,
     String? hotwordsFile,
     double hotwordsScore = 1.5,
+    JaPunctuation? punctuation,
   }) async {
     final wavFile = File(wavPath);
     if (!await wavFile.exists()) {
@@ -1368,6 +1602,7 @@ class LiveTranscriber {
         vadSensitivity: vadSensitivity,
         hotwordsFile: hotwordsFile,
         hotwordsScore: hotwordsScore,
+        punctuation: punctuation,
       );
     } catch (_) {
       // See start()'s identical catch: _buildNativeState can throw after
@@ -1422,10 +1657,28 @@ class LiveTranscriber {
       if (!_debugStreamCancelRequested) {
         _vad?.flush();
         _drainReadySegments();
+        await _waitForDecodesToDrain();
+        // The whole point of this method is to show what a live session
+        // produces, and on a device without a microphone it is the only
+        // way to see a punctuated refine at all. Teardown below ends the
+        // session before this future completes, so a caller cannot ask for
+        // one afterwards -- refineNow() would find no worker and silently
+        // do nothing. So run the last one here, while there is still a
+        // session to run it in, over everything the finals just buffered.
+        if (_refineBuffer.totalDurationSeconds >= _minRefineAudioSeconds) {
+          await refineNow();
+        }
+      } else {
+        await _waitForDecodesToDrain();
       }
-      await _waitForDecodesToDrain();
     } finally {
       _debugStreaming = false;
+      // Started by _resetSessionState above when autoRefineEnabled was
+      // already on. Nothing else cancels it on this path -- stop() only
+      // ends a microphone session -- so without this it would keep ticking
+      // against a torn-down session for the life of the object.
+      _autoRefineTimer?.cancel();
+      _autoRefineTimer = null;
       await _teardownNativeState();
     }
   }

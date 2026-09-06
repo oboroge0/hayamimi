@@ -5,7 +5,7 @@ import 'package:record/record.dart';
 import 'fake_record_platform.dart';
 
 /// Runtime-configuration surface added for the embedding API (issue #29):
-/// the six pacing knobs' constructor defaults/validation/runtime setters,
+/// the seven pacing knobs' constructor defaults/validation/runtime setters,
 /// and [LiveTranscriber.resetSession]/[LiveTranscriber.setVadSensitivity]
 /// when no session is running. None of this needs the sherpa-onnx native
 /// libs or a real mic -- only [LiveTranscriber]'s constructor and these
@@ -46,6 +46,7 @@ void main() {
         defaultAutoRefineMaxBufferedSeconds,
       );
       expect(transcriber.refineBufferMaxSeconds, defaultRefineBufferMaxSeconds);
+      expect(transcriber.prerollSeconds, defaultPrerollSeconds);
     });
 
     test('accepts and reads back custom values', () {
@@ -56,6 +57,7 @@ void main() {
         autoRefineSilenceSeconds: 3.0,
         autoRefineMaxBufferedSeconds: 15.0,
         refineBufferMaxSeconds: 30.0,
+        prerollSeconds: 0.5,
       );
       addTearDown(transcriber.dispose);
 
@@ -65,6 +67,7 @@ void main() {
       expect(transcriber.autoRefineSilenceSeconds, 3.0);
       expect(transcriber.autoRefineMaxBufferedSeconds, 15.0);
       expect(transcriber.refineBufferMaxSeconds, 30.0);
+      expect(transcriber.prerollSeconds, 0.5);
     });
 
     test('a non-positive or non-finite value throws ArgumentError', () {
@@ -93,6 +96,20 @@ void main() {
         throwsArgumentError,
       );
     });
+
+    test('prerollSeconds accepts 0 but not a negative or non-finite value', () {
+      // The one knob where 0 is meaningful rather than a mistake: it means
+      // "decode exactly what the VAD delimited, add nothing".
+      final transcriber = LiveTranscriber(prerollSeconds: 0);
+      addTearDown(transcriber.dispose);
+      expect(transcriber.prerollSeconds, 0);
+
+      expect(() => LiveTranscriber(prerollSeconds: -0.1), throwsArgumentError);
+      expect(
+        () => LiveTranscriber(prerollSeconds: double.nan),
+        throwsArgumentError,
+      );
+    });
   });
 
   group('LiveTranscriber pacing-knob runtime setters', () {
@@ -117,6 +134,11 @@ void main() {
 
       transcriber.refineBufferMaxSeconds = 45.0;
       expect(transcriber.refineBufferMaxSeconds, 45.0);
+
+      transcriber.prerollSeconds = 0.4;
+      expect(transcriber.prerollSeconds, 0.4);
+      transcriber.prerollSeconds = 0;
+      expect(transcriber.prerollSeconds, 0);
     });
 
     test('an out-of-range value throws and leaves the previous value in place', () {
@@ -134,6 +156,9 @@ void main() {
         throwsArgumentError,
       );
       expect(transcriber.refineBufferMaxSeconds, defaultRefineBufferMaxSeconds);
+
+      expect(() => transcriber.prerollSeconds = -1, throwsArgumentError);
+      expect(transcriber.prerollSeconds, defaultPrerollSeconds);
     });
   });
 

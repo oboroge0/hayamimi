@@ -26,7 +26,11 @@ import 'decode_worker.dart';
 /// the user tapped 清書 is included in the group instead of being pushed
 /// into the next one.
 class RefineRequestPayload {
-  const RefineRequestPayload({required this.samples, required this.fastText});
+  const RefineRequestPayload({
+    required this.samples,
+    required this.fastText,
+    this.fastTextPunctuated = false,
+  });
 
   /// The buffered segments' audio, joined.
   final Float32List samples;
@@ -34,6 +38,12 @@ class RefineRequestPayload {
   /// Those segments' fast finals, joined — the fallback if the merged
   /// re-decode comes back suspiciously short.
   final String fastText;
+
+  /// Whether [fastText] is punctuated throughout, because every final that
+  /// went into it was (see `isCombinedFastTextPunctuated`). A refine that
+  /// falls back to [fastText] reports this as its own `punctuated`, and the
+  /// shrink comparison strips [fastText]'s marks when it is set.
+  final bool fastTextPunctuated;
 }
 
 sealed class _Pending {

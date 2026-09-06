@@ -99,11 +99,11 @@ class ManifestEvalRunner {
     return results;
   }
 
-  /// Decodes every entry in [manifestPath] through [RoutingProfile
-  /// .jaSenseVoice] routing (ReazonSpeech ja + SenseVoice en/zh/ko/yue,
-  /// arbitrated per clip by the dual-LID policy in `../routing/`), so a
-  /// multilingual manifest's language-routing accuracy and CER can be
-  /// compared against the PC pipeline's `docs/SCORECARD.md`.
+  /// Decodes every entry in [manifestPath] through
+  /// `RoutingProfile.jaSenseVoice` routing (ReazonSpeech ja + SenseVoice
+  /// en/zh/ko/yue, arbitrated per clip by the dual-LID policy in
+  /// `../routing/`), so a multilingual manifest's language-routing accuracy
+  /// and CER can be compared against the PC pipeline's `docs/SCORECARD.md`.
   ///
   /// Each entry is treated as its own isolated "session" (bootstrap: no
   /// prior language) since manifest clips are independent recordings, not

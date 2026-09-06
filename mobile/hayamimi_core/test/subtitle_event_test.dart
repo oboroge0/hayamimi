@@ -25,10 +25,11 @@ void main() {
         'latency_ms': null,
         'audio_s': null,
         'switched': false,
+        'punctuated': false,
       });
     });
 
-    test('toJson carries lang/speaker/latency/audio_s/switched through', () {
+    test('toJson carries lang/speaker/latency/audio_s/switched/punctuated through', () {
       const event = FinalSubtitleEvent(
         text: 'hello',
         lang: 'ja',
@@ -36,6 +37,7 @@ void main() {
         latencyMs: 123.5,
         audioSeconds: 2.5,
         switched: true,
+        punctuated: true,
       );
       expect(event.toJson(), {
         'type': 'final',
@@ -45,6 +47,7 @@ void main() {
         'latency_ms': 123.5,
         'audio_s': 2.5,
         'switched': true,
+        'punctuated': true,
       });
     });
 
@@ -67,6 +70,7 @@ void main() {
         'speaker': '',
         'latency_ms': null,
         'audio_s': null,
+        'punctuated': false,
       });
     });
 
@@ -85,7 +89,20 @@ void main() {
         'speaker': 'S2',
         'latency_ms': 456.0,
         'audio_s': 12.0,
+        'punctuated': false,
       });
+    });
+
+    test('toJson reports restored Japanese punctuation', () {
+      // A consumer that receives this over the LAN can tell text the
+      // punctuation model wrote from text the recognizer produced.
+      const event = RefineSubtitleEvent(
+        text: '今日は疲れた。もう寝る。',
+        lang: 'ja',
+        punctuated: true,
+      );
+      expect(event.toJson()['punctuated'], isTrue);
+      expect(event.toJson()['text'], '今日は疲れた。もう寝る。');
     });
   });
 

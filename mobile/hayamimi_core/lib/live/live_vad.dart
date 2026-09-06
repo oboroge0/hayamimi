@@ -28,6 +28,34 @@ import 'vad_sensitivity.dart';
 /// the ring never truncates a segment that is still being spoken.
 const double _vadBufferSeconds = 30;
 
+/// One finished speech segment, as a session takes it from its VAD.
+///
+/// This used to be just the samples. It carries where the segment starts as
+/// well because the samples alone are not enough to decode well: a VAD
+/// reports an onset slightly late, so the first word can be clipped, and
+/// repairing that means going back to the audio recorded just before the
+/// segment (see `preroll.dart`). Knowing where "just before" is, on a clock
+/// shared with the audio the session captured, is what [startSample]
+/// provides.
+class LiveSpeechSegment {
+  const LiveSpeechSegment({required this.samples, required this.startSample});
+
+  /// The segment's audio: 16 kHz mono float samples, exactly the speech the
+  /// VAD delimited, with nothing added.
+  final Float32List samples;
+
+  /// Where the segment begins, counted in samples from the first sample
+  /// ever fed to *this VAD instance* -- sherpa-onnx's own
+  /// `SpeechSegment.start`.
+  ///
+  /// Per instance, not per session: a session that changes its VAD
+  /// sensitivity mid-flight swaps in a freshly built VAD, whose counter
+  /// starts again at zero. `LiveTranscriber` keeps track of how much audio
+  /// it had already fed when it swapped and adds that back, so the position
+  /// it works with stays on one continuous session clock.
+  final int startSample;
+}
+
 /// A voice-activity detector driving one live session.
 ///
 /// Stateful across [acceptWaveform] calls: the implementation is tracking
@@ -49,8 +77,8 @@ abstract class LiveVad {
   /// Whether at least one finished segment is waiting to be taken.
   bool get hasSegment;
 
-  /// Removes and returns the oldest finished segment's samples.
-  Float32List takeSegment();
+  /// Removes and returns the oldest finished segment.
+  LiveSpeechSegment takeSegment();
 
   /// Ends any segment in progress and makes it available to [takeSegment],
   /// so stopping does not silently drop what the speaker had just said.
@@ -129,10 +157,13 @@ class SileroLiveVad implements LiveVad {
   bool get hasSegment => !_vad.isEmpty();
 
   @override
-  Float32List takeSegment() {
+  LiveSpeechSegment takeSegment() {
     final segment = _vad.front();
     _vad.pop();
-    return segment.samples;
+    return LiveSpeechSegment(
+      samples: segment.samples,
+      startSample: segment.start,
+    );
   }
 
   @override

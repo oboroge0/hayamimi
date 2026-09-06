@@ -288,6 +288,8 @@ class ModelDownloadEvent {
   final int? totalBytes;
 }
 
+/// [downloadProfile]/[downloadModelSource]'s `onProgress` callback type --
+/// called once per [ModelDownloadEvent], e.g. to drive a progress bar.
 typedef ModelDownloadProgress = void Function(ModelDownloadEvent event);
 
 /// Transport [downloadProfile] uses to fetch a URL, factored out so tests
@@ -301,11 +303,15 @@ abstract class ModelDownloadTransport {
   Future<ModelDownloadResponse> get(Uri url);
 }
 
+/// A [ModelDownloadTransport.get] result: the response body as a byte
+/// stream, plus its declared length when the server sent one.
 class ModelDownloadResponse {
   const ModelDownloadResponse({required this.contentLength, required this.stream});
 
   /// `null` when the server didn't send a `Content-Length` header.
   final int? contentLength;
+
+  /// The response body, in whatever chunks the transport delivers them.
   final Stream<List<int>> stream;
 }
 

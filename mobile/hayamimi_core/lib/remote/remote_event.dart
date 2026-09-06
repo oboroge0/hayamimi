@@ -36,6 +36,7 @@ class RemoteFinalEvent extends RemoteEvent {
     this.tier = '',
     this.audioSeconds,
     this.switched = false,
+    this.punctuated = false,
   });
 
   final String text;
@@ -54,6 +55,16 @@ class RemoteFinalEvent extends RemoteEvent {
   /// if the server didn't send it (including servers running a version of
   /// `subtitle_server.py` from before this field existed).
   final bool switched;
+
+  /// Whether the server had already punctuated this line, mirroring
+  /// `FinalSubtitleEvent.punctuated`. `false` if it didn't send the field.
+  ///
+  /// The desktop pipeline does punctuate its Japanese finals, but
+  /// `subtitle_server.py` has no `punctuated` key on `final` frames to say
+  /// so, so today this is `false` for every real server and exists so that a
+  /// consumer reading `FinalSubtitleEvent.punctuated` gets the same field
+  /// from both paths rather than a field that only some producers have.
+  final bool punctuated;
 }
 
 /// A machine translation of the most recent final line.
@@ -125,6 +136,8 @@ class RemoteUnknownEvent extends RemoteEvent {
   final Map<String, dynamic> raw;
 }
 
+/// Thrown while decoding a server frame into a [RemoteEvent]: malformed
+/// JSON, or JSON that isn't an object.
 class RemoteEventParseException implements Exception {
   RemoteEventParseException(this.message);
   final String message;
@@ -171,6 +184,7 @@ RemoteEvent parseRemoteEvent(String raw) {
         tier: map['tier'] as String? ?? '',
         audioSeconds: (map['audio_s'] as num?)?.toDouble(),
         switched: map['switched'] as bool? ?? false,
+        punctuated: map['punctuated'] as bool? ?? false,
       );
     case 'translation':
       return RemoteTranslationEvent(

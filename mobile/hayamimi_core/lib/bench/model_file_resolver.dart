@@ -20,6 +20,8 @@ class ResolvedModelFiles {
   final String tokens;
 }
 
+/// Thrown by [resolveOnnxFile]/[resolveZipformerTransducerFiles] when a
+/// model directory doesn't contain the file a role needs.
 class ModelFileResolutionException implements Exception {
   ModelFileResolutionException(this.message);
   final String message;

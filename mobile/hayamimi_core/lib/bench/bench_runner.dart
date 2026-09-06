@@ -6,6 +6,8 @@ import 'bench_result.dart';
 import 'model_file_resolver.dart';
 import 'model_kind.dart';
 
+/// Thrown by [BenchRunner] when a model/wav file is missing or can't be
+/// read, or a decode itself fails.
 class BenchRunException implements Exception {
   BenchRunException(this.message);
   final String message;

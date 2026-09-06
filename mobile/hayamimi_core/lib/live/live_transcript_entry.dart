@@ -8,6 +8,7 @@ class LiveTranscriptEntry {
     this.lang,
     this.audioSeconds,
     this.switched = false,
+    this.punctuated = false,
   });
 
   final String text;
@@ -36,4 +37,21 @@ class LiveTranscriptEntry {
   /// entries, which re-judge a whole group rather than a single switch
   /// point.
   final bool switched;
+
+  /// `true` when this entry's text had Japanese punctuation (、 。 ？)
+  /// restored into it, so a caller can tell text the punctuation model
+  /// wrote from text the recognizer produced — e.g. to skip its own
+  /// sentence splitting, or to show that this line is the finished one.
+  ///
+  /// Refine ("清書") and final entries can be `true`, and only when the
+  /// session was started with a `JaPunctuation` model that applies to the
+  /// entry's language. Always `false` for drafts, which are re-decoded every
+  /// second and never punctuated, and `false` for finals when that
+  /// `JaPunctuation` set `applyToFinals: false`.
+  ///
+  /// A refine that fell back to the fast finals' text — because the merged
+  /// re-decode came back too short — reports whatever those finals were:
+  /// `true` in the default configuration, `false` when finals were left
+  /// unpunctuated, since the text that survived is theirs.
+  final bool punctuated;
 }
