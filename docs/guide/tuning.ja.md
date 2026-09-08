@@ -33,7 +33,7 @@ hayamimiの両実装について、ユーザーが触れるつまみを、既定
 | つまみ | 既定値 | 変更する場所 | 何に効くか | 根拠 |
 |---|---|---|---|---|
 | `--threads` | `4` | CLIフラグ、`RoutedASR(threads=...)` | 各sherpa-onnx認識器に渡すintra-opスレッド数 | |
-| `--max-resident` | `3` | CLIフラグ、`RoutedASR(max_resident=...)` | 常駐するja/enティア以外に何個の認識器をメモリに残すか。超えるとLRUで落とす | [benchmarks](../results/benchmarks.md) イテレーション#3（RAM実測）、#7（LRUアンロード） |
+| `--max-resident` | `3` | CLIフラグ、`RoutedASR(max_resident=...)` | 常駐するjaティア以外に何個の認識器をメモリに残すか。超えるとLRUで落とす。`--en-tier v2` では英語と欧州24言語が別の認識器（v2とv3）になるので、両方を行き来するセッションは従来より1枠多く必要（足りないと再ロードを繰り返す） | [benchmarks](../results/benchmarks.md) イテレーション#3（RAM実測）、#7（LRUアンロード） |
 | `--mode {single,balanced,fast}` | `balanced` | CLIフラグ | 言語切替ポリシーのプリセット。下の2フラグと`dual_confirm`をまとめて決める | [lid.md](../eval/lid.md) |
 | `--lang CODE` | `None` | CLIフラグ、`RoutedASR.set_forced_lang()`、`POST /config`の`lang` | 全セグメントを1言語に固定しLIDを完全に飛ばす（`--mode single`で必須） | |
 | `--lang-switch-guard SEC` | `2.0`（`balanced`）、`0.0`（`fast`）。`realtime_transcribe.py`の`mode_defaults`。`RoutedASR.min_switch_s`自体は`2.0` | CLIフラグ、`RoutedASR.set_min_switch_s()`、`POST /config`の`min_switch_s` | これより短い別言語の検出は切替の根拠に数えない | [benchmarks](../results/benchmarks.md) イテレーション#29、[lid.md](../eval/lid.md) |

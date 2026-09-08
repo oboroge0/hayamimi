@@ -730,6 +730,11 @@ _BUILDERS = {
 # on every session regardless of whether the opt-in feature is on.
 _PRELOAD_ORDER = ("pz", "sv", "v3", "omni")
 
+# Opt-in tiers that are strict alternatives to a default tier, and the default
+# they must degrade to when missing (consulted by _get_with_fallback before the
+# generic chain). Register every future opt-in tier here.
+_TIER_FALLBACK: dict[str, tuple[str, ...]] = {"v2": ("v3",)}
+
 
 class ModelUnavailable(RuntimeError):
     """Raised when a model tier is not present on disk (--minimal install)."""
@@ -1059,14 +1064,14 @@ class RoutedASR:
         self._last_used[name] = time.monotonic()
         return rec
 
-    def _get_with_fallback(self, name: str,
-                           prefer: tuple[str, ...] = ()) -> tuple[object, str]:
-        # `prefer` is tried right after `name` and before the generic chain:
-        # an opt-in tier that is a strict alternative to a default tier (v2
-        # for en) must degrade to THAT default, not to whichever model the
-        # generic ja-first chain happens to have on disk.
+    def _get_with_fallback(self, name: str) -> tuple[object, str]:
+        # An opt-in tier that is a strict alternative to a default tier must
+        # degrade to THAT default before the generic ja-first chain (v2 -> v3,
+        # not v2 -> rz whose English is unpunctuated ALL-CAPS). The table is
+        # consulted here, not at the call site, so a future opt-in tier only
+        # has to register its default in _TIER_FALLBACK to get this right.
         chain: list[str] = [name]
-        for cand in (*prefer, "rz", "sv", "v3", "pz", "omni"):
+        for cand in (*_TIER_FALLBACK.get(name, ()), "rz", "sv", "v3", "pz", "omni"):
             if cand not in chain:
                 chain.append(cand)
         for cand in chain:
@@ -1384,10 +1389,9 @@ class RoutedASR:
             # by removing "en" from V3_LANGS, so V3_LANGS/ROUTABLE_LANGS stay
             # accurate for every session that leaves en_tier at its "v3"
             # default.
-            # A missing v2 (default download set) must land on v3, the tier
-            # en is homed on by default -- NOT on the generic chain's first
-            # entry (rz), whose English is unpunctuated ALL-CAPS.
-            return self._get_with_fallback("v2", prefer=("v3",))
+            # A missing v2 (not in the default download set) lands on v3 via
+            # _TIER_FALLBACK, never on the generic chain's rz.
+            return self._get_with_fallback("v2")
         if lang in V3_LANGS:
             return self._get_with_fallback("v3")
         return self._get_with_fallback("omni")

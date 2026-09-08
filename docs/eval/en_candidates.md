@@ -217,6 +217,8 @@ python scripts/realtime_transcribe.py --en-tier v2 --wav testdata/eval_real/en_0
 
 ## 制約
 
+- `--max-resident` の枠を1つ余計に消費する: 既定では en と欧州24言語が v3 を共有するが、`--en-tier v2` では v2 と v3 の2認識器になる。上限が小さい設定（例 `--max-resident 1`）で英語と仏語などを行き来すると、v2/v3 が互いを追い出して毎回モデル再ロード（数秒）が走る。`docs/guide/tuning.md` の `--max-resident` 行に併記した。
+
 - FLEURS/実音声ともread-aloud寄りの音声で、雑音・話者交代・オーバーラップは
   含まない(`docs/results/benchmarks.md`と同じ制約)。
 - RTFは他5トラックと同一CPUを共有した並列実行下の暫定値。専有環境での

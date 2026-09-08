@@ -260,7 +260,7 @@ class _RouteStub:
     def __init__(self, en_tier):
         self._en_tier = en_tier
 
-    def _get_with_fallback(self, name, prefer=()):
+    def _get_with_fallback(self, name):
         return (f"{name}-recognizer", name)
 
 
@@ -326,7 +326,7 @@ def test_route_en_v2_present_uses_v2():
 
 
 def test_get_with_fallback_generic_chain_unchanged():
-    # No `prefer`: the pre-existing ja-first chain is untouched.
+    # Tiers without a _TIER_FALLBACK entry keep the pre-existing ja-first chain.
     stub = _FallbackStub(present={"rz"})
     _, tier = stub._get_with_fallback("pz")
     assert tier == "rz"
@@ -1269,3 +1269,10 @@ def test_lid_max_seconds_is_the_documented_knob():
     assert asr_engine.LID_MAX_SECONDS == lid_preprocessing.LID_MAX_SECONDS
     src = inspect.getsource(asr_engine.RoutedASR._identify_lang)
     assert "max_seconds=LID_MAX_SECONDS" in src
+
+
+def test_tier_fallback_table_only_names_known_tiers():
+    for opt_in, defaults in asr_engine._TIER_FALLBACK.items():
+        assert opt_in in asr_engine._BUILDERS
+        for d in defaults:
+            assert d in asr_engine._BUILDERS
