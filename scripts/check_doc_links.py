@@ -77,9 +77,25 @@ def _resolve(md_path: str, target: str) -> str | None:
     return os.path.normpath(os.path.join(base, unquote(rest)))
 
 
+def _is_venv_root(dirpath: str) -> bool:
+    """A directory IS a Python venv root iff it has pyvenv.cfg directly in
+    it -- the one marker every `python -m venv` (or virtualenv) creates,
+    regardless of what the venv itself is named (.venv, .venv-train, env,
+    ...). Detecting by this marker instead of a fixed name list means a
+    worktree-local training venv (e.g. an eval track's .venv-train per
+    CLAUDE.md's torch/speechbrain setup instructions) never needs its own
+    SKIP_DIRS entry -- and never floods this check with broken links inside
+    some vendored package's own Markdown (e.g. onnxruntime's Privacy.md),
+    which isn't this project's doc to fix."""
+    return os.path.isfile(os.path.join(dirpath, "pyvenv.cfg"))
+
+
 def iter_markdown(root: str):
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in SKIP_DIRS and not _is_venv_root(os.path.join(dirpath, d))
+        )
         for name in sorted(filenames):
             if name.lower().endswith(".md"):
                 yield os.path.join(dirpath, name)

@@ -1000,3 +1000,109 @@ def test_empty_specialist_stays_empty_on_a_minimal_install():
     assert asked == ["omni"]
     assert result["text"] == ""
     assert result["tier"] == "rz"
+
+
+# ---- LID candidate track (docs/eval/lid_candidates.md) ---------------------
+#
+# eval_lid_voxlingua.py itself isn't imported here: it requires torch (only
+# installed in the separate .venv-train, see its docstring), and this test
+# module runs under the main sherpa-onnx venv. Its two torch-free pieces --
+# scripts/lid_target_clf.py's target_clf_predict() and
+# eval_lid_candidates.py's plumbing -- are importable and tested directly.
+
+def test_trim_lid_clip_skips_leading_quiet_preroll():
+    # Regression coverage for the exact preroll-skip behavior extracted from
+    # _identify_lang into asr_engine.trim_lid_clip() (so
+    # eval_lid_candidates.py's challenger backends see identical
+    # preprocessing to the production whisper-tiny detector -- see that
+    # function's docstring). 16kHz: sample_rate//10 = 1600 samples of quiet
+    # tolerance before the trim kicks in.
+    sr = 16000
+    quiet = np.zeros(4000, dtype=np.float32)
+    loud = np.full(1000, 0.5, dtype=np.float32)
+    clip = np.concatenate([quiet, loud])
+    trimmed = asr_engine.trim_lid_clip(clip, sr)
+    # loud[0] is at index 4000, which is > sr//10 (1600) -- must be trimmed,
+    # keeping a small margin (sr//20 = 800 samples) before the loud onset.
+    assert len(trimmed) == len(clip) - (4000 - 800)
+    assert trimmed[800] == 0.5
+
+
+def test_trim_lid_clip_leaves_short_preroll_alone():
+    sr = 16000
+    quiet = np.zeros(500, dtype=np.float32)  # well under sr//10
+    loud = np.full(1000, 0.5, dtype=np.float32)
+    clip = np.concatenate([quiet, loud])
+    trimmed = asr_engine.trim_lid_clip(clip, sr)
+    assert len(trimmed) == len(clip)
+
+
+def test_trim_lid_clip_caps_to_max_seconds():
+    sr = 16000
+    clip = np.ones(sr * 6, dtype=np.float32)
+    trimmed = asr_engine.trim_lid_clip(clip, sr, max_seconds=4.0)
+    assert len(trimmed) == sr * 4
+
+
+def test_sv_predicted_lang_matches_tag_substring():
+    import eval_lid_candidates as elc
+
+    assert elc.sv_predicted_lang("<|yue|><|EMO_UNKNOWN|>text") == "yue"
+    assert elc.sv_predicted_lang("<|zh|>text") == "zh"
+
+
+def test_sv_predicted_lang_unknown_tag_is_question_mark():
+    import eval_lid_candidates as elc
+
+    assert elc.sv_predicted_lang("<|fr|>bonjour") == "?"
+
+
+def test_target_clf_predict_picks_highest_probability_class():
+    from lid_target_clf import target_clf_predict
+
+    # 2-dim toy embedding space, 3 classes: a trivial one-hot-ish setup
+    # where class "ko" should win decisively on a [1, 0] embedding.
+    clf_params = {
+        "classes": ["ja", "en", "ko"],
+        "coef": [[0.0, 5.0], [5.0, 0.0], [0.0, -5.0]],
+        "intercept": [0.0, 0.0, 0.0],
+        "scaler_mean": [0.0, 0.0],
+        "scaler_scale": [1.0, 1.0],
+    }
+    pred, conf = target_clf_predict(np.array([0.0, 1.0]), clf_params)
+    assert pred == "ja"
+    assert conf > 0.9
+
+
+def test_target_clf_predict_confidence_is_a_valid_probability():
+    from lid_target_clf import target_clf_predict
+
+    clf_params = {
+        "classes": ["ja", "en"],
+        "coef": [[1.0, 0.0], [0.0, 1.0]],
+        "intercept": [0.0, 0.0],
+        "scaler_mean": [0.0, 0.0],
+        "scaler_scale": [1.0, 1.0],
+    }
+    pred, conf = target_clf_predict(np.array([0.3, 0.3]), clf_params)
+    assert pred in ("ja", "en")
+    assert 0.0 <= conf <= 1.0
+
+
+def test_verdict_for_rejects_when_any_criterion_fails():
+    import eval_lid_candidates as elc
+
+    # Every criterion met except yue support -- must still be an overall
+    # reject (all-of, not majority-of; see the adoption bar in the track
+    # brief and CRITERIA_HEADER).
+    adopted, _ = elc.verdict_for("x", clean2=0.95, babble2=0.85, has_yue=False,
+                                 size_mb=50.0, latency_ms=100.0, has_confidence=True)
+    assert adopted is False
+
+
+def test_verdict_for_adopts_only_when_every_criterion_passes():
+    import eval_lid_candidates as elc
+
+    adopted, _ = elc.verdict_for("x", clean2=0.95, babble2=0.85, has_yue=True,
+                                 size_mb=50.0, latency_ms=100.0, has_confidence=True)
+    assert adopted is True

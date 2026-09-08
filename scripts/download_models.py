@@ -184,6 +184,10 @@ def main():
                      help="also download 2 extra models (~1GB) used only by scripts/eval_accuracy.py "
                           "and scripts/make_realset_zhko.py as comparison baselines -- not needed "
                           "to run realtime_transcribe.py.")
+    ap.add_argument("--lid-candidates", action="store_true",
+                     help="also download whisper-base (~160MB int8), the sherpa-onnx-only LID "
+                          "replacement candidate evaluated by scripts/eval_lid_candidates.py "
+                          "(docs/eval/lid_candidates.md). Not needed to run realtime_transcribe.py.")
     args = ap.parse_args()
 
     os.makedirs(MODELS_DIR, exist_ok=True)
@@ -289,6 +293,25 @@ def main():
             f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-zipformer-korean-2024-06-24.tar.bz2",
             "sherpa-onnx-zipformer-korean-2024-06-24",
             "Zipformer Korean (eval baseline only)")
+
+    if args.lid_candidates:
+        # whisper-base: candidate (b) in docs/eval/lid_candidates.md (LID
+        # replacement track). int8 only (~160MB); the tarball also ships
+        # fp32 encoder/decoder and test_wavs/, which scripts/eval_lid_candidates.py
+        # never touches, so they're skipped here.
+        extract_members_only(
+            f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-whisper-base.tar.bz2",
+            "sherpa-onnx-whisper-base",
+            {"base-encoder.int8.onnx", "base-decoder.int8.onnx", "base-tokens.txt"},
+            "whisper-base (LID candidate (b), eval only -- see docs/eval/lid_candidates.md)")
+        print("\nNote: LID candidates (a) speechbrain VoxLingua107-ECAPA and (d) its "
+              "target-language classifier need a SEPARATE torch venv (torch/speechbrain "
+              "aren't in this project's runtime requirements) -- see "
+              "scripts/eval_lid_voxlingua.py's docstring for setup:\n"
+              "  python -m venv .venv-train\n"
+              "  .venv-train/Scripts/pip install torch --index-url https://download.pytorch.org/whl/cpu\n"
+              "  .venv-train/Scripts/pip install speechbrain soundfile scikit-learn huggingface_hub fsspec\n"
+              "  .venv-train/Scripts/python scripts/eval_lid_voxlingua.py")
 
     print("\nDone. Run `python scripts/realtime_transcribe.py --wav testdata/ja_test.wav` to smoke-test.")
 

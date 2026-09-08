@@ -26,6 +26,7 @@ import numpy as np
 import sherpa_onnx
 
 import itn_cjk
+from lid_preprocessing import trim_lid_clip  # noqa: F401 (re-exported as asr_engine.trim_lid_clip)
 
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
 V3_MODEL_DIR = os.path.join(MODELS_DIR, "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8")
@@ -934,15 +935,7 @@ class RoutedASR:
         return sorted(self._models)
 
     def _identify_lang(self, samples: np.ndarray, sample_rate: int) -> str:
-        clip = samples
-        # skip the leading quiet (preroll padding): it eats into the 4s LID
-        # window and cost the demo capture its first-utterance language
-        loud = np.flatnonzero(np.abs(clip) > 0.015)
-        if len(loud) and loud[0] > sample_rate // 10:
-            clip = clip[max(loud[0] - sample_rate // 20, 0):]
-        max_len = int(LID_MAX_SECONDS * sample_rate)
-        if len(clip) > max_len:
-            clip = clip[:max_len]
+        clip = trim_lid_clip(samples, sample_rate)
         stream = self.lid.create_stream()
         stream.accept_waveform(sample_rate, clip)
         return self.lid.compute(stream)
