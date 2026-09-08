@@ -56,7 +56,7 @@ English: [README.md](README.md)
 | [`eval/noise.md`](eval/noise.md) | ja | 日付つき記録 | white/pink/babbleノイズ SNR 20/10/5/0dB下での本番経路。ここから二重LID確認の方針が出た。 |
 | [`eval/singing.md`](eval/singing.md) | ja | 日付つき記録 | 歌唱音声（ja/ko/en）。同一歌唱者の朗読版を対照に置いている。 |
 | [`eval/lid.md`](eval/lid.md) | ja | 日付つき記録 | セグメント長に対するLID正解率。whisper-tiny単独とSenseVoice内蔵LIDを、クリーンとノイズ条件の両方で。切替確認ポリシーの根拠。 |
-| [`eval/lid_candidates.md`](eval/lid_candidates.md) | en | 日付つき記録 | whisper-tiny の言語判定を置き換えられるか。whisper-base、SenseVoice単独、VoxLingua107-ECAPA（素のまま／FLEURSで学習した対象言語ヘッド付き）を `lid.md` と同じ clean/babble 曲線で採点。採用なし。最有力候補は構造ではなく学習データ不足。 |
+| [`eval/lid_candidates.md`](eval/lid_candidates.md) | ja | 日付つき記録 | whisper-tiny の言語判定を置き換えられるか。whisper-base、SenseVoice単独、VoxLingua107-ECAPA（素のまま／FLEURSで学習した対象言語ヘッド付き）を `lid.md` と同じ clean/babble 曲線で採点。採用なし。最有力候補は構造ではなく学習データ不足。 |
 | [`eval/translate_candidates.md`](eval/translate_candidates.md) | en | 日付つき記録 | FuguMT（ja→en）と M2M-100（ja→zh/ko/es）のパーミッシブな置き換え候補: opus-mt、M2M-100 1.2B、LMT-60-0.6B を chrF と繰り返し smoke set で採点。採用なし（ループするか、レイテンシ予算の2〜4倍）。 |
 | [`eval/ko_candidates.md`](eval/ko_candidates.md) | en | 日付つき記録 | 韓国語経路の代替: ゲイン正規化した zipformer-ko、言語固定の SenseVoice、Omnilingual。SenseVoice 維持。サイズ上限を緩めるなら Cohere Transcribe が次の候補。 |
 | [`eval/video_test.md`](eval/video_test.md) | ja | 日付つき記録 | 実YouTube動画6本をフルパイプラインに通した2026-08-24の記録。ノイズ抑制の作業はここから始まった。 |

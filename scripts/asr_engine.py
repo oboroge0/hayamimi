@@ -935,7 +935,10 @@ class RoutedASR:
         return sorted(self._models)
 
     def _identify_lang(self, samples: np.ndarray, sample_rate: int) -> str:
-        clip = trim_lid_clip(samples, sample_rate)
+        # max_seconds is passed explicitly so asr_engine.LID_MAX_SECONDS stays
+        # the knob docs/guide/tuning.md documents (lid_preprocessing keeps its
+        # own default only for the eval scripts that can't import this module).
+        clip = trim_lid_clip(samples, sample_rate, max_seconds=LID_MAX_SECONDS)
         stream = self.lid.create_stream()
         stream.accept_waveform(sample_rate, clip)
         return self.lid.compute(stream)

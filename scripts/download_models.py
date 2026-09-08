@@ -174,6 +174,78 @@ def download_hf_repo(repo: str, dest_dir: str, label: str, ignore_patterns=None)
     snapshot_download(repo_id=repo, local_dir=target, ignore_patterns=ignore_patterns)
 
 
+def download_opt_ins(args) -> None:
+    """Opt-in downloads (--eval-baselines, --lid-candidates, --translate-candidates).
+
+    Called from BOTH the --minimal early return and the end of the full run:
+    an opt-in flag must never be silently ignored just because it was
+    combined with --minimal (the docs/eval/*_candidates.md records tell
+    people to add these flags; a model that then never arrives degrades
+    routing without any warning at download time).
+    """
+    if args.eval_baselines:
+        download_and_extract_tarbz2(
+            f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8.tar.bz2",
+            "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8",
+            "Parakeet tdt_ctc 0.6B ja (eval baseline only)")
+
+        download_and_extract_tarbz2(
+            f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-zipformer-korean-2024-06-24.tar.bz2",
+            "sherpa-onnx-zipformer-korean-2024-06-24",
+            "Zipformer Korean (eval baseline only)")
+
+    if args.lid_candidates:
+        # whisper-base: candidate (b) in docs/eval/lid_candidates.md (LID
+        # replacement track). int8 only (~160MB); the tarball also ships
+        # fp32 encoder/decoder and test_wavs/, which scripts/eval_lid_candidates.py
+        # never touches, so they're skipped here.
+        extract_members_only(
+            f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-whisper-base.tar.bz2",
+            "sherpa-onnx-whisper-base",
+            {"base-encoder.int8.onnx", "base-decoder.int8.onnx", "base-tokens.txt"},
+            "whisper-base (LID candidate (b), eval only -- see docs/eval/lid_candidates.md)")
+        print("\nNote: LID candidates (a) speechbrain VoxLingua107-ECAPA and (d) its "
+              "target-language classifier need a SEPARATE torch venv (torch/speechbrain "
+              "aren't in this project's runtime requirements) -- see "
+              "scripts/eval_lid_voxlingua.py's docstring for setup:\n"
+              "  python -m venv .venv-train\n"
+              "  .venv-train/Scripts/pip install torch --index-url https://download.pytorch.org/whl/cpu\n"
+              "  .venv-train/Scripts/pip install speechbrain soundfile scikit-learn huggingface_hub fsspec\n"
+              "  .venv-train/Scripts/python scripts/eval_lid_voxlingua.py")
+
+    if args.translate_candidates:
+        # Track B (docs/eval/translate_candidates.md): none of these were
+        # adopted -- no shipped script reads models/*-src/. Downloaded as
+        # the *upstream* (pre-CTranslate2) repo so a future re-evaluation
+        # pass doesn't need to re-locate/re-verify the source models; run
+        # the ct2-transformers-converter commands in that doc's "Candidates
+        # and setup" section afterwards to get a usable *-ct2/ directory.
+        download_hf_repo(
+            "Helsinki-NLP/opus-mt-ja-en",
+            "opus-mt-ja-en-src",
+            "opus-mt-ja-en source repo (Track B candidate, Apache-2.0, not adopted)")
+
+        download_hf_repo(
+            "Helsinki-NLP/opus-mt-ja-es",
+            "opus-mt-ja-es-src",
+            "opus-mt-ja-es source repo (Track B candidate, Apache-2.0, not adopted)")
+
+        download_hf_repo(
+            "facebook/m2m100_1.2B",
+            "m2m100-1.2B-src",
+            "M2M-100 1.2B source repo (Track B candidate, MIT, not adopted)")
+
+        download_hf_repo(
+            "NiuTrans/LMT-60-0.6B",
+            "lmt60-0.6b-src",
+            "LMT-60-0.6B source repo (Track B candidate, Apache-2.0, not adopted)")
+
+        print("\n--translate-candidates done. These are upstream transformers-format repos, "
+              "not usable directly -- see docs/eval/translate_candidates.md's 'Candidates and "
+              "setup' section for the ct2-transformers-converter commands to produce "
+              "models/<name>-ct2/.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--minimal", action="store_true",
@@ -236,6 +308,7 @@ def main():
     if args.minimal:
         print("\n--minimal done. zh/ko/yue/EU/omnilingual ASR, speaker labels, and "
               "translation are unavailable until you re-run without --minimal.")
+        download_opt_ins(args)
         return
 
     # --- full multilingual routing ---
@@ -293,67 +366,7 @@ def main():
         "mojicast-fugumt-ja-en-ct2",
         "FuguMT CTranslate2 (ja->en translation, CC BY-SA 4.0 -- see THIRD_PARTY_NOTICES.md)")
 
-    if args.eval_baselines:
-        download_and_extract_tarbz2(
-            f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8.tar.bz2",
-            "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8",
-            "Parakeet tdt_ctc 0.6B ja (eval baseline only)")
-
-        download_and_extract_tarbz2(
-            f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-zipformer-korean-2024-06-24.tar.bz2",
-            "sherpa-onnx-zipformer-korean-2024-06-24",
-            "Zipformer Korean (eval baseline only)")
-
-    if args.lid_candidates:
-        # whisper-base: candidate (b) in docs/eval/lid_candidates.md (LID
-        # replacement track). int8 only (~160MB); the tarball also ships
-        # fp32 encoder/decoder and test_wavs/, which scripts/eval_lid_candidates.py
-        # never touches, so they're skipped here.
-        extract_members_only(
-            f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-whisper-base.tar.bz2",
-            "sherpa-onnx-whisper-base",
-            {"base-encoder.int8.onnx", "base-decoder.int8.onnx", "base-tokens.txt"},
-            "whisper-base (LID candidate (b), eval only -- see docs/eval/lid_candidates.md)")
-        print("\nNote: LID candidates (a) speechbrain VoxLingua107-ECAPA and (d) its "
-              "target-language classifier need a SEPARATE torch venv (torch/speechbrain "
-              "aren't in this project's runtime requirements) -- see "
-              "scripts/eval_lid_voxlingua.py's docstring for setup:\n"
-              "  python -m venv .venv-train\n"
-              "  .venv-train/Scripts/pip install torch --index-url https://download.pytorch.org/whl/cpu\n"
-              "  .venv-train/Scripts/pip install speechbrain soundfile scikit-learn huggingface_hub fsspec\n"
-              "  .venv-train/Scripts/python scripts/eval_lid_voxlingua.py")
-
-    if args.translate_candidates:
-        # Track B (docs/eval/translate_candidates.md): none of these were
-        # adopted -- no shipped script reads models/*-src/. Downloaded as
-        # the *upstream* (pre-CTranslate2) repo so a future re-evaluation
-        # pass doesn't need to re-locate/re-verify the source models; run
-        # the ct2-transformers-converter commands in that doc's "Candidates
-        # and setup" section afterwards to get a usable *-ct2/ directory.
-        download_hf_repo(
-            "Helsinki-NLP/opus-mt-ja-en",
-            "opus-mt-ja-en-src",
-            "opus-mt-ja-en source repo (Track B candidate, Apache-2.0, not adopted)")
-
-        download_hf_repo(
-            "Helsinki-NLP/opus-mt-ja-es",
-            "opus-mt-ja-es-src",
-            "opus-mt-ja-es source repo (Track B candidate, Apache-2.0, not adopted)")
-
-        download_hf_repo(
-            "facebook/m2m100_1.2B",
-            "m2m100-1.2B-src",
-            "M2M-100 1.2B source repo (Track B candidate, MIT, not adopted)")
-
-        download_hf_repo(
-            "NiuTrans/LMT-60-0.6B",
-            "lmt60-0.6b-src",
-            "LMT-60-0.6B source repo (Track B candidate, Apache-2.0, not adopted)")
-
-        print("\n--translate-candidates done. These are upstream transformers-format repos, "
-              "not usable directly -- see docs/eval/translate_candidates.md's 'Candidates and "
-              "setup' section for the ct2-transformers-converter commands to produce "
-              "models/<name>-ct2/.")
+    download_opt_ins(args)
 
     print("\nDone. Run `python scripts/realtime_transcribe.py --wav testdata/ja_test.wav` to smoke-test.")
 

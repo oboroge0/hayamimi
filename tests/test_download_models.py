@@ -72,3 +72,22 @@ def test_partial_dir_is_refetched_and_complete_dir_is_skipped(sandbox):
     assert set(os.listdir(models / "omni")) == WANTED
     download_models.extract_members_only(tar, "omni", WANTED, "omni")
     assert fetched == [tar], "a complete directory must not be downloaded again"
+
+
+def test_minimal_still_runs_opt_in_downloads(monkeypatch):
+    """--minimal must not silently drop --eval-baselines/--lid-candidates/
+    --translate-candidates: the opt-in helper runs on the minimal path too."""
+    calls = []
+    monkeypatch.setattr(download_models, "download_and_extract_tarbz2",
+                        lambda *a, **k: calls.append(("tar", a[1])))
+    monkeypatch.setattr(download_models, "download_file",
+                        lambda *a, **k: calls.append(("file", a[1])))
+    monkeypatch.setattr(download_models, "download_hf_repo",
+                        lambda *a, **k: calls.append(("hf", a[1])))
+    monkeypatch.setattr(download_models, "extract_members_only",
+                        lambda *a, **k: calls.append(("members", a[1])))
+    monkeypatch.setattr(download_models.os, "makedirs", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", ["download_models.py", "--minimal", "--lid-candidates"])
+    download_models.main()
+    assert ("members", "sherpa-onnx-whisper-base") in calls
+    assert not any(name == "sherpa-onnx-paraformer-zh-int8-2025-10-07" for _, name in calls)

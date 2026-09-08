@@ -1143,3 +1143,14 @@ def test_verdict_for_adopts_only_when_every_criterion_passes():
     adopted, _ = elc.verdict_for("x", clean2=0.95, babble2=0.85, has_yue=True,
                                  size_mb=50.0, latency_ms=100.0, has_confidence=True)
     assert adopted is True
+
+
+def test_lid_max_seconds_is_the_documented_knob():
+    # docs/guide/tuning.md documents asr_engine.LID_MAX_SECONDS as the LID
+    # window; the shared trimmer must default to the same value and
+    # _identify_lang passes the engine constant explicitly.
+    import inspect
+    import lid_preprocessing
+    assert asr_engine.LID_MAX_SECONDS == lid_preprocessing.LID_MAX_SECONDS
+    src = inspect.getsource(asr_engine.RoutedASR._identify_lang)
+    assert "max_seconds=LID_MAX_SECONDS" in src

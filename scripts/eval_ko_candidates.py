@@ -189,13 +189,10 @@ class SenseVoiceAutoKo:
         if self._rec is None:
             import sherpa_onnx
 
-            self._rec = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-                model=_find(MODEL_SV_DIR, "model*.onnx"),
-                tokens=os.path.join(MODEL_SV_DIR, "tokens.txt"),
-                num_threads=self.threads,
-                use_itn=True,
-                language="",
-            )
+            # the production tier, built by the production builder so this
+            # baseline can never drift from asr_engine._build_sense_voice
+            import asr_engine
+            self._rec = asr_engine._build_sense_voice(self.threads)
         return self._rec
 
     def transcribe(self, samples, sr):
@@ -222,11 +219,8 @@ class OmnilingualKo:
         if self._rec is None:
             import sherpa_onnx
 
-            self._rec = sherpa_onnx.OfflineRecognizer.from_omnilingual_asr_ctc(
-                model=_find(MODEL_OMNI_DIR, "model*.onnx"),
-                tokens=os.path.join(MODEL_OMNI_DIR, "tokens.txt"),
-                num_threads=self.threads,
-            )
+            import asr_engine
+            self._rec = asr_engine._build_omnilingual(self.threads)
         return self._rec
 
     def transcribe(self, samples, sr):
