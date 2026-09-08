@@ -221,8 +221,9 @@ python scripts/realtime_transcribe.py --en-tier v2 --wav testdata/eval_real/en_0
 
 - FLEURS/実音声ともread-aloud寄りの音声で、雑音・話者交代・オーバーラップは
   含まない(`docs/results/benchmarks.md`と同じ制約)。
-- RTFは他5トラックと同一CPUを共有した並列実行下の暫定値。専有環境での
-  再計測は未実施。
+- 本文の RTF は他5トラックと同一CPUを共有した並列実行下の暫定値。統合前に専有環境
+  (6スレッド、単独実行)で再計測した結果は v3 0.141 / v2 0.099(FLEURS en 100本、WER は
+  本文と同じ 10.04% / 6.64%)で、採用基準 RTF < 0.2 を満たす。
 - メモリ計測は「モデル単体をロードしてウォームアップした場合」の値。本番の
   `RoutedASR`が保持する他tier(rz/whisper-tiny LID等)込みの実測ではない。
 - v2採用後もv3は引き続き他24のV3_LANGS(欧州言語)を担当するため、v3自体は
