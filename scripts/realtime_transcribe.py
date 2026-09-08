@@ -1666,6 +1666,12 @@ def main():
     ap.add_argument("--refine-agree-threshold", type=float, default=None, metavar="CER",
                     help="agreement threshold for --refine-ja-second-opinion "
                          "(mutual CER between the two hypotheses; default 0.25)")
+    ap.add_argument("--en-tier", choices=["v3", "v2"], default="v3",
+                    help="which Parakeet model handles 'en' (default v3, which also "
+                         "covers the other 24 V3_LANGS European languages). v2 is an "
+                         "opt-in en-only alternative measured lower-WER on English "
+                         "(docs/eval/en_candidates.md; needs download_models.py "
+                         "--en-parakeet-v2, +~660MB resident once loaded).")
     ap.add_argument("--transcript", metavar="PATH",
                     help="append refined transcript lines to this file")
     ap.add_argument("--hotwords", metavar="PATH", default="",
@@ -1833,6 +1839,7 @@ def main():
                         dual_confirm=(args.mode != "fast"),
                         forced_lang=args.lang if args.mode == "single" else None,
                         ja_second_opinion=args.refine_ja_second_opinion,
+                        en_tier=args.en_tier,
                         on_event=hub.publish,
                         **({"agree_threshold": args.refine_agree_threshold}
                            if args.refine_agree_threshold is not None else {}))
