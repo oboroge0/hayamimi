@@ -71,17 +71,9 @@ INT8_ONNX_NAME = os.path.join("quantized_ort", "punct_4class.int8.onnx")
 LABELS = ["O", "、", "。", "？", "！"]
 TARGET_MARKS = ("、", "。", "？", "！")
 
-_Q_SENTINEL = ""
-_E_SENTINEL = ""
 
 
-def _safe_nfkc(text: str) -> str:
-    """See module docstring / docs/eval/punct_retrain.md -- plain NFKC
-    folds fullwidth "？"/"！" to ASCII "?"/"!", which breaks fullwidth-only
-    mark-membership checks downstream. Protect them with PUA sentinels."""
-    text = text.replace("？", _Q_SENTINEL).replace("！", _E_SENTINEL)
-    text = unicodedata.normalize("NFKC", text)
-    return text.replace(_Q_SENTINEL, "？").replace(_E_SENTINEL, "！")
+from ja_text_norm import safe_nfkc as _safe_nfkc  # noqa: E402
 
 
 def strip_marks(text: str, marks=TARGET_MARKS):

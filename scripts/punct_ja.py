@@ -22,6 +22,8 @@ import time
 import unicodedata
 from pathlib import Path
 
+import numpy as np
+
 # numpy / onnxruntime / fugashi are imported lazily, inside the methods that
 # need them, so `import punct_ja` costs nothing but the constants below.
 # scripts/dump_ja_config.py reads those constants in an environment that has
@@ -292,17 +294,24 @@ class PunctuatorJa4Class:
         )
 
     def restore(self, text: str) -> str:
-        """Insert 、/。/？/！ into `text` and return the punctuated string."""
+        """Insert 、/。/？/！ into `text` and return the punctuated string.
+
+        Purely additive: every character of `text` survives unchanged and
+        only marks are inserted. The model was trained on NFKC-normalised
+        text (ja_text_norm.safe_nfkc); callers feeding raw ASR output with
+        fullwidth digits/Latin or halfwidth katakana should normalise first,
+        as the desktop pipeline and the eval harness do. This method does
+        not normalise for you because that would alter characters and break
+        the additive contract the offsets rely on.
+        """
         text = text.strip()
         if not text:
             return text
         text = text[: self.max_chars]
 
-        import numpy as np
-
         enc = self.tokenizer.encode(text)
         ids_np = np.array([enc.ids], dtype=np.int64)
-        mask_np = np.array([[1] * len(enc.ids)], dtype=np.int64)
+        mask_np = np.ones((1, len(enc.ids)), dtype=np.int64)
 
         logits = self.session.run(
             ["logits"], {"input_ids": ids_np, "attention_mask": mask_np}

@@ -40,6 +40,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from punct_ja import PunctuatorJa  # noqa: E402
+from ja_text_norm import safe_nfkc  # noqa: E402
 from eval_accuracy import levenshtein  # noqa: E402
 
 MODEL_DIR = os.path.join(ROOT, "models", "mojicast-punct-onnx")
@@ -320,7 +321,9 @@ def strip_marks(text: str):
         mark (or "") that immediately followed stripped[i] in the original
         text (only the first such mark; stacked marks are rare/absent here).
     """
-    norm = unicodedata.normalize("NFKC", text)
+    # safe_nfkc keeps the fullwidth ？ (a TARGET_MARK) from being folded to
+    # ASCII "?" and silently dropped from the ground truth -- see ja_text_norm.
+    norm = safe_nfkc(text)
     stripped = []
     marks_after = []
     for ch in norm:

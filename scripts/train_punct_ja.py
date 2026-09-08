@@ -70,28 +70,9 @@ TARGET_MARKS = ("、", "。", "？", "！")
 IGNORE_INDEX = -100
 
 
-_Q_SENTINEL = ""  # private-use-area placeholder for "？" during NFKC
-_E_SENTINEL = ""  # private-use-area placeholder for "！" during NFKC
 
 
-def _safe_nfkc(text: str) -> str:
-    """unicodedata.normalize("NFKC", ...) folds fullwidth "？"/"！" (U+FF1F/
-    U+FF01) to their ASCII halfwidth forms "?"/"!" -- this is standard NFKC
-    behavior (fullwidth Latin-range compatibility folding), but it silently
-    breaks any code that NFKC-normalizes a string and *then* checks
-    membership in a fullwidth-only mark set, which is exactly what
-    scripts/quantize_punct.py::strip_marks does (TARGET_MARKS = ("、", "。",
-    "？")). "、"/"。" are ideographic punctuation, not fullwidth-Latin, so
-    they're unaffected -- only ？/！ silently vanish from `marks_after`
-    while a stray ASCII "?"/"!" is left behind in the "stripped" text
-    instead of being removed. Found while building this task's training
-    labels (？/！ label counts came out exactly 0 despite the corpus having
-    tens of thousands of them) -- see docs/eval/punct_retrain.md. Protect
-    fullwidth ？/！ with private-use sentinels around the NFKC call so they
-    survive normalization intact."""
-    text = text.replace("？", _Q_SENTINEL).replace("！", _E_SENTINEL)
-    text = unicodedata.normalize("NFKC", text)
-    return text.replace(_Q_SENTINEL, "？").replace(_E_SENTINEL, "！")
+from ja_text_norm import safe_nfkc as _safe_nfkc  # noqa: E402
 
 
 def strip_marks(text: str):

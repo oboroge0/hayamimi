@@ -41,7 +41,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # their own Markdown with links relative to *their* repo, not this one --
 # e.g. onnxruntime's Privacy.md links to "../README.md" meaning its own
 # package README, which doesn't exist here and isn't this repo's problem.
-SKIP_DIRS = {".dart_tool", "build", "node_modules", ".git", ".claude", ".venv", ".venv-train"}
+# virtualenvs are skipped by _is_venv_root() (pyvenv.cfg), whatever they are named
+SKIP_DIRS = {".dart_tool", "build", "node_modules", ".git", ".claude"}
 
 SELF_URL_PREFIX = "https://github.com/oboroge0/hayamimi/blob/main/"
 

@@ -67,21 +67,9 @@ _HALFWIDTH_QE = str.maketrans({"?": "？", "!": "！"})
 _MARK_RUN_RE = re.compile(r"([、。？！])[、。？！]+")
 
 
-_Q_SENTINEL = ""  # private-use-area placeholder for "？" during NFKC
-_E_SENTINEL = ""  # private-use-area placeholder for "！" during NFKC
 
 
-def _safe_nfkc(text: str) -> str:
-    """Plain unicodedata.normalize("NFKC", ...) folds fullwidth "？"/"！"
-    (U+FF1F/U+FF01) to ASCII "?"/"!" (standard fullwidth-Latin compat
-    folding); that silently defeats any later fullwidth-only TARGET_MARKS
-    membership check downstream (see scripts/train_punct_ja.py::_safe_nfkc
-    for the full writeup -- this bug zeroed out ？/！ training labels
-    before being found and fixed here and there). Protect them with PUA
-    sentinels across the NFKC call."""
-    text = text.replace("？", _Q_SENTINEL).replace("！", _E_SENTINEL)
-    text = unicodedata.normalize("NFKC", text)
-    return text.replace(_Q_SENTINEL, "？").replace(_E_SENTINEL, "！")
+from ja_text_norm import safe_nfkc as _safe_nfkc  # noqa: E402
 
 
 def _clean_line(line: str) -> str:

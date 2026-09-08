@@ -412,8 +412,8 @@ model path changes anywhere in the repo:
 
 ### Proposed `THIRD_PARTY_NOTICES.md` addition
 
-Not applied -- this is the suggested wording for whoever adopts the model
-into the shipped set. It belongs in the **Text models** table:
+Applied at integration time (the row below is what `THIRD_PARTY_NOTICES.md`
+now carries, in the **Text models** table):
 
 ```markdown
 | `punct-ja-4class-permissive` (Japanese 4-class punctuation restoration, opt-in) | Base model: SB Intuitions; fine-tune: hayamimi | MIT | [sbintuitions/modernbert-ja-30m](https://huggingface.co/sbintuitions/modernbert-ja-30m), fine-tuned on [HuggingFaceFW/fineweb-2](https://huggingface.co/datasets/HuggingFaceFW/fineweb-2) `jpn_Jpan` (ODC-By 1.0) -- see `docs/eval/punct_retrain.md` |
