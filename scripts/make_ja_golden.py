@@ -133,6 +133,14 @@ def run_clip(wav_path: str) -> dict:
 
     Everything heavy is imported here rather than at module scope so this
     file stays importable (for ja_cer) without models, numpy or sherpa-onnx.
+
+    Builds a whole pipeline per clip and TEARS IT DOWN AGAIN (the finally
+    below). Both objects own background threads that hold the multi-GB
+    sherpa-onnx recognizers alive, so a run that only dropped its local
+    references leaked one full engine per clip: eight clips took
+    `pytest tests` to ~19 GB RSS. build_golden() and
+    tests/test_ja_golden.py both call this in a loop, which is why the
+    teardown lives here and not at either call site.
     """
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     import realtime_transcribe as rt
@@ -150,21 +158,29 @@ def run_clip(wav_path: str) -> dict:
                     forced_lang=SETTINGS["lang"],
                     ja_second_opinion=False,
                     on_event=hub.publish)
-    asr.min_switch_s = 2.0
-    live_vad = rt.LiveVad(0.35, 12.0)
-    stats = rt.SessionStats()
-    printer = rt.PartialPrinter(enabled=SETTINGS["partials"], hub=hub)
-    history = rt.AudioHistory(rt.SAMPLE_RATE)
-    refiner = rt.Refiner(asr, history, rt.SAMPLE_RATE, printer, stats=stats)
-
-    samples, sr = rt.read_wave(wav_path)
-    rt.run_stream(rt.wav_chunks(samples, sr, realtime=False), live_vad, sr,
-                  asr, stats, printer, refiner, history)
-    # main()'s finish(sr), minus the speaker bookkeeping --speakers adds
-    live_vad.flush()
-    rt.drain_segments(live_vad, sr, asr, stats, printer, history, refiner=refiner)
-    refiner.maybe_refine(0, force=True)
-    refiner._task_queue.join()  # noqa: SLF001 -- exactly what finish() does
+    try:
+        asr.min_switch_s = 2.0
+        live_vad = rt.LiveVad(0.35, 12.0)
+        stats = rt.SessionStats()
+        printer = rt.PartialPrinter(enabled=SETTINGS["partials"], hub=hub)
+        history = rt.AudioHistory(rt.SAMPLE_RATE)
+        refiner = rt.Refiner(asr, history, rt.SAMPLE_RATE, printer, stats=stats)
+        try:
+            samples, sr = rt.read_wave(wav_path)
+            rt.run_stream(rt.wav_chunks(samples, sr, realtime=False), live_vad, sr,
+                          asr, stats, printer, refiner, history)
+            # main()'s finish(sr), minus the speaker bookkeeping --speakers adds
+            live_vad.flush()
+            rt.drain_segments(live_vad, sr, asr, stats, printer, history, refiner=refiner)
+            refiner.maybe_refine(0, force=True)
+        finally:
+            # close() drains the queue the way finish()'s _task_queue.join()
+            # did, then ends the worker thread -- so this is the flush AND
+            # the teardown, and every refine event is on `hub` by the time
+            # the events are read below.
+            refiner.close()
+    finally:
+        asr.close()
 
     finals = [e["text"] for e in events if e.get("type") == "final"]
     refines = [e["text"] for e in events if e.get("type") == "refine"]

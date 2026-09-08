@@ -710,6 +710,18 @@ def build_translators(langs: str, pool: "TranslatorPool") -> None:
             print(str(exc), file=sys.stderr)
 
 
+# Queue sentinel for the two "one daemon thread draining a Queue forever"
+# workers below (TranslationWorker, Refiner). Both used to loop on
+# `while True: q.get()` with no way out, which meant the thread's frame
+# held its owner -- and through the Refiner, the RoutedASR and its
+# multi-GB sherpa-onnx recognizers -- alive for the life of the process.
+# Nothing could be garbage collected, so re-running the ja golden set
+# (eight pipelines, one per clip) took `pytest tests` to ~19 GB RSS.
+# Enqueuing this object tells the loop to return; because both queues are
+# FIFO, everything submitted before it still runs first.
+_WORKER_STOP = object()
+
+
 class TranslationWorker:
     """Async ja->target translation of finalized lines (console display).
 
@@ -724,15 +736,49 @@ class TranslationWorker:
     def __init__(self, pool: TranslatorPool, hub: "EventHub"):
         self._pool = pool
         self._hub = hub
-        self._q: "queue.Queue[str]" = queue.Queue()
-        threading.Thread(target=self._run, daemon=True).start()
+        self._q: "queue.Queue" = queue.Queue()
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
     def submit(self, text: str):
+        """Queue one finalized ja line for translation.
+
+        A no-op after close(): the worker is gone, so anything queued now
+        would sit unread forever. Unlike Refiner.maybe_refine() (which
+        raises, because losing refine text loses transcript content), a
+        dropped console translation of a line that was already printed in
+        its original language costs the user nothing at shutdown.
+        """
+        if self._closed:
+            return
         self._q.put(text)
+
+    def close(self) -> None:
+        """Stop the worker thread once everything already queued has been
+        translated. Idempotent.
+
+        Same reason Refiner.close() exists: this thread's frame holds
+        `self`, and through it the TranslatorPool's M2M models, so an
+        unterminated worker keeps them alive for the life of the process.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._q.put(_WORKER_STOP)
+        self._thread.join()
+
+    def __enter__(self) -> "TranslationWorker":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def _run(self):
         while True:
             text = self._q.get()
+            if text is _WORKER_STOP:
+                return
             for lang, tr in self._pool.items():
                 out = safe_translate(tr, text)
                 if out != text:  # fallback returns the source: nothing worth showing
@@ -842,12 +888,53 @@ class Refiner:
         # out of chronological sequence. A single consumer thread draining a
         # Queue processes strictly in enqueue order, so this can't happen.
         self._task_queue: "queue.Queue" = queue.Queue()
+        self._closed = False
+        self._close_lock = threading.Lock()
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker_thread.start()
+
+    def close(self) -> None:
+        """Finish the queued refine work, stop the worker, close the
+        transcript file. Idempotent; safe to call from any thread.
+
+        This is the counterpart to the `_task_queue.join()` main()'s
+        finish() already did, and it drains exactly the same way: the stop
+        sentinel goes in at the BACK of the FIFO, so every group queued
+        before it is still decoded, printed, published and written to the
+        transcript before the worker returns. close() then waits for the
+        thread to actually end.
+
+        Why it has to exist at all: _worker_loop's frame holds `self`,
+        `self` holds the RoutedASR, and the RoutedASR holds several GB of
+        sherpa-onnx recognizers. A Refiner whose worker never returns is
+        therefore uncollectable no matter what its owner drops -- which is
+        how running the eight golden ja clips in one process (a fresh
+        Refiner + RoutedASR per clip) grew `pytest tests` to ~19 GB. Pair
+        this with RoutedASR.close(); scripts/make_ja_golden.run_clip() and
+        main() both do, in that order.
+        """
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._task_queue.put(_WORKER_STOP)
+        self._worker_thread.join()
+        if self._transcript is not None:
+            self._transcript.close()
+            self._transcript = None
+
+    def __enter__(self) -> "Refiner":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def _worker_loop(self):
         while True:
             task = self._task_queue.get()
+            if task is _WORKER_STOP:
+                self._task_queue.task_done()
+                return
             try:
                 task()
             except Exception:
@@ -897,7 +984,10 @@ class Refiner:
         visually swallowing an en segment sandwiched between two ja ones
         into a "[refine/ja] ..." line. Refine groups now never cross a
         language boundary.
+
+        Raises RuntimeError after close() -- see maybe_refine().
         """
+        self._check_open()
         corrected = script_corrected_lang(lang, text)
         if self.spans:
             group_lang = script_corrected_lang(self.spans[-1][2], self.spans[-1][3])
@@ -1165,7 +1255,25 @@ class Refiner:
         self.printer.hub.publish({"type": "recluster", **stats})
         return stats
 
+    def _check_open(self) -> None:
+        """Refuse work on a closed Refiner, loudly.
+
+        A no-op would be the friendlier-looking choice, but every caller
+        here (run_stream/drain_segments' ingestion path, main()'s finish(),
+        reset_live_session()) is submitting audio that is supposed to end
+        up in the console/SSE/transcript output -- silently dropping it
+        would lose transcript content with nothing to show for it. Worse,
+        a `force_sync=True` refine enqueued after close() would block its
+        caller forever on an Event no worker is left to set, so this turns
+        a deadlock into an immediate, traceable error.
+        """
+        if self._closed:
+            raise RuntimeError(
+                "this Refiner is closed (close() stopped its worker thread); "
+                "build a new Refiner for a new session")
+
     def maybe_refine(self, now_sample: int, force: bool = False, force_sync: bool | None = None):
+        self._check_open()
         if not self.spans:
             return
         first_start = self.spans[0][0]
@@ -1929,6 +2037,17 @@ def main():
         # shutdown too, right after the console prints above so both
         # report identical numbers.
         hub.publish(_session_summary_event(stats, speaker_labeler))
+        # Release the pipeline explicitly, AFTER every event above has been
+        # published -- Refiner.close() drains whatever refine work is still
+        # queued (the same drain finish() does) and asr.close() then frees
+        # the recognizers, so a caller that imports this module and calls
+        # main() in-process gets its memory back instead of holding it
+        # until the interpreter exits. Order matters: the refiner decodes
+        # through the engine, so it stops first.
+        if refiner is not None:
+            refiner.close()
+        translator_worker.close()
+        asr.close()
 
 
 if __name__ == "__main__":
