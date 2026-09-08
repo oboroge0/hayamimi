@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from realtime_transcribe import (AudioHistory, PartialPrinter, PREROLL_S, Refiner,
                                  digits_consistent, translate_by_sentence)
 import asr_engine
+import translate_candidates
 import translate_m2m
 
 
@@ -187,6 +188,42 @@ def test_default_beam_size_used_for_unvalidated_targets():
     # back to DEFAULT_BEAM_SIZE rather than KeyError.
     assert translate_m2m.BEAM_SIZE_BY_TARGET.get("fr", translate_m2m.DEFAULT_BEAM_SIZE) == translate_m2m.DEFAULT_BEAM_SIZE
     assert "es" not in translate_m2m.BEAM_SIZE_BY_TARGET  # measured via the fallback, not a dedicated tuning
+
+
+# ---- Track B candidate backend selection (docs/eval/translate_candidates.md)
+# make_translator() validates backend/target combinations before touching
+# disk, so these run without any downloaded candidate model.
+
+def test_make_translator_rejects_unknown_backend():
+    with pytest.raises(ValueError):
+        translate_candidates.make_translator("not-a-backend", "en")
+
+
+def test_make_translator_opus_mt_rejects_target_with_no_upstream_model():
+    # Helsinki-NLP publishes no official ja->zh or ja->ko opus-mt model --
+    # see docs/eval/translate_candidates.md's "Candidates and setup".
+    with pytest.raises(ValueError):
+        translate_candidates.make_translator("opus-mt", "zh")
+
+
+def test_make_translator_fugumt_rejects_non_en_target():
+    # fugumt is a dedicated ja->en model; unlike the multilingual backends
+    # it has no target_lang parameter at all.
+    with pytest.raises(ValueError):
+        translate_candidates.make_translator("fugumt", "zh")
+
+
+def test_opus_mt_dir_by_target_only_has_en_and_es():
+    assert set(translate_candidates.OPUS_MT_DIR_BY_TARGET) == {"en", "es"}
+
+
+def test_capped_max_length_is_bounded_both_directions():
+    # a tiny source must not collapse to 0 (untranslatable), and a huge
+    # source must not blow past the cap into an unbounded decode.
+    tiny = translate_candidates._capped_max_length(0, cap=150, min_len=30, per_token=6, base=20)
+    huge = translate_candidates._capped_max_length(10_000, cap=150, min_len=30, per_token=6, base=20)
+    assert tiny == 30
+    assert huge == 150
 
 
 # ---- routing table consistency --------------------------------------------

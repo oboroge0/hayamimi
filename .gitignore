@@ -3,11 +3,12 @@
 .DS_Store
 .claude/
 .playwright-mcp/
+.hf-cache/
 .pytest_cache/
 .venv-train/
 .venv/
-Thumbs.db
 __pycache__/
 models/
 session.txt
 testdata/
+Thumbs.db

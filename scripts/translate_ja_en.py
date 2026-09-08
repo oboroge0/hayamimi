@@ -39,7 +39,13 @@ MAX_DECODING_LENGTH_BASE = 20
 class TranslatorJaEn:
     """Loads the FuguMT ja->en CTranslate2 model once and translates lines."""
 
-    def __init__(self, model_dir: str = _MODEL_DIR, device: str = "cpu", compute_type: str = "int8"):
+    def __init__(
+        self,
+        model_dir: str = _MODEL_DIR,
+        device: str = "cpu",
+        compute_type: str = "int8",
+        intra_threads: int = 0,
+    ):
         self.model_dir = model_dir
 
         source_spm_path = os.path.join(model_dir, "source.spm")
@@ -48,7 +54,9 @@ class TranslatorJaEn:
         self._sp_source = spm.SentencePieceProcessor(model_file=source_spm_path)
         self._sp_target = spm.SentencePieceProcessor(model_file=target_spm_path)
 
-        self._translator = ctranslate2.Translator(model_dir, device=device, compute_type=compute_type)
+        self._translator = ctranslate2.Translator(
+            model_dir, device=device, compute_type=compute_type, intra_threads=intra_threads
+        )
 
     def translate(self, text: str) -> str:
         """Translate a single line of Japanese text to English.

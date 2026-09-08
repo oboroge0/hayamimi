@@ -188,6 +188,16 @@ def main():
                      help="also download whisper-base (~160MB int8), the sherpa-onnx-only LID "
                           "replacement candidate evaluated by scripts/eval_lid_candidates.py "
                           "(docs/eval/lid_candidates.md). Not needed to run realtime_transcribe.py.")
+
+    ap.add_argument("--translate-candidates", action="store_true",
+                     help="also download the source (pre-CTranslate2-conversion) Hugging Face repos "
+                          "for the 4 Track B translation replacement candidates evaluated in "
+                          "docs/eval/translate_candidates.md (~5GB total, none adopted -- not used by "
+                          "any shipped script). These are the *upstream* transformers-format repos, "
+                          "not ready-to-use CTranslate2 models: run the ct2-transformers-converter "
+                          "commands in that doc's 'Candidates and setup' section afterwards (needs "
+                          "torch/transformers, e.g. in a separate .venv-train -- see that doc's "
+                          "'Environment' section) to reproduce models/<name>-ct2/.")
     args = ap.parse_args()
 
     os.makedirs(MODELS_DIR, exist_ok=True)
@@ -312,6 +322,38 @@ def main():
               "  .venv-train/Scripts/pip install torch --index-url https://download.pytorch.org/whl/cpu\n"
               "  .venv-train/Scripts/pip install speechbrain soundfile scikit-learn huggingface_hub fsspec\n"
               "  .venv-train/Scripts/python scripts/eval_lid_voxlingua.py")
+
+    if args.translate_candidates:
+        # Track B (docs/eval/translate_candidates.md): none of these were
+        # adopted -- no shipped script reads models/*-src/. Downloaded as
+        # the *upstream* (pre-CTranslate2) repo so a future re-evaluation
+        # pass doesn't need to re-locate/re-verify the source models; run
+        # the ct2-transformers-converter commands in that doc's "Candidates
+        # and setup" section afterwards to get a usable *-ct2/ directory.
+        download_hf_repo(
+            "Helsinki-NLP/opus-mt-ja-en",
+            "opus-mt-ja-en-src",
+            "opus-mt-ja-en source repo (Track B candidate, Apache-2.0, not adopted)")
+
+        download_hf_repo(
+            "Helsinki-NLP/opus-mt-ja-es",
+            "opus-mt-ja-es-src",
+            "opus-mt-ja-es source repo (Track B candidate, Apache-2.0, not adopted)")
+
+        download_hf_repo(
+            "facebook/m2m100_1.2B",
+            "m2m100-1.2B-src",
+            "M2M-100 1.2B source repo (Track B candidate, MIT, not adopted)")
+
+        download_hf_repo(
+            "NiuTrans/LMT-60-0.6B",
+            "lmt60-0.6b-src",
+            "LMT-60-0.6B source repo (Track B candidate, Apache-2.0, not adopted)")
+
+        print("\n--translate-candidates done. These are upstream transformers-format repos, "
+              "not usable directly -- see docs/eval/translate_candidates.md's 'Candidates and "
+              "setup' section for the ct2-transformers-converter commands to produce "
+              "models/<name>-ct2/.")
 
     print("\nDone. Run `python scripts/realtime_transcribe.py --wav testdata/ja_test.wav` to smoke-test.")
 
