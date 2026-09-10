@@ -6,6 +6,8 @@ Usage:
     python scripts/realtime_transcribe.py --wav testdata/ja_test.wav --no-realtime
     python scripts/realtime_transcribe.py --wav testdata/ja_test.wav       # paced with sleeps
     python scripts/realtime_transcribe.py                                 # live microphone
+    python scripts/realtime_transcribe.py --input speaker                 # PC audio output (WASAPI loopback, Windows)
+    python scripts/realtime_transcribe.py --input mix                     # mic + PC audio output, summed
 """
 import argparse
 import os
@@ -14,7 +16,9 @@ import sys
 import threading
 import time
 import wave
-from typing import Callable
+from collections import deque
+from contextlib import contextmanager
+from typing import Callable, NamedTuple
 
 import numpy as np
 import sherpa_onnx
@@ -300,9 +304,71 @@ def wav_chunks(samples: np.ndarray, sample_rate: int, realtime: bool):
 
 
 MIC_QUEUE_TIMEOUT_S = 0.1  # how often the generator wakes up to check stop_event
+LOOPBACK_BLOCK_SIZE = WINDOW_SIZE * 4  # SoundCard recommends > record(numframes)
+MIX_QUEUE_MAXLEN = 64  # ~2.0s, bounded symmetrically for both hardware clocks
+CAPTURE_CHUNK_NS = int(WINDOW_SIZE / SAMPLE_RATE * 1_000_000_000)
+MIX_SYNC_TOLERANCE_NS = int(1.5 * CAPTURE_CHUNK_NS)
 
 
-def mic_chunks(stop_event: "threading.Event | None" = None):
+class _CapturedChunk(NamedTuple):
+    """A frame plus the monotonic time at which capture completed."""
+
+    end_ns: int
+    samples: np.ndarray
+
+
+def _next_capture_end_ns(previous_end_ns: "int | None") -> int:
+    """Timestamp fixed audio windows without collapsing buffered bursts.
+
+    SoundCard can satisfy a call from its internal pending buffer almost
+    immediately after the preceding call.  Wall-clocking both completions
+    would assign consecutive 32ms audio windows nearly the same time.  Keep
+    at least one window between them while still jumping forward after a real
+    capture pause.
+    """
+    now_ns = time.perf_counter_ns()
+    if previous_end_ns is None:
+        return now_ns
+    return max(now_ns, previous_end_ns + CAPTURE_CHUNK_NS)
+
+
+def _resolve_mic_device(name: "str | None" = None):
+    """Pick a sounddevice input device index for mic_chunks().
+
+    PortAudio's own "default input device" can be unset (-1, none at all)
+    -- e.g. a Remote Desktop session with microphone redirection turned
+    off has no default across MME/DirectSound/WASAPI; the remote machine's
+    own physical mic still enumerates under the WDM-KS host API but can't
+    actually be opened cross-session ("Invalid device"). So: honor an
+    explicit name/substring first, else PortAudio's default if it has one,
+    else just the first input-capable device of any kind -- mic_chunks()
+    wraps the actual open call to turn a bad guess here into an actionable
+    error rather than a raw PortAudioError.
+    """
+    import sounddevice as sd
+
+    devices = sd.query_devices()
+    if name:
+        matches = [i for i, d in enumerate(devices)
+                   if name.lower() in d["name"].lower() and d["max_input_channels"] > 0]
+        if not matches:
+            avail = ", ".join(f"[{i}] {d['name']}" for i, d in enumerate(devices)
+                              if d["max_input_channels"] > 0) or "(none)"
+            raise RuntimeError(f"no input device matching {name!r} -- available: {avail}")
+        return matches[0]
+
+    default_in = sd.default.device[0]
+    if isinstance(default_in, int) and default_in >= 0:
+        return default_in
+    for i, d in enumerate(devices):
+        if d["max_input_channels"] > 0:
+            return i
+    raise RuntimeError("no microphone input device found at all -- see --list-audio-devices")
+
+
+def mic_chunks(stop_event: "threading.Event | None" = None,
+               device_name: "str | None" = None,
+               _timestamped: bool = False):
     """Yield mic input frames until `stop_event` is set.
 
     `q.get()` alone blocks forever with no chunk to hand back control to the
@@ -312,18 +378,433 @@ def mic_chunks(stop_event: "threading.Event | None" = None):
     """
     import sounddevice as sd
 
-    q: "queue.Queue[np.ndarray]" = queue.Queue()
+    device = _resolve_mic_device(device_name)
+    q: "queue.Queue[np.ndarray | _CapturedChunk]" = queue.Queue()
+
+    last_end_ns = None
 
     def callback(indata, frames, time_info, status):
-        q.put(indata[:, 0].copy())
+        nonlocal last_end_ns
+        samples = indata[:, 0].copy()
+        # Timestamp in PortAudio's callback, not later in mix's drain
+        # thread: if that thread is briefly descheduled, queued old chunks
+        # must retain their real acquisition times.
+        if _timestamped:
+            last_end_ns = _next_capture_end_ns(last_end_ns)
+            item = _CapturedChunk(last_end_ns, samples)
+        else:
+            item = samples
+        q.put(item)
 
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                         blocksize=WINDOW_SIZE, callback=callback):
+    try:
+        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+                             blocksize=WINDOW_SIZE, device=device, callback=callback):
+            while stop_event is None or not stop_event.is_set():
+                try:
+                    yield q.get(timeout=MIC_QUEUE_TIMEOUT_S)
+                except queue.Empty:
+                    continue
+    except sd.PortAudioError as exc:
+        raise RuntimeError(
+            f"couldn't open microphone [{device}] {sd.query_devices(device)['name']!r} "
+            f"({exc}). Over Remote Desktop, Windows blocks opening the remote machine's "
+            f"own physical mic across the session -- enable microphone redirection instead "
+            f"(mstsc: Show Options > Local Resources > Remote audio > Recording > Record "
+            f"from this computer). See --list-audio-devices, or pass --mic-device NAME to "
+            f"pick a different device.") from exc
+
+
+def _resolve_loopback_speaker(name: "str | None" = None):
+    """Pick a soundcard Speaker to WASAPI-loopback-capture for speaker_chunks().
+
+    WASAPI loopback taps the render endpoint directly -- unlike the classic
+    "Stereo Mix" recording device, it needs no opt-in in Windows Sound
+    settings and works even when the sound driver doesn't expose Stereo
+    Mix at all.
+    """
+    if sys.platform != "win32":
+        raise RuntimeError("--input speaker/mix needs Windows (WASAPI loopback via the "
+                            "soundcard package) -- --input mic/wav/ws work on any platform")
+    import soundcard as sc
+
+    if name:
+        matches = [s for s in sc.all_speakers() if name.lower() in s.name.lower()]
+        if not matches:
+            avail = ", ".join(repr(s.name) for s in sc.all_speakers()) or "(none)"
+            raise RuntimeError(f"no output device matching {name!r} -- available: {avail}")
+        return matches[0]
+    try:
+        return sc.default_speaker()
+    except Exception as exc:
+        raise RuntimeError(
+            f"no default output device to loop back from ({exc}). Over Remote Desktop this "
+            f"is usually the redirected 'Remote Audio' channel, not the PC's own speakers -- "
+            f"see --list-audio-devices, or pass --speaker-device NAME.") from exc
+
+
+def _import_soundcard():
+    """Import SoundCard on the long-lived caller that owns its global COM."""
+    import soundcard as sc
+    return sc
+
+
+@contextmanager
+def _windows_com_initialized(ole32=None):
+    """Initialize COM for the calling capture thread, then balance it.
+
+    SoundCard 0.4.6 initializes COM only in the thread that first imports
+    its Windows backend.  speaker_chunks() deliberately performs WASAPI
+    work on another thread, and COM apartments are per-thread, so that
+    worker needs its own CoInitializeEx/CoUninitialize pair.
+
+    ``ole32`` is injectable so the HRESULT behavior can be tested on CI
+    without a Windows audio endpoint.
+    """
+    if ole32 is None:
+        import ctypes
+        ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+        ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        ole32.CoInitializeEx.restype = ctypes.c_long
+        ole32.CoUninitialize.argtypes = []
+        ole32.CoUninitialize.restype = None
+
+    hr = int(ole32.CoInitializeEx(None, 0))  # COINIT_MULTITHREADED
+    code = hr & 0xFFFFFFFF
+    rpc_e_changed_mode = 0x80010106
+    initialized_here = code < 0x80000000
+    if not initialized_here and code != rpc_e_changed_mode:
+        raise RuntimeError(f"CoInitializeEx failed (HRESULT 0x{code:08X})")
+    try:
+        yield
+    finally:
+        # S_OK and S_FALSE both require a matching CoUninitialize.  A
+        # changed-mode result means another owner initialized this thread;
+        # using that existing apartment is valid, but it is not ours to undo.
+        if initialized_here:
+            ole32.CoUninitialize()
+
+
+def _downmix_loopback(block) -> np.ndarray:
+    """Validate a SoundCard frame matrix and average every native channel."""
+    frames = np.asarray(block, dtype=np.float32)
+    if frames.ndim != 2 or frames.shape[1] < 2:
+        raise RuntimeError(
+            "WASAPI loopback returned invalid single-channel data; "
+            f"expected frames x >=2 channels, got shape {frames.shape}")
+    if frames.shape[0] != WINDOW_SIZE:
+        raise RuntimeError(
+            f"WASAPI loopback returned {frames.shape[0]} frames; expected {WINDOW_SIZE}")
+    return np.ascontiguousarray(frames.mean(axis=1, dtype=np.float32))
+
+
+def speaker_chunks(stop_event: "threading.Event | None" = None,
+                    device_name: "str | None" = None,
+                    _timestamped: bool = False):
+    """Yield mono 16kHz frames captured from the PC's audio output (WASAPI
+    loopback via the `soundcard` package) -- whatever is playing through
+    the speakers/headphones (a call partner's voice, a video), transcribed
+    the same way mic audio is. `soundcard` resamples to 16kHz; native output
+    channels are captured together and NumPy-downmixed here because
+    SoundCard 0.4.6's Windows single-channel recording path is known to
+    return corrupted data.
+
+    The actual soundcard.recorder().record() calls run on a dedicated
+    background thread, polled through a queue exactly like mic_chunks()
+    polls sounddevice's callback queue -- NOT called inline in this
+    generator. soundcard.record() is a blocking pull, not a callback: if it
+    were called directly from run_stream()'s loop, a slow VAD/ASR decode
+    downstream (seen up to ~2s during two-pass refine) would stall the
+    *next* record() call long enough for WASAPI's own capture buffer to
+    overrun in the meantime, which soundcard surfaces as
+    "SoundcardRuntimeWarning: data discontinuity in recording" -- silently
+    dropped audio, confirmed by ear against a live TTS test before this was
+    threaded off. mic_chunks() never had this problem because
+    sounddevice's InputStream callback already runs on PortAudio's own
+    thread, independent of whatever the consumer is doing.
+    """
+    if stop_event is not None and stop_event.is_set():
+        return
+    if sys.platform != "win32":
+        raise RuntimeError("--input speaker/mix needs Windows (WASAPI loopback via the "
+                           "soundcard package) -- --input mic/wav/ws work on any platform")
+
+    # Import before initializing the worker's apartment.  SoundCard 0.4.6's
+    # module-global COM helper incorrectly treats S_FALSE (already initialized)
+    # as an error during its first import; the worker gets a separate, explicit
+    # COM scope below before it creates or touches any device wrapper.
+    sc = _import_soundcard()
+
+    capture_stop = threading.Event()
+    q: "queue.Queue[np.ndarray | _CapturedChunk]" = queue.Queue()
+    fatal: "queue.Queue[tuple[str, str]]" = queue.Queue()
+
+    def _capture():
+        label = device_name or "default output device"
+        last_end_ns = None
+        try:
+            with _windows_com_initialized():
+                # Resolve and use every COM-backed object in this apartment;
+                # only plain arrays/strings/exceptions cross the thread edge.
+                speaker = _resolve_loopback_speaker(device_name)
+                label = speaker.name
+                loopback_mic = sc.get_microphone(id=speaker.id, include_loopback=True)
+                record_channels = max(2, int(loopback_mic.channels))
+                with loopback_mic.recorder(
+                        samplerate=SAMPLE_RATE,
+                        channels=record_channels,
+                        blocksize=LOOPBACK_BLOCK_SIZE) as rec:
+                    while not capture_stop.is_set():
+                        samples = _downmix_loopback(
+                            rec.record(numframes=WINDOW_SIZE))
+                        if _timestamped:
+                            last_end_ns = _next_capture_end_ns(last_end_ns)
+                            item = _CapturedChunk(last_end_ns, samples)
+                        else:
+                            item = samples
+                        q.put(item)
+        except Exception as exc:
+            # Do not transport the exception/traceback: its frames can retain
+            # COM-backed recorder objects and later finalize them on the
+            # consumer thread after this apartment has been uninitialized.
+            fatal.put((label, str(exc)))
+
+    thread = threading.Thread(target=_capture, name="speaker-loopback-capture",
+                              daemon=True)
+    thread.start()
+    try:
         while stop_event is None or not stop_event.is_set():
             try:
                 yield q.get(timeout=MIC_QUEUE_TIMEOUT_S)
             except queue.Empty:
+                if not fatal.empty():
+                    label, message = fatal.get()
+                    raise RuntimeError(
+                        f"speaker loopback capture of {label!r} failed: {message}") from None
                 continue
+    finally:
+        capture_stop.set()
+        thread.join(timeout=2.0)
+
+
+def _put_latest(q, item) -> None:
+    """Put without blocking, dropping the oldest item when a queue is full."""
+    while True:
+        try:
+            q.put_nowait(item)
+            return
+        except queue.Full:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                # The consumer won the race between Full and get_nowait().
+                continue
+
+
+def _drain_available(q, pending) -> None:
+    """Move every currently queued packet into the chronological buffer."""
+    while True:
+        try:
+            pending.append(q.get_nowait())
+        except queue.Empty:
+            return
+
+
+def _pop_aligned_speaker(pending, target_ns: int,
+                         tolerance_ns: int = MIX_SYNC_TOLERANCE_NS):
+    """Pop the closest speaker packet in the target window, at most once.
+
+    Stale packets are discarded, packets too far in the future are retained,
+    and choosing one packet also discards older unchosen candidates.  The
+    deque is chronological because its single producer timestamps at capture.
+    """
+    lower = target_ns - tolerance_ns
+    upper = target_ns + tolerance_ns
+    while pending:
+        packet = pending[0]
+        if packet.end_ns < lower:
+            pending.popleft()
+            continue
+        break
+    if not pending or pending[0].end_ns > upper:
+        return None
+
+    best_index = 0
+    best_distance = abs(pending[0].end_ns - target_ns)
+    for index, packet in enumerate(pending):
+        if packet.end_ns > upper:
+            break
+        distance = abs(packet.end_ns - target_ns)
+        if distance < best_distance:
+            best_index = index
+            best_distance = distance
+    for _ in range(best_index):
+        pending.popleft()
+    return pending.popleft()
+
+
+def _wait_for_aligned_speaker(spk_q, pending, spk_done,
+                              target_ns: int):
+    """Collect available speaker packets, briefly waiting for the closest."""
+    _drain_available(spk_q, pending)
+    upper_ns = target_ns + MIX_SYNC_TOLERANCE_NS
+    while not spk_done.is_set():
+        has_nonpast_candidate = any(
+            target_ns <= packet.end_ns <= upper_ns
+            for packet in pending)
+        if has_nonpast_candidate:
+            break
+        if any(packet.end_ns > upper_ns for packet in pending):
+            # Timestamps are monotonic; once a newer packet
+            # arrived, no missing in-window packet can arrive behind it.
+            break
+        remaining_ns = upper_ns - time.perf_counter_ns()
+        if remaining_ns <= 0:
+            break
+        try:
+            pending.append(spk_q.get(timeout=remaining_ns / 1_000_000_000))
+        except queue.Empty:
+            break
+        _drain_available(spk_q, pending)
+    # The producer can enqueue its final packet and set spk_done in the
+    # narrow interval after the first drain but before the loop condition.
+    _drain_available(spk_q, pending)
+    return _pop_aligned_speaker(
+        pending, target_ns)
+
+
+def mix_chunks(stop_event: "threading.Event | None" = None,
+               mic_device_name: "str | None" = None,
+               speaker_device_name: "str | None" = None):
+    """Yield mic audio summed with speaker-loopback audio, one mono stream.
+
+    Runs mic_chunks() and speaker_chunks() concurrently on background
+    threads (each paced by its own hardware clock, ~32ms/chunk) and adds
+    only capture-timestamp-aligned windows so one pipeline transcribes both
+    what the user says into the mic and whatever else is playing on the PC
+    (a call partner, a video) -- e.g. for meeting transcription. The mic
+    clock paces output. Both queues use the same bounded, drop-oldest policy,
+    so a slow ASR consumer resumes near live time without pairing different
+    moments. A speaker chunk outside a small synchronization window is
+    silence. A dead mic is fatal; a dead speaker side falls back to mic-only.
+    """
+    if stop_event is not None and stop_event.is_set():
+        return
+
+    soundcard_preload_error = None
+    if sys.platform == "win32":
+        # Ensure SoundCard's module-global COM helper belongs to this
+        # long-lived caller, not the short-lived speaker drain thread.  The
+        # actual device objects still live exclusively in speaker_chunks()'
+        # explicitly initialized capture apartment.
+        try:
+            _import_soundcard()
+        except Exception as exc:
+            # SoundCard 0.4.6 rejects COM's legitimate S_FALSE result when an
+            # embedding host already initialized this apartment.  Do not
+            # retry the half-failed import on the short-lived drain thread;
+            # that would attach its module-global COM owner to the wrong
+            # lifetime.  The speaker side reports this once and mix remains
+            # usable as mic-only.
+            soundcard_preload_error = RuntimeError(
+                f"soundcard initialization on the mix caller failed: {exc}")
+
+    capture_stop = threading.Event()
+    mic_q: "queue.Queue[_CapturedChunk]" = queue.Queue(maxsize=MIX_QUEUE_MAXLEN)
+    spk_q: "queue.Queue[_CapturedChunk]" = queue.Queue(maxsize=MIX_QUEUE_MAXLEN)
+    mic_fatal: "queue.Queue[Exception]" = queue.Queue()
+    spk_fatal: "queue.Queue[Exception]" = queue.Queue()
+    mic_done = threading.Event()
+    spk_done = threading.Event()
+
+    def _drain_mic():
+        try:
+            kwargs = {"stop_event": capture_stop, "device_name": mic_device_name,
+                      "_timestamped": True}
+            for packet in mic_chunks(**kwargs):
+                _put_latest(mic_q, packet)
+        except Exception as exc:
+            mic_fatal.put(exc)
+            capture_stop.set()
+        finally:
+            mic_done.set()
+
+    def _drain_speaker():
+        try:
+            if soundcard_preload_error is not None:
+                raise soundcard_preload_error
+            kwargs = {"stop_event": capture_stop, "device_name": speaker_device_name,
+                      "_timestamped": True}
+            for packet in speaker_chunks(**kwargs):
+                _put_latest(spk_q, packet)
+        except Exception as exc:
+            spk_fatal.put(exc)
+        finally:
+            spk_done.set()
+
+    mic_thread = threading.Thread(target=_drain_mic, name="mix-mic-capture", daemon=True)
+    spk_thread = threading.Thread(target=_drain_speaker, name="mix-speaker-capture",
+                                  daemon=True)
+    mic_thread.start()
+    spk_thread.start()
+    pending_speaker = deque(maxlen=MIX_QUEUE_MAXLEN)
+    speaker_error_reported = False
+
+    def _raise_mic_failure() -> None:
+        try:
+            exc = mic_fatal.get_nowait()
+        except queue.Empty:
+            return
+        raise exc
+
+    def _report_speaker_failure() -> None:
+        nonlocal speaker_error_reported
+        if speaker_error_reported:
+            return
+        try:
+            exc = spk_fatal.get_nowait()
+        except queue.Empty:
+            return
+        speaker_error_reported = True
+        print(f"[mix] speaker loopback capture stopped: {exc}", file=sys.stderr)
+
+    try:
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return
+            _raise_mic_failure()
+            _report_speaker_failure()
+            try:
+                mic_packet = mic_q.get(timeout=MIC_QUEUE_TIMEOUT_S)
+            except queue.Empty:
+                _raise_mic_failure()
+                _report_speaker_failure()
+                if mic_done.is_set():
+                    return
+                continue
+
+            # At live speed an older in-window speaker frame may already be
+            # queued while the exact matching one completes a few milliseconds
+            # later.  Do not consume the older candidate immediately: wait for
+            # a same-time/future candidate until this target's finite deadline,
+            # then choose the closest packet available.  For queued/stale mic
+            # audio the deadline is already past, so this never compounds ASR
+            # latency.
+            target_ns = mic_packet.end_ns
+            spk_packet = _wait_for_aligned_speaker(
+                spk_q, pending_speaker, spk_done, target_ns)
+
+            _report_speaker_failure()
+            mic_chunk = mic_packet.samples
+            if (spk_packet is not None and
+                    len(spk_packet.samples) == len(mic_chunk)):
+                mixed = np.clip(mic_chunk + spk_packet.samples, -1.0, 1.0)
+            else:
+                mixed = mic_chunk
+            yield mixed
+    finally:
+        capture_stop.set()
+        mic_thread.join(timeout=2.0)
+        spk_thread.join(timeout=2.0)
 
 
 def ws_chunks(ingest):
@@ -1674,8 +2155,24 @@ def main():
                          "supports it. Only zh/ko have measured translation quality so far "
                          "-- other targets print an 'unvalidated' note to stderr, see "
                          "docs/design/translate_m2m.md")
-    ap.add_argument("--input", choices=["mic", "wav", "ws"], default=None,
-                    help="audio source; default is mic, or wav if --wav is given")
+    ap.add_argument("--input", choices=["mic", "wav", "ws", "speaker", "mix"], default=None,
+                    help="audio source; default is mic, or wav if --wav is given. "
+                         "'speaker' transcribes whatever is playing on the PC's audio "
+                         "output (WASAPI loopback, Windows only -- no Stereo Mix setup "
+                         "needed); 'mix' transcribes mic + speaker summed into one "
+                         "stream (e.g. meeting transcription: your voice and the call "
+                         "audio together)")
+    ap.add_argument("--mic-device", default=None, metavar="NAME",
+                    help="substring match for the input device --input mic/mix captures "
+                         "from (default: system default input device). See "
+                         "--list-audio-devices.")
+    ap.add_argument("--speaker-device", default=None, metavar="NAME",
+                    help="substring match for the output device --input speaker/mix "
+                         "loops back from (default: system default output device). See "
+                         "--list-audio-devices.")
+    ap.add_argument("--list-audio-devices", action="store_true",
+                    help="print available audio input/output devices and exit -- use to "
+                         "find a name for --mic-device/--speaker-device")
     ap.add_argument("--ws-host", default="127.0.0.1", metavar="HOST",
                     help="bind host for --input ws (default 127.0.0.1, localhost-only; "
                          "pass --ws-host 0.0.0.0 to also accept connections from other "
@@ -1685,8 +2182,26 @@ def main():
                     help="port for the --input ws /ingest endpoint (default 8766)")
     args = ap.parse_args()
 
+    if args.list_audio_devices:
+        import sounddevice as sd
+
+        print(sd.query_devices())
+        if sys.platform == "win32":
+            try:
+                import soundcard as sc
+
+                default_id = sc.default_speaker().id
+                print("\nWASAPI output devices (for --speaker-device):")
+                for s in sc.all_speakers():
+                    print(f"  {s.name}" + ("  (default)" if s.id == default_id else ""))
+            except Exception as exc:
+                print(f"\n(soundcard loopback devices unavailable: {exc})", file=sys.stderr)
+        return
+
     if args.mode == "single" and not args.lang:
         ap.error("--mode single requires --lang CODE")
+    if args.input in ("speaker", "mix") and sys.platform != "win32":
+        ap.error("--input speaker/mix needs Windows (WASAPI loopback)")
     # --mode bundles defaults for the two hysteresis knobs; an explicitly
     # passed --lang-switch-guard/--lid-switch-confirm still wins. "single"
     # has no entry here: forced_lang (set below) bypasses all switch/
@@ -1891,8 +2406,20 @@ def main():
             run_stream(ws_chunks(ingest), live_vad, SAMPLE_RATE, asr, stats, printer, refiner,
                        history, translator_worker, speaker_labeler, stop_event=stop_event,
                        control=control)
+        elif input_mode == "speaker":
+            run_stream(speaker_chunks(stop_event=stop_event, device_name=args.speaker_device),
+                       live_vad, SAMPLE_RATE, asr, stats, printer, refiner, history,
+                       translator_worker, speaker_labeler, stop_event=stop_event,
+                       control=control)
+        elif input_mode == "mix":
+            run_stream(mix_chunks(stop_event=stop_event, mic_device_name=args.mic_device,
+                                  speaker_device_name=args.speaker_device),
+                       live_vad, SAMPLE_RATE, asr, stats, printer, refiner, history,
+                       translator_worker, speaker_labeler, stop_event=stop_event,
+                       control=control)
         else:
-            run_stream(mic_chunks(stop_event=stop_event), live_vad, SAMPLE_RATE, asr, stats,
+            run_stream(mic_chunks(stop_event=stop_event, device_name=args.mic_device),
+                       live_vad, SAMPLE_RATE, asr, stats,
                        printer, refiner, history, translator_worker, speaker_labeler,
                        stop_event=stop_event, control=control)
     except KeyboardInterrupt:

@@ -62,6 +62,7 @@ evaluation -- `asr_engine.py`'s routing does not use them.
 | [numpy](https://numpy.org/) | BSD-3-Clause | |
 | [soundfile](https://github.com/bastibe/python-soundfile) | BSD-3-Clause | |
 | [sounddevice](https://github.com/spatialaudio/python-sounddevice) | MIT | microphone capture |
+| [soundcard](https://github.com/bastibe/SoundCard) | BSD-3-Clause | WASAPI loopback capture of PC audio output for `--input speaker`/`mix` |
 | [fugashi](https://github.com/polm/fugashi) | MIT (MeCab itself is BSD/GPL/LGPL tri-license) | Japanese tokenization for punctuation restoration |
 | [unidic-lite](https://github.com/polm/unidic-lite) | MIT (dictionary data: BSD-modified, per UniDic) | dictionary for fugashi |
 | [kiwipiepy](https://github.com/bab2min/kiwipiepy) | **LGPL-2.1-or-later** | Korean tokenizer, used only to fix SenseVoice's spacing on `ko` output; optional at runtime (falls through silently if not installed) -- kept as an **optional/dev extra**, not a hard runtime dependency, to avoid LGPL obligations on the core install |

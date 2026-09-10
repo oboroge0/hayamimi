@@ -198,7 +198,12 @@ class _FakeInputStream:
 def test_mic_chunks_notices_stop_event_without_audio(monkeypatch):
     import realtime_transcribe as rt
 
-    fake_sd = types.SimpleNamespace(InputStream=_FakeInputStream)
+    fake_sd = types.SimpleNamespace(
+        InputStream=_FakeInputStream,
+        query_devices=lambda: [{"name": "fake mic", "max_input_channels": 1}],
+        default=types.SimpleNamespace(device=[0, 0]),
+        PortAudioError=RuntimeError,
+    )
     monkeypatch.setitem(sys.modules, "sounddevice", fake_sd)
 
     stop_event = threading.Event()
