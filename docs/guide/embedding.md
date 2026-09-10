@@ -19,6 +19,30 @@ letting sherpa-onnx's C++ layer call `exit()` on a missing model path, and
 its own thread can stop it cleanly (`stop_event.set()`) without relying on
 `KeyboardInterrupt`, which only works for the CLI's own process.
 
+**Shutting down a pipeline.** Stopping `run_stream` is not the same as
+releasing the engine. `Refiner`, `TranslationWorker` and `RoutedASR` each
+run background threads, and a running thread holds its owner alive -- so a
+host app that merely dropped its references kept every sherpa-onnx
+recognizer (several GB) resident for the life of the process, and building
+a second pipeline added a second set. Call `close()` when a pipeline is
+done, refiner first (it decodes through the engine):
+
+```python
+refiner.close()          # drains whatever refine work is still queued, then stops
+translator_worker.close()
+asr.close()              # joins the preload/prefetch threads, frees the models
+```
+
+All three are idempotent and usable as context managers. `close()` is the
+end of that object's life, not a pause: `RoutedASR.transcribe()/partial()/
+identify()` and `Refiner.add_span()/maybe_refine()` raise `RuntimeError`
+afterwards, so build a new pipeline for a new session -- or, to start a
+fresh conversation on the models already loaded, use
+`realtime_transcribe.reset_live_session()` instead, which resets session
+state and keeps every model resident. `main()` closes all three at
+shutdown, after the final `session_summary` is published, so the event
+stream an embedder sees is unchanged.
+
 ## Embedding: runtime control and structured events
 
 Two gaps remained even with the pieces above importable. First, session

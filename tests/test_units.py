@@ -341,6 +341,11 @@ def test_partial_forced_lang_routes_directly_without_lid_or_sv_probe():
     class _Stub:
         forced_lang = "ko"
         last_lang = "en"  # deliberately different, to prove it's ignored
+        # transcribe()/partial() now refuse to run on a closed engine
+        # (RoutedASR.close()); borrowed rather than faked so this stub
+        # keeps checking whatever the real guard checks.
+        _closed = False
+        _check_open = asr_engine.RoutedASR._check_open
 
         def _route(self, lang):
             assert lang == "ko"
@@ -530,6 +535,11 @@ def test_transcribe_bootstrap_too_short_decodes_but_does_not_seed_last_lang():
         _pending_lang = None
         _pending_count = 0
         _unavailable = set()
+        # transcribe()/partial() now refuse to run on a closed engine
+        # (RoutedASR.close()); borrowed rather than faked so this stub
+        # keeps checking whatever the real guard checks.
+        _closed = False
+        _check_open = asr_engine.RoutedASR._check_open
 
         def _decode_full(self, rec, samples, sample_rate):
             return ("hi", "<|en|>0.9")
@@ -580,6 +590,11 @@ def test_transcribe_bootstrap_zh_yue_reuses_single_sv_probe_decode():
         _pending_count = 0
         _unavailable = set()
         _itn_overrides = asr_engine.itn_cjk.EMPTY_OVERRIDES
+        # transcribe()/partial() now refuse to run on a closed engine
+        # (RoutedASR.close()); borrowed rather than faked so this stub
+        # keeps checking whatever the real guard checks.
+        _closed = False
+        _check_open = asr_engine.RoutedASR._check_open
         ko_spacer = None
         punct = None
 
@@ -744,6 +759,11 @@ class _FakeRefiner:
     the real method's effect on self.spans: a forced flush empties it)."""
 
     add_span = Refiner.add_span
+    # add_span() now refuses to run on a closed Refiner (Refiner.close());
+    # borrowed, same as add_span itself, so this stub checks what the real
+    # guard checks.
+    _closed = False
+    _check_open = Refiner._check_open
 
     def __init__(self):
         self.spans = []
@@ -957,6 +977,11 @@ def _omni_safety_net_stub(omni_available: bool):
         _pending_count = 0
         _unavailable = set() if omni_available else {"omni"}
         _itn_overrides = asr_engine.itn_cjk.EMPTY_OVERRIDES
+        # transcribe()/partial() now refuse to run on a closed engine
+        # (RoutedASR.close()); borrowed rather than faked so this stub
+        # keeps checking whatever the real guard checks.
+        _closed = False
+        _check_open = asr_engine.RoutedASR._check_open
         ko_spacer = None
         punct = None
         _looks_truncated = staticmethod(asr_engine.RoutedASR._looks_truncated)
