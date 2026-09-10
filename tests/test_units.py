@@ -242,6 +242,96 @@ def test_expected_language_homes():
     assert "zh" in asr_engine.PARA_LANGS
 
 
+# ---- opt-in en-only tier (en_tier="v2", docs/eval/en_candidates.md) --------
+
+def test_resolve_en_tier_accepts_known_values():
+    assert asr_engine.resolve_en_tier("v3") == "v3"
+    assert asr_engine.resolve_en_tier("v2") == "v2"
+
+
+def test_resolve_en_tier_rejects_unknown_value():
+    with pytest.raises(ValueError):
+        asr_engine.resolve_en_tier("v1")
+
+
+class _RouteStub:
+    """Records which tier _route() resolved to, without loading any model."""
+
+    def __init__(self, en_tier):
+        self._en_tier = en_tier
+
+    def _get_with_fallback(self, name):
+        return (f"{name}-recognizer", name)
+
+
+def test_route_en_stays_on_v3_by_default():
+    # en_tier defaults to "v3" everywhere (RoutedASR.__init__, --en-tier) --
+    # V3_LANGS itself is untouched by the opt-in tier (test_expected_language_homes
+    # above), so this is the behavior every existing caller keeps getting.
+    _, tier = asr_engine.RoutedASR._route(_RouteStub("v3"), "en")
+    assert tier == "v3"
+
+
+def test_route_en_switches_to_v2_when_opted_in():
+    _, tier = asr_engine.RoutedASR._route(_RouteStub("v2"), "en")
+    assert tier == "v2"
+
+
+def test_route_other_v3_langs_unaffected_by_en_tier():
+    # only "en" moves to v2; the other 24 V3_LANGS European languages have no
+    # v2-equivalent model and must stay on v3 regardless of en_tier.
+    _, tier = asr_engine.RoutedASR._route(_RouteStub("v2"), "fr")
+    assert tier == "v3"
+
+
+class _FallbackStub:
+    """Drives the real _get_with_fallback() with a fake _get() that only
+    knows the models in `present` -- no sherpa-onnx, no disk."""
+
+    def __init__(self, present, en_tier="v2"):
+        self._present = set(present)
+        self._en_tier = en_tier
+        self._fallback_warned = set()
+        self.events = []
+
+    def _get(self, name):
+        if name not in self._present:
+            raise asr_engine.ModelUnavailable(name)
+        return f"{name}-recognizer"
+
+    def _emit(self, event):
+        self.events.append(event)
+
+    _get_with_fallback = asr_engine.RoutedASR._get_with_fallback
+    _route = asr_engine.RoutedASR._route
+
+
+def test_route_en_v2_missing_degrades_to_v3_not_rz():
+    # --en-tier v2 on a default install (no v2 tarball) must fall back to v3,
+    # the tier en is homed on by default. The generic fallback chain starts
+    # with rz (ReazonSpeech), whose English output is unpunctuated ALL-CAPS,
+    # so landing there would be a silent quality regression.
+    stub = _FallbackStub(present={"rz", "sv", "v3", "omni"})
+    _, tier = stub._route("en")
+    assert tier == "v3"
+    assert [e["type"] for e in stub.events] == ["model_fallback"]
+    assert stub.events[0]["requested"] == "v2" and stub.events[0]["used"] == "v3"
+
+
+def test_route_en_v2_present_uses_v2():
+    stub = _FallbackStub(present={"rz", "v2", "v3"})
+    _, tier = stub._route("en")
+    assert tier == "v2"
+    assert stub.events == []
+
+
+def test_get_with_fallback_generic_chain_unchanged():
+    # Tiers without a _TIER_FALLBACK entry keep the pre-existing ja-first chain.
+    stub = _FallbackStub(present={"rz"})
+    _, tier = stub._get_with_fallback("pz")
+    assert tier == "rz"
+
+
 # ---- script correction matrix ----------------------------------------------
 
 def test_script_correction_matrix():
@@ -1179,3 +1269,10 @@ def test_lid_max_seconds_is_the_documented_knob():
     assert asr_engine.LID_MAX_SECONDS == lid_preprocessing.LID_MAX_SECONDS
     src = inspect.getsource(asr_engine.RoutedASR._identify_lang)
     assert "max_seconds=LID_MAX_SECONDS" in src
+
+
+def test_tier_fallback_table_only_names_known_tiers():
+    for opt_in, defaults in asr_engine._TIER_FALLBACK.items():
+        assert opt_in in asr_engine._BUILDERS
+        for d in defaults:
+            assert d in asr_engine._BUILDERS

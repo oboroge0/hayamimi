@@ -36,7 +36,7 @@ life of the process.
 | Knob | Default | Where to change it | What it affects | Evidence |
 |---|---|---|---|---|
 | `--threads` | `4` | CLI flag; `RoutedASR(threads=...)` | intra-op thread count handed to every sherpa-onnx recognizer | |
-| `--max-resident` | `3` | CLI flag; `RoutedASR(max_resident=...)` | how many recognizers besides the always-resident ja/en tier stay in memory; the least recently used one is dropped past the cap | [benchmarks](../results/benchmarks.md) iteration #3 (RAM), #7 (LRU unload) |
+| `--max-resident` | `3` | CLI flag; `RoutedASR(max_resident=...)` | how many recognizers besides the always-resident ja tier stay in memory; the least recently used one is dropped past the cap. With `--en-tier v2`, English and the other 24 European languages no longer share one recognizer (v2 + v3), so a session that alternates between them needs one more slot than before or it thrashes reloads | [benchmarks](../results/benchmarks.md) iteration #3 (RAM), #7 (LRU unload) |
 | `--mode {single,balanced,fast}` | `balanced` | CLI flag | language-switch policy preset; sets the two flags below and `dual_confirm` | [lid.md](../eval/lid.md) |
 | `--lang CODE` | `None` | CLI flag; `RoutedASR.set_forced_lang()`; `POST /config` `lang` | pins every segment to one language and skips LID entirely (required by `--mode single`) | |
 | `--lang-switch-guard SEC` | `2.0` (`balanced`), `0.0` (`fast`) via `mode_defaults` in `realtime_transcribe.py`; `RoutedASR.min_switch_s` itself is `2.0` | CLI flag; `RoutedASR.set_min_switch_s()`; `POST /config` `min_switch_s` | a new-language detection shorter than this never counts toward a switch | [benchmarks](../results/benchmarks.md) iteration #29; [lid.md](../eval/lid.md) |

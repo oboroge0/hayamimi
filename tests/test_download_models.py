@@ -91,3 +91,17 @@ def test_minimal_still_runs_opt_in_downloads(monkeypatch):
     download_models.main()
     assert ("members", "sherpa-onnx-whisper-base") in calls
     assert not any(name == "sherpa-onnx-paraformer-zh-int8-2025-10-07" for _, name in calls)
+
+
+def test_minimal_with_en_parakeet_v2_downloads_v2(monkeypatch):
+    calls = []
+    monkeypatch.setattr(download_models, "download_and_extract_tarbz2",
+                        lambda *a, **k: calls.append(a[1]))
+    monkeypatch.setattr(download_models, "download_file", lambda *a, **k: None)
+    monkeypatch.setattr(download_models, "download_hf_repo", lambda *a, **k: None)
+    monkeypatch.setattr(download_models, "extract_members_only", lambda *a, **k: None)
+    monkeypatch.setattr(download_models.os, "makedirs", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", ["download_models.py", "--minimal", "--en-parakeet-v2"])
+    download_models.main()
+    assert "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8" in calls
+    assert "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8" not in calls

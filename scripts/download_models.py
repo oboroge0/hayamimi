@@ -175,7 +175,7 @@ def download_hf_repo(repo: str, dest_dir: str, label: str, ignore_patterns=None)
 
 
 def download_opt_ins(args) -> None:
-    """Opt-in downloads (--eval-baselines, --lid-candidates, --translate-candidates).
+    """Opt-in downloads (--en-parakeet-v2, --eval-baselines, --lid-candidates, --translate-candidates).
 
     Called from BOTH the --minimal early return and the end of the full run:
     an opt-in flag must never be silently ignored just because it was
@@ -183,6 +183,12 @@ def download_opt_ins(args) -> None:
     people to add these flags; a model that then never arrives degrades
     routing without any warning at download time).
     """
+    if args.en_parakeet_v2:
+        download_and_extract_tarbz2(
+            f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
+            "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
+            "Parakeet TDT 0.6B v2 (en-only, opt-in --en-tier v2)")
+
     if args.eval_baselines:
         download_and_extract_tarbz2(
             f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8.tar.bz2",
@@ -270,11 +276,18 @@ def main():
                           "commands in that doc's 'Candidates and setup' section afterwards (needs "
                           "torch/transformers, e.g. in a separate .venv-train -- see that doc's "
                           "'Environment' section) to reproduce models/<name>-ct2/.")
+    ap.add_argument("--en-parakeet-v2", action="store_true",
+                     help="also download the opt-in en-only Parakeet v2 tier (~460MB, "
+                          "see docs/eval/en_candidates.md and --en-tier v2). Not part of "
+                          "--minimal or the default set -- en stays on v3 unless you "
+                          "both download this and pass --en-tier v2.")
     args = ap.parse_args()
 
     os.makedirs(MODELS_DIR, exist_ok=True)
 
     total_gb = "~1.1GB" if args.minimal else ("~4.1GB" if args.eval_baselines else "~3.1GB")
+    if args.en_parakeet_v2:
+        total_gb += " + ~460MB (--en-parakeet-v2)"
     print(f"hayamimi model download: this will fetch {total_gb} into {MODELS_DIR}")
     print("(see THIRD_PARTY_NOTICES.md for each model's license)\n")
 

@@ -62,6 +62,7 @@ English: [README.md](README.md)
 | [`eval/video_test.md`](eval/video_test.md) | ja | 日付つき記録 | 実YouTube動画6本をフルパイプラインに通した2026-08-24の記録。ノイズ抑制の作業はここから始まった。 |
 | [`eval/head_dropout.md`](eval/head_dropout.md) | ja | 日付つき記録 | 発話冒頭がどれだけ落ちるかの実測。プリロールと「疑わしいときだけ再試行」の根拠。 |
 | [`eval/head_dropout_results.json`](eval/head_dropout_results.json) | — | 日付つき記録 | その計測のクリップ単位の生出力。`scripts/eval_head_dropout.py`が書き出す。 |
+| [`eval/en_candidates.md`](eval/en_candidates.md) | ja | 日付つき記録 | en経路をv3から en専用Parakeet v2に振り替える価値があるか。FLEURS/実音声WER・ライセンス・メモリを比較し、v2を採用(opt-in、既定はv3のまま)。 |
 
 ## 設計の経緯
 

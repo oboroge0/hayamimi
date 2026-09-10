@@ -63,6 +63,7 @@ on — read them for how something was measured and what it showed at the time.
 | [`eval/video_test.md`](eval/video_test.md) | ja | dated record | Six real YouTube clips through the full pipeline, 2026-08-24 — the run that started the noise-suppression work. |
 | [`eval/head_dropout.md`](eval/head_dropout.md) | ja | dated record | How often an utterance loses its opening, measured; the basis for the pre-roll and the retry-on-suspicion split. |
 | [`eval/head_dropout_results.json`](eval/head_dropout_results.json) | — | dated record | That measurement's raw per-clip output, written by `scripts/eval_head_dropout.py`. |
+| [`eval/en_candidates.md`](eval/en_candidates.md) | ja | dated record | Is it worth moving the en route off v3 onto an en-only Parakeet v2? Compares FLEURS/real-speech WER, licensing, and memory; adopts v2 (opt-in, default stays v3). |
 
 ## Design history
 
