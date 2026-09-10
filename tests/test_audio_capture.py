@@ -19,6 +19,26 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import realtime_transcribe as rt  # noqa: E402
 
 
+class _RuntimeSys:
+    """Keep test overrides local while following pytest's current streams."""
+
+    def __getattr__(self, name):
+        return getattr(sys, name)
+
+
+@pytest.fixture(autouse=True)
+def isolated_runtime_sys(monkeypatch):
+    # Patching the real sys.platform breaks NumPy's lazy imports on Linux.
+    monkeypatch.setattr(rt, "sys", _RuntimeSys())
+
+
+@pytest.fixture(params=["linux", "win32"])
+def fake_mix_backend(monkeypatch, request, isolated_runtime_sys):
+    # Fake generators also need a fake caller-thread SoundCard preload.
+    monkeypatch.setattr(rt.sys, "platform", request.param)
+    monkeypatch.setattr(rt, "_import_soundcard", lambda: None)
+
+
 @pytest.mark.parametrize("input_mode", ["speaker", "mix"])
 def test_cli_rejects_loopback_on_non_windows_before_loading_models(monkeypatch, input_mode):
     monkeypatch.setattr(rt.sys, "platform", "linux")
@@ -352,7 +372,8 @@ def test_wait_for_speaker_drains_packet_enqueued_as_done_becomes_true():
     assert chosen is final_packet
 
 
-def test_mix_stall_drops_both_sides_symmetrically_and_keeps_time_alignment(monkeypatch):
+def test_mix_stall_drops_both_sides_symmetrically_and_keeps_time_alignment(
+        monkeypatch, fake_mix_backend):
     gate = threading.Event()
     mic_finished = threading.Event()
     speaker_finished = threading.Event()
@@ -398,7 +419,8 @@ def test_mix_stall_drops_both_sides_symmetrically_and_keeps_time_alignment(monke
         np.testing.assert_allclose(actual, expected, atol=1e-6)
 
 
-def test_mix_waits_for_a_closer_packet_instead_of_consuming_older_candidate(monkeypatch):
+def test_mix_waits_for_a_closer_packet_instead_of_consuming_older_candidate(
+        monkeypatch, fake_mix_backend):
     target = time.perf_counter_ns() + 10_000_000_000
     old_was_queued = threading.Event()
     release_exact = threading.Event()
@@ -460,7 +482,8 @@ def test_mix_does_not_retry_failed_soundcard_import_on_capture_thread(
     assert err.count("S_FALSE rejected") == 1
 
 
-def test_mix_speaker_failure_falls_back_once_to_mic_only(monkeypatch, capsys):
+def test_mix_speaker_failure_falls_back_once_to_mic_only(
+        monkeypatch, capsys, fake_mix_backend):
     base = time.perf_counter_ns()
 
     def fake_mic_chunks(*, stop_event, device_name, _timestamped):
@@ -478,7 +501,7 @@ def test_mix_speaker_failure_falls_back_once_to_mic_only(monkeypatch, capsys):
     assert capsys.readouterr().err.count("loopback lost") == 1
 
 
-def test_mix_microphone_failure_is_fatal_and_stops_speaker(monkeypatch):
+def test_mix_microphone_failure_is_fatal_and_stops_speaker(monkeypatch, fake_mix_backend):
     speaker_stopped = threading.Event()
 
     def broken_mic_chunks(*, stop_event, device_name, _timestamped):
