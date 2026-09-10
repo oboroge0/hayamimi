@@ -63,6 +63,7 @@ English: [README.md](README.md)
 | [`eval/head_dropout.md`](eval/head_dropout.md) | ja | 日付つき記録 | 発話冒頭がどれだけ落ちるかの実測。プリロールと「疑わしいときだけ再試行」の根拠。 |
 | [`eval/head_dropout_results.json`](eval/head_dropout_results.json) | — | 日付つき記録 | その計測のクリップ単位の生出力。`scripts/eval_head_dropout.py`が書き出す。 |
 | [`eval/en_candidates.md`](eval/en_candidates.md) | ja | 日付つき記録 | en経路をv3から en専用Parakeet v2に振り替える価値があるか。FLEURS/実音声WER・ライセンス・メモリを比較し、v2を採用(opt-in、既定はv3のまま)。 |
+| [`eval/punct_retrain.md`](eval/punct_retrain.md) | en | 日付つき記録 | 4クラス（＋なし）の日本語句読点モデルをゼロから再学習（MIT の `modernbert-ja-30m` ベース、ODC-By の FineWeb-2 テキスト）。FLEURS ja で F1 0.89（現行 0.62）、？／！対応、約10倍高速。opt-in の代替として採用（既定の句読点器は無変更）。1回目がライセンスで不採用になった経緯と、現行モデルが勝つセットも記載。 |
 
 ## 設計の経緯
 

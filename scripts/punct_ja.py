@@ -22,6 +22,8 @@ import time
 import unicodedata
 from pathlib import Path
 
+import numpy as np
+
 # numpy / onnxruntime / fugashi are imported lazily, inside the methods that
 # need them, so `import punct_ja` costs nothing but the constants below.
 # scripts/dump_ja_config.py reads those constants in an environment that has
@@ -219,6 +221,133 @@ class PunctuatorJa:
             mark = "？" if seg.endswith(_QUESTION_SUFFIXES) else "。"
             out.append(seg + mark)
         return "".join(out)
+
+
+PUNCT4_LABELS = ("O", "、", "。", "？", "！")
+PUNCT4_DEFAULT_MODEL_DIR = SCRIPT_DIR.parent / "models" / "punct-ja-4class-permissive"
+PUNCT4_ONNX_FILENAME = "punct_4class.onnx"
+PUNCT4_MAX_CHARS = 450
+PUNCT4_INTRA_OP_NUM_THREADS = 2  # other eval tracks run in parallel on this CPU
+
+
+class PunctuatorJa4Class:
+    """Opt-in 4-class (+ "none") ja punctuation restorer -- improvement
+    track C, see docs/eval/punct_retrain.md for the full writeup (data,
+    licenses, training config, FLEURS-ja accuracy table, adopt decision).
+
+    Unlike PunctuatorJa above (BERT-char body, comma/period only from the
+    model plus a suffix-heuristic "？" pass and no "！" support at all),
+    this restorer is a single token-classification model
+    (sbintuitions/modernbert-ja-30m body, MIT, fine-tuned here on
+    FineWeb-2 jpn_Jpan, ODC-By 1.0) that predicts, per subword token,
+    whether one of 、/。/？/！ follows it directly -- no separate heuristic
+    pass. Being a derivative of an MIT base model, the resulting weights
+    are distributable under MIT, matching the permissive licensing of
+    everything else this repo ships (THIRD_PARTY_NOTICES.md).
+
+    It is NOT the default punctuator anywhere in this repo; callers must
+    explicitly construct this class (the default `model_dir` points at
+    models/punct-ja-4class-permissive/, produced by
+    scripts/train_punct_ja.py + scripts/export_punct_4class.py) to opt in.
+
+    Uses the `tokenizers` library directly (already a transitive dependency
+    in this repo's .venv) rather than `transformers`, so opting in doesn't
+    require installing torch/transformers into the runtime environment.
+    """
+
+    def __init__(
+        self,
+        model_dir: str | Path = PUNCT4_DEFAULT_MODEL_DIR,
+        onnx_filename: str = PUNCT4_ONNX_FILENAME,
+        max_chars: int = PUNCT4_MAX_CHARS,
+        num_threads: int = PUNCT4_INTRA_OP_NUM_THREADS,
+    ):
+        import onnxruntime as ort
+
+        try:
+            from tokenizers import Tokenizer
+        except ImportError as e:  # pragma: no cover
+            raise ImportError(
+                "the `tokenizers` package is required for PunctuatorJa4Class. "
+                "Install with: pip install tokenizers"
+            ) from e
+
+        model_dir = Path(model_dir)
+        onnx_path = model_dir / onnx_filename
+        tokenizer_path = model_dir / "hf" / "tokenizer.json"
+        if not onnx_path.exists() or not tokenizer_path.exists():
+            raise FileNotFoundError(
+                f"4-class punctuation model files not found under {model_dir}. "
+                "Expected punct_4class.onnx and hf/tokenizer.json -- see "
+                "docs/eval/punct_retrain.md for how to (re)produce them "
+                "(scripts/train_punct_ja.py + scripts/export_punct_4class.py)."
+            )
+
+        self.max_chars = max_chars
+        self.tokenizer = Tokenizer.from_file(str(tokenizer_path))
+
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = num_threads
+        so.inter_op_num_threads = 1
+        self.session = ort.InferenceSession(
+            str(onnx_path), sess_options=so, providers=["CPUExecutionProvider"]
+        )
+
+    def restore(self, text: str) -> str:
+        """Insert 、/。/？/！ into `text` and return the punctuated string.
+
+        Purely additive: every character of `text` survives unchanged and
+        only marks are inserted. The model was trained on NFKC-normalised
+        text (ja_text_norm.safe_nfkc); callers feeding raw ASR output with
+        fullwidth digits/Latin or halfwidth katakana should normalise first,
+        as the desktop pipeline and the eval harness do. This method does
+        not normalise for you because that would alter characters and break
+        the additive contract the offsets rely on.
+        """
+        text = text.strip()
+        if not text:
+            return text
+        text = text[: self.max_chars]
+
+        enc = self.tokenizer.encode(text)
+        ids_np = np.array([enc.ids], dtype=np.int64)
+        mask_np = np.ones((1, len(enc.ids)), dtype=np.int64)
+
+        logits = self.session.run(
+            ["logits"], {"input_ids": ids_np, "attention_mask": mask_np}
+        )[0][0]  # -> (seq_len, 5)
+        preds = logits.argmax(-1).tolist()
+
+        return reconstruct_punct4_text(text, enc.offsets, preds)
+
+
+def reconstruct_punct4_text(text: str, offsets, label_ids, labels=PUNCT4_LABELS) -> str:
+    """Pure reconstruction step for PunctuatorJa4Class.restore(): given the
+    plain `text` fed to the tokenizer and parallel per-token (start, end)
+    char-offset / predicted-label-id sequences (as produced by a
+    `tokenizers` fast tokenizer + argmax over the ONNX model's logits),
+    insert the predicted marks right after the last character each token
+    covers and return the punctuated string.
+
+    Split out from restore() so this logic (the part that's actually worth
+    unit-testing) can be tested with synthetic offsets/labels, without
+    onnxruntime, `tokenizers`, or the trained model files -- see
+    tests/test_punct_4class.py.
+    """
+    mark_at = [""] * len(text)
+    for (start, end), label_id in zip(offsets, label_ids):
+        if end <= start:
+            continue  # special token (CLS/SEP), offset (0, 0)
+        label = labels[label_id]
+        if label != "O" and end - 1 < len(mark_at):
+            mark_at[end - 1] = label
+
+    out_parts: list[str] = []
+    for i, ch in enumerate(text):
+        out_parts.append(ch)
+        if mark_at[i]:
+            out_parts.append(mark_at[i])
+    return "".join(out_parts)
 
 
 # ------------------------------------------------------------------------

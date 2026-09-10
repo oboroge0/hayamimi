@@ -64,6 +64,7 @@ on — read them for how something was measured and what it showed at the time.
 | [`eval/head_dropout.md`](eval/head_dropout.md) | ja | dated record | How often an utterance loses its opening, measured; the basis for the pre-roll and the retry-on-suspicion split. |
 | [`eval/head_dropout_results.json`](eval/head_dropout_results.json) | — | dated record | That measurement's raw per-clip output, written by `scripts/eval_head_dropout.py`. |
 | [`eval/en_candidates.md`](eval/en_candidates.md) | ja | dated record | Is it worth moving the en route off v3 onto an en-only Parakeet v2? Compares FLEURS/real-speech WER, licensing, and memory; adopts v2 (opt-in, default stays v3). |
+| [`eval/punct_retrain.md`](eval/punct_retrain.md) | en | dated record | A 4-class (+ none) ja punctuation model retrained from scratch (MIT `modernbert-ja-30m` base, ODC-By FineWeb-2 text) — FLEURS ja F1 0.89 vs the shipped model's 0.62, adds ？/！ support, ~10x faster, adopted as an opt-in alternative (default punctuator unchanged). Includes why the first attempt was rejected on licensing, and one set where the shipped model still wins. |
 
 ## Design history
 
