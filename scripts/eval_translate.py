@@ -55,10 +55,18 @@ FLEURS_CONFIG_BY_LANG = {
     "zh": "cmn_hans_cn",
     "ko": "ko_kr",
     "es": "es_419",
+    "en": "en_us",
 }
 
 DEFAULT_N = 50
 DEFAULT_SEED = 0
+DEFAULT_BACKEND = "m2m"
+# Number of CTranslate2 intra-op threads to use per translator during eval.
+# Track B's eval runs share this machine's 6 CPU cores with 5 other tracks'
+# evaluations in parallel -- see docs/eval/translate_candidates.md. This is
+# a benchmarking-time cap only; it does not change scripts/translate_m2m.py's
+# or scripts/translate_ja_en.py's own default (unset -> ctranslate2 default).
+DEFAULT_INTRA_THREADS = 2
 
 
 def _parquet_url(config: str, split: str) -> str:
@@ -110,18 +118,31 @@ def build_pairs(target_lang: str, n: int, seed: int = DEFAULT_SEED):
     return [(ja_texts[i], tgt_texts[i]) for i in chosen]
 
 
-def run_eval(target_lang: str, n: int = DEFAULT_N, seed: int = DEFAULT_SEED) -> dict:
-    """Translate n ja->target_lang FLEURS sentences and score against reference chrF."""
+def run_eval(
+    target_lang: str,
+    n: int = DEFAULT_N,
+    seed: int = DEFAULT_SEED,
+    backend: str = DEFAULT_BACKEND,
+    intra_threads: int = DEFAULT_INTRA_THREADS,
+) -> dict:
+    """Translate n ja->target_lang FLEURS sentences and score against reference chrF.
+
+    backend selects the translator implementation via
+    translate_candidates.make_translator() -- "m2m" (the default) is the
+    existing, already-shipped TranslatorM2M and reproduces this script's
+    original behavior/results exactly. Other backends are Track B candidate
+    replacements; see docs/eval/translate_candidates.md.
+    """
     import sacrebleu
 
-    from translate_m2m import TranslatorM2M
+    from translate_candidates import make_translator
 
     pairs = build_pairs(target_lang, n, seed)
     print(f"[{target_lang}] {len(pairs)} ja/{target_lang} FLEURS pairs "
-          f"(split={FLEURS_SPLIT}, seed={seed})", file=sys.stderr)
+          f"(split={FLEURS_SPLIT}, seed={seed}, backend={backend})", file=sys.stderr)
 
     t0 = time.perf_counter()
-    translator = TranslatorM2M(target_lang)
+    translator = make_translator(backend, target_lang, intra_threads=intra_threads)
     load_s = time.perf_counter() - t0
 
     hyps = []
@@ -144,6 +165,7 @@ def run_eval(target_lang: str, n: int = DEFAULT_N, seed: int = DEFAULT_SEED) -> 
 
     return {
         "target_lang": target_lang,
+        "backend": backend,
         "n": len(pairs),
         "load_s": load_s,
         "corpus_chrf": corpus_chrf,
@@ -154,7 +176,8 @@ def run_eval(target_lang: str, n: int = DEFAULT_N, seed: int = DEFAULT_SEED) -> 
 
 def print_report(result: dict) -> None:
     lang = result["target_lang"]
-    print(f"\n=== ja -> {lang}: chrF={result['corpus_chrf']:.2f} "
+    backend = result.get("backend", "?")
+    print(f"\n=== [{backend}] ja -> {lang}: chrF={result['corpus_chrf']:.2f} "
           f"(n={result['n']}, mean {result['mean_ms']:.0f} ms/line, "
           f"model load {result['load_s']:.2f}s) ===")
     for r in result["per_sentence"][:5]:
@@ -172,17 +195,25 @@ def main():
                      help=f"max sentences per target (default {DEFAULT_N})")
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED,
                      help="RNG seed for sampling which FLEURS ids to use")
+    ap.add_argument("--backend", default=DEFAULT_BACKEND,
+                     help="translator backend from translate_candidates.make_translator() "
+                          "(default 'm2m', the already-shipped TranslatorM2M). "
+                          "See docs/eval/translate_candidates.md for the full list "
+                          "(fugumt, m2m, m2m100-1.2b, opus-mt, lmt60).")
+    ap.add_argument("--intra-threads", type=int, default=DEFAULT_INTRA_THREADS,
+                     help=f"ctranslate2 intra_threads per translator (default {DEFAULT_INTRA_THREADS})")
     args = ap.parse_args()
 
     targets = [t.strip() for t in args.targets.split(",") if t.strip()]
     results = {}
     for lang in targets:
-        results[lang] = run_eval(lang, n=args.n, seed=args.seed)
+        results[lang] = run_eval(lang, n=args.n, seed=args.seed, backend=args.backend,
+                                  intra_threads=args.intra_threads)
         print_report(results[lang])
 
     print("\n=== Summary ===")
     for lang, r in results.items():
-        print(f"{lang}: chrF={r['corpus_chrf']:.2f}  n={r['n']}  mean={r['mean_ms']:.0f} ms/line")
+        print(f"[{args.backend}] {lang}: chrF={r['corpus_chrf']:.2f}  n={r['n']}  mean={r['mean_ms']:.0f} ms/line")
 
     return results
 

@@ -126,6 +126,7 @@ class TranslatorM2M:
         model_dir: str = _MODEL_DIR,
         device: str = "cpu",
         compute_type: str = "int8",
+        intra_threads: int = 0,
     ):
         if not is_supported_target(target_lang, model_dir):
             raise ValueError(
@@ -153,7 +154,9 @@ class TranslatorM2M:
         sp_path = os.path.join(model_dir, "sentencepiece.model")
         self._sp = spm.SentencePieceProcessor(model_file=sp_path)
 
-        self._translator = ctranslate2.Translator(model_dir, device=device, compute_type=compute_type)
+        self._translator = ctranslate2.Translator(
+            model_dir, device=device, compute_type=compute_type, intra_threads=intra_threads
+        )
 
     def translate(self, text: str) -> str:
         """Translate a single line of Japanese text to self.target_lang.

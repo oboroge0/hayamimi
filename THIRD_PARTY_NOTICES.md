@@ -26,6 +26,9 @@ weights** -- one of them is share-alike, not permissive.
 |---|---|---|---|
 | `mojicast-punct-onnx` (Japanese punctuation restoration) | Base models: Tohoku NLP + bobfromjapan; ONNX export: Mojicast (ishiki-emo) | Apache-2.0 | [tohoku-nlp/bert-base-japanese-char-v3](https://huggingface.co/tohoku-nlp/bert-base-japanese-char-v3), [bobfromjapan/bert_japanese_punctuation](https://huggingface.co/bobfromjapan/bert_japanese_punctuation), export: [ishiki-emo/mojicast-punct-onnx](https://huggingface.co/ishiki-emo/mojicast-punct-onnx) |
 | `mojicast-m2m100-ct2` (M2M-100 418M, ja->zh/ko translation) | Meta AI (base model); CTranslate2 conversion: Mojicast (ishiki-emo) | MIT | [facebook/m2m100_418M](https://huggingface.co/facebook/m2m100_418M), conversion: [ishiki-emo/mojicast-m2m100-ct2](https://huggingface.co/ishiki-emo/mojicast-m2m100-ct2) |
+| `opus-mt-ja-en-src` / `opus-mt-ja-es-src` (translation replacement candidates, `--translate-candidates`, eval only -- not adopted) | Helsinki-NLP | Apache-2.0 | [Helsinki-NLP/opus-mt-ja-en](https://huggingface.co/Helsinki-NLP/opus-mt-ja-en), [Helsinki-NLP/opus-mt-ja-es](https://huggingface.co/Helsinki-NLP/opus-mt-ja-es) -- see `docs/eval/translate_candidates.md` |
+| `m2m100-1.2B-src` (translation replacement candidate, `--translate-candidates`, eval only -- not adopted) | Meta AI | MIT | [facebook/m2m100_1.2B](https://huggingface.co/facebook/m2m100_1.2B) -- see `docs/eval/translate_candidates.md` |
+| `lmt60-0.6b-src` (translation replacement candidate, `--translate-candidates`, eval only -- not adopted) | NiuTrans | Apache-2.0 (Qwen3-based) | [NiuTrans/LMT-60-0.6B](https://huggingface.co/NiuTrans/LMT-60-0.6B) -- see `docs/eval/translate_candidates.md` |
 | `mojicast-fugumt-ja-en-ct2` (FuguMT, ja->en translation) | staka (base model); CTranslate2 conversion: Mojicast (ishiki-emo) | **CC BY-SA 4.0 (share-alike)** | [staka/fugumt-ja-en](https://huggingface.co/staka/fugumt-ja-en), conversion: [ishiki-emo/mojicast-fugumt-ja-en-ct2](https://huggingface.co/ishiki-emo/mojicast-fugumt-ja-en-ct2) |
 
 > **CC BY-SA 4.0 flag:** `mojicast-fugumt-ja-en-ct2` (used for `--translate en`)
@@ -50,6 +53,14 @@ evaluation -- `asr_engine.py`'s routing does not use them.
 |---|---|---|---|
 | `sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8` | NVIDIA NeMo (trained on ReazonSpeech data) | CC-BY-4.0 | packaged by k2-fsa/sherpa-onnx (`asr-models` release) |
 | `sherpa-onnx-zipformer-korean-2024-06-24` | k2-fsa / Zipformer (Korean) | Apache-2.0 | [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models) |
+| `sherpa-onnx-whisper-base` (LID replacement candidate, `--lid-candidates`) | OpenAI | MIT | [openai/whisper](https://github.com/openai/whisper), ONNX export packaged by k2-fsa/sherpa-onnx -- see `docs/eval/lid_candidates.md` |
+
+LID replacement candidates (a)/(d) in `docs/eval/lid_candidates.md` use
+`speechbrain/lang-id-voxlingua107-ecapa` (SpeechBrain, Apache-2.0, trained on
+the VoxLingua107 dataset) via a separate `.venv-train` (torch/speechbrain
+are not runtime dependencies of this project -- see that doc's "再現コマンド"
+section for setup). Downloaded into `.venv-train/pretrained/` (gitignored,
+outside `models/`), not by `download_models.py`.
 
 ## Python runtime dependencies
 

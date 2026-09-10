@@ -3079,6 +3079,234 @@ gatingによる改善は、この実装・このモデルでは再現しなか�
    このループでは追わない。将来この方向を再開するなら、清書グループの
    単位設計（GROUP_GAP_S/GROUP_MAX_S）自体の見直しから始める必要がある。
 
+## 21. Track F: 専用OSD（重複発話検出）モデル調査とDER計測 — 不採用（専用モデルは未取得・代替の疑似OSDも§20と同じ天井）
+
+本トラックは**調査・計測のみ**。`scripts/diarize.py`/`scripts/realtime_transcribe.py`
+への統合は行っていない。§20が最後に開いたまま残した論点
+——「専用に学習されたOSDモデル/ヘッドなら§20の逆効果を回避できるのでは
+ないか」——を、実際にモデルを取得・計測することで検証する。
+
+### 背景
+
+§20（Round 9 Experiment B）は、§16のpowerset直接デコードに単純な
+信頼度ゲート（pair classの事後確率が閾値未満ならdominant single
+speakerへ降格）をretrofitし、閾値を上げるほど正味寄与が単調に悪化する
+（-0.6pt→+0.5pt、pyannote）という、文献（Bredin et al.）の逆方向の
+結果を得た。§20の診断は「同じpowersetヘッドの生の事後確率は、
+overlap検出の閾値化に転用できるほど『自信度＝正しさ』という関係に
+なっていない」——真のoverlapフレームでも事後確率が低め・拡散気味に
+なりやすいため、と結論していた。本トラックはこの結論を2方向から
+検証する: (a)(c) 実際に専用OSDモデルを持ってこられるか、(b) 同じ
+ヘッドの出力に§20より重い後処理（時間方向の文脈と話者ごとの結合条件）
+を足せば§20の天井を超えられるか。
+
+### 候補 (a): pyannote/overlapped-speech-detection
+
+Hugging Face `pyannote/overlapped-speech-detection`（pyannote.audio 2.1の
+専用OSDパイプライン）を取得しようとしたが、`gh api`相当の
+`https://huggingface.co/api/models/pyannote/overlapped-speech-detection`
+が `"gated":"auto"` を返す——利用規約への同意とHugging Faceアカウントの
+トークンが必須で、この環境にはどちらも無い（`HF_TOKEN`等の環境変数も
+未設定）。実際に `config.yaml` を無認証で取得しようとすると
+`Access to model ... is restricted. You must have access to it and be
+authenticated to access it.` で拒否される。関連する
+`pyannote/speaker-diarization-community-1`（2024年公開、CC-BY-4.0で
+OSDを含む）、`pyannote/segmentation`（3.0ではない旧版）も同じく
+`"gated":"auto"`。ユーザーのHugging Faceアカウントでの認証・利用規約
+同意が必要な操作であり、本トラックの権限範囲（調査・計測、
+非対話環境）では代行できないため、**取得不能として記録**するに留める。
+将来これを取るなら、ユーザー自身がHugging Faceで規約に同意し
+`HF_TOKEN`を発行する必要がある。
+
+### 候補 (c): 2024〜2026年公開モデルの調査
+
+WebSearchで調査した範囲では、ONNX化してonnxruntime CPUで即計測できる
+候補は見つからなかった:
+
+- **3D-Speaker（modelscope）の`--include_overlap`**: 名前は専用OSDに
+  見えるが、実体は別モデルではない。`3D-Speaker`リポジトリの
+  `egs/3dspeaker/speaker-diarization/README.md`を直接確認したところ、
+  「The pyannote/segmentation-3.0 is used as a overlapping speech
+  detection module」——**本トラックが§16・§20で既に使っている
+  `models/sherpa-onnx-pyannote-segmentation-3-0/model.onnx`と同一モデル**
+  であり、しかもHugging Face側の同意・トークンが要る点も同じ。
+  新しい候補ではないため計測対象から除外した。
+- **NVIDIA NeMo Sortformer**（`nvidia/diar_streaming_sortformer_4spk-v2`、
+  2024〜2025年公開）: end-to-endでoverlapを直接扱う診断結果を持ち、
+  Hugging Face上は`"gated":false`・`"license":"cc-by-4.0"`——ライセンス
+  面では基準3を満たす。しかしONNXエクスポートは上流で現在壊れている
+  （GitHub Issue `NVIDIA-NeMo/NeMo#15077`「ONNX Export Fails for
+  Streaming Sortformer Model」、`sortformer_modules.py`内の動的
+  スライシングがONNXの静的グラフ要件と非互換）。この環境で
+  `nemo_toolkit`＋`torch`一式（`.venv-train`が必要になる規模）を入れて
+  自前でONNX化を試みる分岐もあり得るが、上流Issueが未解決の既知の
+  ブロッカーである以上、まず試して失敗を確認するより先に**工数見積もり
+  だけ記録して実施しない**方針とした（動的スライシングをONNX対応の
+  静的形状コードへ書き換える改修が必要——見積もり: 中〜大、モデルの
+  内部構造の把握とNeMo側へのアップストリーム貢献相当の作業）。
+- **WavLMベースのspeaker-aware progressive OSD**（Sun et al.,
+  "Towards Robust Overlapping Speech Detection: A Speaker-Aware
+  Progressive Approach Using WavLM", arXiv:2505.23207, 2025年5月）:
+  DIHARD3/AMI等でOSD専用に学習されたモデルだが、コード・重みとも
+  未公開（arXivのアブストラクト・PDFのみで、リポジトリへのリンクが
+  見当たらない）。**学習が必要な選択肢**に該当し、タスクの指示通り
+  工数見積もりのみ記録する: WavLM-baseのfine-tuningとして、
+  AMI+DIHARD3相当のOSDラベル付きデータの用意、学習パイプライン構築、
+  学習時間（WavLM-baseでGPU数時間〜1日程度が一般的）を要し、
+  hayamimiの実行基盤（CPU、onnxruntime）に載せるには学習後さらに
+  ONNX変換・量子化の追加工程が要る——見積もり: 大（複数日〜週オーダー）。
+
+結論: (a)(c)とも「今すぐ計測できる専用OSDモデル」は得られなかった。
+残る検証手段は(b)のみ。
+
+### 候補 (b): 疑似OSD（同じpowersetヘッド＋重い後処理）
+
+§20との違いを明確にするため、新規`scripts/eval_diar_osd.py`
+（`pseudo_osd_decode()`）に3つのゲートを実装した。いずれも
+**§20にはなかった時間方向の文脈・話者ごとの結合条件**である:
+
+1. **結合周辺確率フロア（joint marginal floor）**: §20はpair class
+   自身の事後確率だけを閾値化していた。本ゲートは、pair classが
+   argmaxのフレームについて、そのペアを構成する**2人の話者それぞれの
+   周辺確率**（その話者を含む全powersetクラスの確率和——単独クラス＋
+   両方のペアクラス）が両方ともフロアを超えることを要求する。
+   pair class自身の確率だけでは「両者ともそれなりに確信があるが
+   均等」なのか「片方だけが確信されていて、もう片方は消去法で
+   選ばれている」なのかを区別できない——後者を弾く。
+2. **ヒステリシス（2閾値のシュミットトリガ）**: フレーム列に沿って、
+   overlap-armed状態に入るには`hi_thresh`以上、抜けるには`lo_thresh`
+   未満（`lo_thresh <= hi_thresh`）を要求する。§20の単一フレーム
+   閾値は閾値付近でフレームごとに判定がフリップしうるが、本ゲートは
+   一度armedになれば`lo_thresh`まで事後確率が下がるまで判定を保持する
+   ——「重複発話は16.9msごとに点滅しない」という物理的な前提に
+   合わせた設計。
+3. **最小連続長（min run-length）**: 上記2つを通過したoverlap判定でも、
+   連続フレーム数が`min_run_frames`未満の区間はdominant single
+   speakerへ差し戻す。`activity_to_segments()`の`min_duration_on`が
+   出力ターン全般に課している床を、overlap区間そのものに前倒しで
+   適用する形。
+
+3ゲートいずれも「argmaxがpair classを選んだフレームを**降格させる
+方向にしか働かない**」——§16の無条件argmaxを新たにoverlapと判定する
+ことはない。`hi_thresh=lo_thresh=0.0`・`joint_floor=0.0`・
+`min_run_frames=1`にすると全ゲートが無条件で通過し、§16の無条件argmax
+と数学的に一致する（`tests/test_diar_osd.py`の
+`test_pseudo_osd_degenerates_to_plain_argmax`で保証、他7件は各ゲートの
+単体動作を検証）。
+
+**§16との数値的な整合性確認**: `--mode none`（`eval_diar_overlap.py`の
+`powerset_decode()`を本ファイル内で再実装したもの、`pseudo_osd_decode`
+は使わない）でAMI 5会議・閾値0.65を再実行したところ、5会議全ての
+DER・miss/fa/confusionが§16の表と完全一致した（平均
+overlap-on 14.6%/12.1%、overlap-stripped 15.2%/12.5%、pyannote/
+simpleder）。以降の`--mode pseudo`の数値はこの再現済みbaselineとの
+差分として読める。
+
+### 測定
+
+AMI 5会議、collar=0.25s、クラスタリング閾値0.65（§16・§20と同じ）。
+**このマシンは他5トラックと6コードCPUを共有中のため、`--threads 2`に
+制限して計測した——本節のRTFは暫定値（並列実行中の計測）**。
+
+4つの設定を計測した（`hi/lo`はpair class自身の事後確率、`joint`は
+結合周辺確率フロア、`run`は最小連続フレーム数≒`run×16.875ms`）:
+
+| 設定 | hi/lo | joint | run | overlap-on DER (pyannote/simple) | overlap-stripped DER (pyannote/simple) | 正味寄与（on-stripped） |
+|---|---|---|---|---|---|---|
+| baseline（§16再現、`--mode none`） | — | — | — | 14.6%/12.1% | 15.2%/12.5% | -0.6pt/-0.3pt |
+| P3（構造のみ、確信度ゲート実質無効） | 0.0/0.0 | 0.20 | 4 | 14.7%/12.1% | 15.2%/12.5% | -0.6pt/-0.4pt |
+| P1（穏やか） | 0.5/0.35 | 0.15 | 2 | 14.6%/12.0% | 15.2%/12.5% | **-0.7pt/-0.5pt** |
+| P2（§20の閾値0.7相当＋構造） | 0.7/0.5 | 0.15 | 3 | 14.6%/12.1% | 14.9%/12.2% | -0.4pt/-0.2pt |
+| P4（積極的） | 0.8/0.6 | 0.25 | 5 | 14.8%/12.3% | 14.9%/12.2% | -0.1pt/+0.1pt |
+
+**§20と同じ単調悪化パターンが、時間方向の文脈と結合条件を足しても
+消えなかった**。`hi_thresh`を0.5→0.7→0.8と上げるにつれ正味寄与は
+-0.7pt→-0.4pt→-0.1pt（pyannote）と単調に悪化し、§20の
+-0.6pt→-0.1pt→+0.1pt→+0.5pt（pair_gateなし→0.7→0.8→0.9）と
+同じ形の曲線を描く。構造のみ（P3、確信度ゲートを実質無効化し
+joint floor・min-run-lengthだけを効かせた設定）はbaselineとほぼ
+同一（-0.6pt→-0.6pt/-0.4pt）——大半のtrue overlapフレームは
+pair class自身の事後確率が既に高いため、確信度ゲートを介さない
+構造だけでは弾かれるフレームがほとんど無く、ゲートとして機能して
+いない。最良のP1（-0.7pt/-0.5pt）もbaseline（-0.6pt/-0.3pt）との
+差は0.1〜0.2ptで、§16が指摘した「run間ノイズ床」の範囲内にある。
+
+**P1（最良設定）の会議別内訳**、baseline（`--mode none`）との
+正味寄与の比較:
+
+| meeting | baseline 正味寄与 | P1 正味寄与 | 差分 |
+|---|---|---|---|
+| ES2011a | -2.7pt | -2.4pt | +0.3pt（悪化） |
+| IS1008a | +1.2pt | +0.6pt | -0.6pt（改善、ただし依然として有害） |
+| ES2004a | -2.6pt | -2.2pt | +0.4pt（悪化） |
+| IS1009a | +1.2pt | +0.6pt | -0.6pt（改善、ただし依然として有害） |
+| TS3003a | 0.0pt | 0.0pt | 変化なし |
+
+P1はoverlap比率の低い2会議（IS1008a・IS1009a、§16で「overlap出力が
+純粋に害」と指摘した側）の悪化幅を半分程度に抑えるが、その代償として
+overlap比率の高い2会議（ES2011a・ES2004a、§16で正味寄与が最も大きく
+プラスだった側）の利得を削っている——5会議中「悪化なし」なのは
+IS1008a・IS1009a・TS3003aの3会議のみで、基準2（4会議以上で悪化なし）
+を満たさない。
+
+### 判定
+
+**不採用**。基準1（正味寄与-1.5pt以上）は最良設定（P1、-0.7pt/-0.5pt）
+でも大きく未達——§20の-0.6ptからの改善幅は0.1〜0.2ptで、基準が
+要求する規模の1割にも届かない。基準2（5会議中4会議以上で悪化なし）
+も満たさない（P1は3/5）。基準3（ライセンス・ONNX可否）は
+そもそも専用モデルを取得できていないため評価不能。基準4（追加RTF）
+は本トラックでは問題にならなかった（`--threads 2`でも全設定
+RTF 0.017〜0.035、seg+embed込みで§16と同オーダー）が、基準1・2が
+未達である以上意味を持たない。
+
+**§20の結論がより強く裏付けられた**: 「専用に学習されたOSDモデル/
+ヘッドなら§20の逆効果を回避できるのではないか」という問いに対し、
+同じpowersetヘッドの出力に時間方向の文脈（ヒステリシス）と話者ごとの
+結合条件（joint floor）、最小持続時間（min-run-length）を足しても
+天井は動かなかった。これは、問題が「単一フレームの閾値判定が粗い」
+という後処理側の設計の甘さではなく、**§20が既に診断した通りheadその
+ものの性質**（overlapフレームの事後確率分布が、真偽を問わず低め・
+拡散気味になる）に起因することの追加の裏付けと解釈する。この天井を
+動かすには(a)(c)で調査した「専用に学習されたOSDモデル/ヘッド」が
+本当に必要——(a)はHugging Faceの認証待ち、(c)は公開モデルなし
+（Sortformerはライセンス基準は満たすがONNXエクスポートが上流で
+壊れている、WavLM論文は重み未公開）という状態で止まっている。
+
+### 進める場合の統合設計案とUX判断項目（今回は「進める」基準を
+満たさないため、参考として記録するのみ）
+
+基準を満たす専用OSDが将来手に入った場合の統合設計は、§16・§20の
+「本番へ入れるとしたら何が要るか」と同一の課題を引き継ぐ:
+
+- 配線先は清書パス（`Refiner._emit_turns()`）で、§16指摘の
+  「清書グループ単位に切り戻すと利得の大半（一括クラスタリング分）
+  が消える」制約はOSDの中身が変わっても変わらない。専用OSDの
+  純粋な効果を測るには清書グループ粒度での再測定が別途必要。
+- 出力側のUX（同時に2人の行をどう出すか）は§16で据え置いたまま
+  未設計。DER以前にこの決定が先——という§16・§20の指摘は本トラック
+  でも変わらない。
+- (a)を取るならユーザーのHugging Faceアカウントでの規約同意と
+  `HF_TOKEN`発行が前提。(c)のSortformerを取るならNeMo側のONNX
+  エクスポート修正（上流Issue解決待ちか自前パッチ）が前提。
+  いずれも本トラックの範囲（調査・計測）を超える。
+
+### 残課題
+
+- 専用OSDモデル自体を一度も計測できていない——本トラックが検証した
+  のは「同じpowersetヘッドへの後処理をどれだけ凝らしても§20の天井は
+  動かない」ことであり、「専用モデルなら動くはず」という§20の仮説
+  自体はまだ反証も実証もされていない。
+- `pseudo_osd_decode()`のジョイントフロア・ヒステリシス・
+  最小連続長は独立にスイープしていない（本節の4設定は3パラメータを
+  同時に動かした組）。個別の寄与分解は行っていない——ただしP3
+  （確信度ゲートのみ無効化）がbaselineとほぼ同一だったことから、
+  joint floor・min-run-lengthだけでは効果が乏しく、確信度ゲート
+  （`hi_thresh`）が結果を支配していることは分かる。
+- Sortformerの自前ONNXエクスポート修正は本トラックでは着手していない
+  （前述の通り工数見積もりに留めた）。将来これを試すなら、まず
+  `NVIDIA-NeMo/NeMo#15077`の解決状況を確認するところから。
+
 ## 出典
 
 - [Speaker Diarization — sherpa-onnx docs](https://k2-fsa.github.io/sherpa/onnx/speaker-diarization/index.html)
@@ -3104,3 +3332,18 @@ gatingによる改善は、この実装・このモデルでは再現しなか�
 - リポジトリ内: `scripts/speaker_id.py`, `scripts/realtime_transcribe.py`,
   `scripts/download_models.py`, `README.md`, `docs/design/goals.md`,
   `docs/results/benchmarks.md`
+- [pyannote/overlapped-speech-detection (Hugging Face)](https://huggingface.co/pyannote/overlapped-speech-detection) /
+  [pyannote/speaker-diarization-community-1 (Hugging Face)](https://huggingface.co/pyannote/speaker-diarization-community-1) /
+  [pyannote/segmentation (Hugging Face)](https://huggingface.co/pyannote/segmentation) — Track F候補(a)、
+  いずれも`huggingface.co/api/models/...`が`"gated":"auto"`を返すことを直接確認（本調査、認証トークン無し）
+- [modelscope/3D-Speaker: speaker-diarization recipe README](https://github.com/modelscope/3D-Speaker/blob/main/egs/3dspeaker/speaker-diarization/README.md) —
+  Track F候補(c)、`--include_overlap`が`pyannote/segmentation-3.0`（本ドキュメント既出のモデルと同一）を
+  呼んでいるだけであることを本文で直接確認
+- [nvidia/diar_streaming_sortformer_4spk-v2 (Hugging Face)](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2)（`"gated":false`,
+  `"license":"cc-by-4.0"`を`huggingface.co/api/models/...`で直接確認） /
+  [NVIDIA-NeMo/NeMo Issue #15077: ONNX Export Fails for Streaming Sortformer Model](https://github.com/NVIDIA-NeMo/NeMo/issues/15077) —
+  Track F候補(c)、ONNXエクスポートが上流で壊れている根拠
+- Z. Sun, L. Zhang, Q. Wang, P. Zhou, L. Xie, "Towards Robust Overlapping
+  Speech Detection: A Speaker-Aware Progressive Approach Using WavLM"
+  (arXiv:2505.23207, 2025) — Track F候補(c)、コード・重み未公開の
+  WavLMベースOSD専用モデル
