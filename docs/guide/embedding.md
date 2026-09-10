@@ -97,9 +97,13 @@ unsupported translation target) answers `400` with that setter's own error
 message rather than applying a partial or silently-clamped change. VAD
 sensitivity is the one key that can't take effect immediately: sherpa-onnx
 has no in-place setter for it, so a `vad` change is deferred until the
-detector isn't in the middle of a speech segment, then it rebuilds -- a
-change requested while someone is talking takes effect once they pause, not
-at the moment of the request.
+detector isn't in the middle of a speech segment and every completed segment
+has been drained, then it rebuilds. Requests waiting for that boundary compose
+field by field: setting `threshold`, then only `min_silence`, keeps both changes;
+the latest explicit value wins for a repeated field. An empty or all-null VAD
+update does nothing. `GET /config` reports the active settings until the rebuild
+succeeds. Rebuilding preserves absolute segment positions, so the audio history
+and refine pass continue to refer to the same samples.
 
 `POST /reset` clears the running session's speaker centroids, sticky/pending
 language state, and refine/session statistics, without reloading any model

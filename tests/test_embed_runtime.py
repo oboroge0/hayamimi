@@ -11,6 +11,7 @@ RoutedASR-setter section, which constructs a real (but preload=False,
 warmup=False) engine and so needs at least the whisper-tiny LID model
 present on disk -- see `needs_lid_model` below, matching the skip pattern
 tests/test_asr_segment.py already uses for its own model-dependent tests.
+The real-speech LiveVad rebuild test additionally needs silero_vad.onnx.
 """
 import http.client
 import json
@@ -18,6 +19,7 @@ import os
 import sys
 import threading
 import time
+import types
 
 import numpy as np
 import pytest
@@ -521,12 +523,31 @@ class _FakeVad:
         self.max_speech = max_speech
         self.threshold = threshold
         self.speech = False
+        self.queued = False
+        self.front_segment = types.SimpleNamespace(
+            start=0, samples=np.zeros(0, dtype=np.float32))
+        self.current_segment_value = types.SimpleNamespace(
+            start=0, samples=np.zeros(0, dtype=np.float32))
 
     def is_speech_detected(self):
         return self.speech
 
     def accept_waveform(self, chunk):
         pass
+
+    def empty(self):
+        return not self.queued
+
+    @property
+    def front(self):
+        return self.front_segment
+
+    @property
+    def current_segment(self):
+        return self.current_segment_value
+
+    def pop(self):
+        self.queued = False
 
 
 @pytest.fixture
@@ -579,6 +600,187 @@ def test_live_vad_set_sensitivity_partial_args_keep_other_values(fake_build_vad)
     live.accept_waveform(np.zeros(512, dtype=np.float32))
     params = live.current_params()
     assert params == {"threshold": 0.5, "min_silence": 0.5, "max_speech": 12.0}
+
+
+def test_live_vad_composes_pending_updates_and_keeps_last_explicit_value(fake_build_vad):
+    live = rt.LiveVad()
+    live.set_sensitivity(threshold=0.7)
+    live.set_sensitivity(min_silence=0.6)
+    live.set_sensitivity(threshold=0.8, min_silence=None)
+    live.set_sensitivity()  # an empty/null request must not undo pending changes
+    assert live.current_params() == {
+        "threshold": 0.5, "min_silence": 0.35, "max_speech": 12.0,
+    }
+
+    live.accept_waveform(np.zeros(512, dtype=np.float32))
+
+    assert live.current_params() == {
+        "threshold": 0.8, "min_silence": 0.6, "max_speech": 12.0,
+    }
+    assert len(fake_build_vad) == 2
+
+
+def test_live_vad_empty_update_does_not_rebuild_detector(fake_build_vad):
+    live = rt.LiveVad()
+    live.set_sensitivity(threshold=None, min_silence=None, max_speech=None)
+    live.accept_waveform(np.zeros(512, dtype=np.float32))
+    assert len(fake_build_vad) == 1
+
+
+def test_live_vad_waits_for_completed_segment_to_be_drained(fake_build_vad):
+    live = rt.LiveVad()
+    first = fake_build_vad[-1]
+    samples = np.ones(256, dtype=np.float32)
+    first.front_segment = types.SimpleNamespace(start=64, samples=samples)
+    first.queued = True
+    live.set_sensitivity(threshold=0.8)
+
+    live.accept_waveform(np.zeros(512, dtype=np.float32))
+
+    assert len(fake_build_vad) == 1
+    assert not live.empty()
+    assert live.front.start == 64
+    np.testing.assert_array_equal(live.front.samples, samples)
+    live.pop()
+    live.accept_waveform(np.zeros(512, dtype=np.float32))
+    assert len(fake_build_vad) == 2
+    assert live.current_params()["threshold"] == 0.8
+
+
+def test_live_vad_rebuild_preserves_absolute_segment_positions(fake_build_vad):
+    live = rt.LiveVad()
+    live.accept_waveform(np.zeros(512, dtype=np.float32))
+    live.set_sensitivity(threshold=0.7)
+    live.accept_waveform(np.zeros(512, dtype=np.float32))
+    rebuilt = fake_build_vad[-1]
+    samples = np.ones(64, dtype=np.float32)
+    rebuilt.front_segment = types.SimpleNamespace(start=64, samples=samples)
+    rebuilt.current_segment_value = types.SimpleNamespace(start=96, samples=samples)
+
+    saved_segment = live.front
+    assert saved_segment.start == 576
+    assert live.current_segment.start == 608
+    np.testing.assert_array_equal(saved_segment.samples, samples)
+
+    live.set_sensitivity(min_silence=0.6)
+    live.accept_waveform(np.zeros(512, dtype=np.float32))
+    fake_build_vad[-1].front_segment = types.SimpleNamespace(start=32, samples=samples)
+    assert live.front.start == 1056
+    assert saved_segment.start == 576  # an older view keeps its own offset
+
+
+def test_live_vad_failed_rebuild_preserves_active_and_pending_state(fake_build_vad, monkeypatch):
+    live = rt.LiveVad()
+    first = fake_build_vad[-1]
+    factory = rt.build_vad
+    live.accept_waveform(np.zeros(512, dtype=np.float32))
+    live.set_sensitivity(threshold=0.7)
+
+    def fail_build(*args):
+        raise RuntimeError("detector unavailable")
+
+    monkeypatch.setattr(rt, "build_vad", fail_build)
+    with pytest.raises(RuntimeError, match="detector unavailable"):
+        live.accept_waveform(np.zeros(512, dtype=np.float32))
+    assert live.current_params()["threshold"] == 0.5
+    assert live._vad is first
+
+    monkeypatch.setattr(rt, "build_vad", factory)
+    live.set_sensitivity(min_silence=0.6)
+    live.accept_waveform(np.zeros(512, dtype=np.float32))
+    assert live.current_params() == {
+        "threshold": 0.7, "min_silence": 0.6, "max_speech": 12.0,
+    }
+    # The failed accept did not advance the stream's sample clock.
+    assert live.front.start == 512
+
+
+def test_live_vad_rebuild_keeps_stream_preroll_and_refiner_coordinates(monkeypatch):
+    built = []
+
+    class Detector(_FakeVad):
+        def accept_waveform(self, chunk):
+            if len(built) > 1:
+                self.front_segment = types.SimpleNamespace(start=0, samples=chunk.copy())
+                self.queued = True
+
+    def factory(min_silence, max_speech, threshold):
+        detector = Detector(min_silence, max_speech, threshold)
+        built.append(detector)
+        return detector
+
+    class Asr:
+        def transcribe(self, samples, sample_rate, **kwargs):
+            np.testing.assert_array_equal(samples, np.concatenate([before, after]))
+            return {"text": "test", "lang": "en", "lid_ms": 0, "decode_ms": 0}
+
+    class Refiner:
+        def __init__(self):
+            self.spans = []
+            self.times = []
+
+        def add_span(self, start, end, *args):
+            self.spans.append((start, end))
+
+        def maybe_refine(self, now, **kwargs):
+            self.times.append(now)
+
+    monkeypatch.setattr(rt, "build_vad", factory)
+    live = rt.LiveVad()
+    before = np.full(512, 0.1, dtype=np.float32)
+    after = np.full(512, 0.2, dtype=np.float32)
+
+    def chunks():
+        yield before
+        live.set_sensitivity(threshold=0.7)
+        yield after
+
+    history = rt.AudioHistory(rt.SAMPLE_RATE)
+    refiner = Refiner()
+    stats = rt.SessionStats()
+    rt.run_stream(chunks(), live, rt.SAMPLE_RATE, Asr(), stats,
+                  rt.PartialPrinter(enabled=False), refiner=refiner, history=history)
+    assert refiner.spans == [(512, 1024)]
+    assert refiner.times == [512, 1024]
+    assert history.last_seg_end == 1024
+    assert stats.segments == 1
+
+
+@pytest.mark.skipif(not os.path.exists(rt.VAD_MODEL), reason="Silero VAD model not installed")
+def test_live_vad_real_speech_matches_fresh_detector_after_rebuild():
+    path = os.path.join(os.path.dirname(__file__), "golden", "ja", "ja_014.wav")
+    samples, sr = rt.read_wave(path)
+    audio = np.concatenate([np.zeros(sr, dtype=np.float32), samples,
+                            np.zeros(sr, dtype=np.float32)])
+
+    def feed(detector):
+        segments = []
+        accepted = 0
+        for chunk in rt.wav_chunks(audio, sr, realtime=False):
+            detector.accept_waveform(chunk)
+            accepted += len(chunk)
+            while not detector.empty():
+                segment = detector.front
+                segments.append((segment.start, np.asarray(segment.samples).copy()))
+                detector.pop()
+        assert not detector.is_speech_detected()
+        assert segments, "the real fixture must produce speech segments"
+        return accepted, segments
+
+    live = rt.LiveVad()
+    offset, first = feed(live)
+    _, reference_first = feed(rt.build_vad())
+    live.set_sensitivity(threshold=0.7)
+    _, second = feed(live)
+    _, reference_second = feed(rt.build_vad(vad_threshold=0.7))
+
+    for actual, reference, shift in ((first, reference_first, 0),
+                                      (second, reference_second, offset)):
+        assert len(actual) == len(reference)
+        for (start, frames), (ref_start, ref_frames) in zip(actual, reference):
+            assert start == ref_start + shift
+            np.testing.assert_array_equal(frames, ref_frames)
+    assert live.current_params()["threshold"] == 0.7
 
 
 # --- LiveVad.set_sensitivity: validation (GitHub issue #29 review round 1) --

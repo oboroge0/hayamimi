@@ -107,8 +107,9 @@ class LiveVad:
     utterance, so a set_sensitivity() request is only actually applied at
     the next safe point: the next accept_waveform() call (one per audio
     chunk, called from run_stream()'s loop) that finds the detector NOT
-    currently inside a detected speech segment. A request made mid-speech
-    just waits until that segment closes.
+    currently inside a detected speech segment and has no completed segments
+    waiting to be drained. A request made mid-speech waits until that segment
+    closes and is consumed. Multiple pending requests compose field by field.
 
     Implements the subset of sherpa_onnx.VoiceActivityDetector's API that
     run_stream()/drain_segments() actually use, so `LiveVad(...)` is a
@@ -123,18 +124,24 @@ class LiveVad:
         self._vad = build_vad(min_silence, max_speech, vad_threshold)
         self._pending: dict | None = None  # requested-but-not-yet-applied params
         self._lock = threading.Lock()
+        # Each new detector starts at sample zero. Translate its segment
+        # positions to the continuous timeline used by AudioHistory/Refiner.
+        self._accepted_samples = 0
+        self._detector_offset = 0
 
     def current_params(self) -> dict:
         """Currently ACTIVE sensitivity (not a pending, not-yet-applied
         request -- see the class docstring), for GET /config."""
-        return {"threshold": self._threshold, "min_silence": self._min_silence,
-                "max_speech": self._max_speech}
+        with self._lock:
+            return {"threshold": self._threshold, "min_silence": self._min_silence,
+                    "max_speech": self._max_speech}
 
     def set_sensitivity(self, threshold: float | None = None,
                         min_silence: float | None = None,
                         max_speech: float | None = None) -> None:
         """Request new sensitivity parameters. Any argument left as None
-        keeps its current value (including an explicit JSON `null` coming
+        keeps its pending value, or current value if no update is pending
+        (including an explicit JSON `null` coming
         through POST /config -- payload.get() can't tell "key absent" from
         "key present but null" apart, and both mean "no change" here,
         which is what a caller sending a partial `vad` object expects).
@@ -149,6 +156,8 @@ class LiveVad:
         to build_vad() -- would crash the DECODE thread arbitrarily long
         after the HTTP request that caused it had already returned 200.
         """
+        if threshold is None and min_silence is None and max_speech is None:
+            return
         if threshold is not None:
             _require_number("threshold", threshold)
             if not (0 < threshold <= 1):
@@ -162,24 +171,35 @@ class LiveVad:
             if not (max_speech > 0):
                 raise ValueError(f"max_speech must be > 0, got {max_speech!r}")
         with self._lock:
+            base = self._pending or {
+                "threshold": self._threshold,
+                "min_silence": self._min_silence,
+                "max_speech": self._max_speech,
+            }
             self._pending = {
-                "threshold": self._threshold if threshold is None else threshold,
-                "min_silence": self._min_silence if min_silence is None else min_silence,
-                "max_speech": self._max_speech if max_speech is None else max_speech,
+                "threshold": base["threshold"] if threshold is None else threshold,
+                "min_silence": base["min_silence"] if min_silence is None else min_silence,
+                "max_speech": base["max_speech"] if max_speech is None else max_speech,
             }
 
     def _maybe_apply_pending(self) -> None:
         with self._lock:
             if self._pending is None:
                 return
-            if self._vad.is_speech_detected():
-                return  # mid-speech: wait for this segment to close
+            if self._vad.is_speech_detected() or not self._vad.empty():
+                return  # keep in-progress and completed-but-undrained audio
             params = self._pending
+            # Build before publishing active settings or consuming the request.
+            # A failed build leaves both intact. Holding the setter's lock also
+            # ensures concurrent partial updates see one consistent base.
+            new_vad = build_vad(params["min_silence"], params["max_speech"],
+                                params["threshold"])
+            self._vad = new_vad
+            self._threshold = params["threshold"]
+            self._min_silence = params["min_silence"]
+            self._max_speech = params["max_speech"]
+            self._detector_offset = self._accepted_samples
             self._pending = None
-        self._threshold = params["threshold"]
-        self._min_silence = params["min_silence"]
-        self._max_speech = params["max_speech"]
-        self._vad = build_vad(self._min_silence, self._max_speech, self._threshold)
 
     # --- the subset of sherpa_onnx.VoiceActivityDetector's API used by
     # run_stream()/drain_segments() ---
@@ -187,13 +207,14 @@ class LiveVad:
     def accept_waveform(self, chunk) -> None:
         self._maybe_apply_pending()  # checked once per chunk: the "next safe point"
         self._vad.accept_waveform(chunk)
+        self._accepted_samples += len(chunk)
 
     def empty(self) -> bool:
         return self._vad.empty()
 
     @property
     def front(self):
-        return self._vad.front
+        return _OffsetVadSegment(self._vad.front, self._detector_offset)
 
     def pop(self):
         return self._vad.pop()
@@ -203,10 +224,25 @@ class LiveVad:
 
     @property
     def current_segment(self):
-        return self._vad.current_segment
+        return _OffsetVadSegment(self._vad.current_segment, self._detector_offset)
 
     def flush(self):
         return self._vad.flush()
+
+
+class _OffsetVadSegment:
+    """Read-only segment view on the stream's continuous sample timeline."""
+
+    def __init__(self, segment, offset: int):
+        self._segment = segment
+        self._offset = offset
+
+    @property
+    def start(self) -> int:
+        return int(self._segment.start) + self._offset
+
+    def __getattr__(self, name):
+        return getattr(self._segment, name)
 
 
 def _require_number(name: str, value) -> None:
