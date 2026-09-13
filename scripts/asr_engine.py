@@ -125,6 +125,23 @@ def resolve_en_tier(requested: str) -> str:
 PUNCT_MODELS = ("bert", "4class")
 
 
+PUNCT4_INT8_FILENAME = "quantized_ort/punct_4class.int8.onnx"
+PUNCT4_FP32_FILENAME = "punct_4class.onnx"
+
+
+def _punct4_onnx_filename(model_dir) -> str:
+    """Pick the 4-class ONNX file the engine loads: int8 when present, else fp32.
+
+    Pure path check (no onnxruntime) so it is unit-testable; the int8 export
+    is what download_models.py --punct-4class ships and what the README quotes
+    (37MB, 3.4ms/line), so it must be the default when both files exist.
+    """
+    import os
+    if os.path.exists(os.path.join(str(model_dir), PUNCT4_INT8_FILENAME)):
+        return PUNCT4_INT8_FILENAME
+    return PUNCT4_FP32_FILENAME
+
+
 def resolve_punct_model(requested: str) -> str:
     """Validate a --punct-model / RoutedASR(punct_model=...) value.
 
@@ -1040,9 +1057,14 @@ class RoutedASR:
                                "ms": None})
                     if self._punct_model == "4class":
                         try:
-                            from punct_ja import PunctuatorJa4Class
+                            from punct_ja import (PUNCT4_DEFAULT_MODEL_DIR,
+                                                  PunctuatorJa4Class)
 
-                            self._punct = PunctuatorJa4Class()
+                            # int8 first: same F1 as fp32 within 0.001 on FLEURS
+                            # ja and 4x smaller (docs/eval/punct_retrain.md);
+                            # fall back to the fp32 export if only that is present.
+                            self._punct = PunctuatorJa4Class(
+                                onnx_filename=_punct4_onnx_filename(PUNCT4_DEFAULT_MODEL_DIR))
                         except Exception as exc:
                             message = (f"4-class punctuation model unavailable ({exc}); "
                                        f"falling back to the default bert punctuator")

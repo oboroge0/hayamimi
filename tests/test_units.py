@@ -1360,3 +1360,11 @@ def test_tier_fallback_table_only_names_known_tiers():
         assert opt_in in asr_engine._BUILDERS
         for d in defaults:
             assert d in asr_engine._BUILDERS
+
+
+def test_punct4_prefers_int8_when_present(tmp_path):
+    (tmp_path / "punct_4class.onnx").write_bytes(b"x")
+    assert asr_engine._punct4_onnx_filename(tmp_path) == asr_engine.PUNCT4_FP32_FILENAME
+    (tmp_path / "quantized_ort").mkdir()
+    (tmp_path / "quantized_ort" / "punct_4class.int8.onnx").write_bytes(b"x")
+    assert asr_engine._punct4_onnx_filename(tmp_path) == asr_engine.PUNCT4_INT8_FILENAME
