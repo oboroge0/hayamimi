@@ -39,6 +39,7 @@ Whisper系・クラウドSTT API・他のローカルモデルとの比較（hay
 | 構造化イベント + 実行時設定 | パイプラインの各段階（確定文、翻訳、モデル読み込み、警告、セッション集計...）が`EventHub`に発行され、組み込み先アプリはこれを直接listenできる。`--serve`時はさらに`GET`/`POST /config`と`POST /reset`が使え、プロセスを再起動せずに言語・翻訳・VAD設定の変更やセッションのリセットができる（詳細は後述の「組み込み: 実行時制御と構造化イベント」参照） |
 | OBSオーバーレイ+ダッシュボード | `--serve`でローカルHTTPサーバーを起動、ブラウザソースオーバーレイとライブダッシュボードを提供 |
 | ネットワーク音声入力 | `--input ws`でWebSocket経由のマイク音声（スマホ、ESP32/スタックチャン等）を受け付け、`--serve`のダッシュボード/オーバーレイにもそのまま流れる |
+| スピーカーループバック入力 | `--input speaker`でPC内部のスピーカー（システム音声出力）をWASAPIループバックで文字起こし（Windows専用、Stereo Mixの有効化は不要）。`--input mix`はマイクとスピーカー音声を合成した1本のストリームとして文字起こし（会議の文字起こしなどに） |
 | メモリ上限管理 | LRUモデル退避で常駐モデルを上限内（既定<2GB）に制御 |
 | CPUのみ | すべてのモデルがsherpa-onnx経由の量子化ONNXとして動作。GPU・PyTorch不要 |
 
@@ -84,6 +85,41 @@ localhostからしかアクセスできません。LAN上の他端末を受け�
 `--ws-host 0.0.0.0`を明示してください（`/ingest`に認証はないので、信頼できる
 ネットワークでのみ使うこと）。バインドしたアドレスは起動時にstderrへ出力されます。
 
+## スピーカー（PC音声）ループバック入力
+
+`--input speaker`は、マイクの代わりにPC内部のスピーカー（システム音声出力
+――通話相手の声や動画の音声など）を文字起こしします。`--input mix`は
+マイクとスピーカー音声を合成した1本のストリームを文字起こしするので、
+会議の文字起こし（自分の声＋通話相手の声を両方拾う）などに使えます。
+
+```bash
+.venv\Scripts\python scripts\realtime_transcribe.py --input speaker
+.venv\Scripts\python scripts\realtime_transcribe.py --input mix
+```
+
+`soundcard`パッケージ経由のWASAPIループバックを使っており、レンダー
+エンドポイントを直接タップするため、従来の「ステレオミキサー」のように
+Windowsのサウンド設定で事前に有効化する必要はなく、サウンドドライバーが
+ステレオミキサーを提供していない環境でも動作します。**Windows専用**です
+（他のOS向けのループバック経路はまだ実装していません）。
+
+`mix`は録音時刻が約48ms以内の音声を対応付け、合成後のサンプル値を
+[-1, 1]に制限します。マイクを基準に進み、認識が遅れた場合は両側の古い
+待機音声を破棄します。スピーカー録音の失敗はstderrへ通知してマイクのみで
+継続し、マイクの失敗ではストリームを停止します。合成した1本の文字起こしで、
+音源別トラックや音響エコー除去はありません。通話音声をマイクでも二重に
+拾わないよう、ヘッドホンの利用を推奨します。
+
+既定ではシステムの既定入力/出力デバイスを使います。マイクや出力デバイスが
+複数ある場合は`--list-audio-devices`で一覧を確認でき、`--mic-device NAME`
+/ `--speaker-device NAME`（部分一致）で個別に指定できます。リモート
+デスクトップ経由で接続している場合、PC本体の物理マイクは基本的に開けません
+（Windowsがセッションをまたいだアクセスをブロックするため）――代わりに
+RDPクライアント側でマイクリダイレクトを有効にするか（`mstsc`の場合:
+[オプションを表示] > [ローカル リソース] > [リモート オーディオ] >
+[録音] > [このコンピューターで録音する]）、PC本体のコンソールで直接
+実行してください。
+
 ## 他アプリへの組み込み
 
 `scripts/realtime_transcribe.py`の各部品（`RoutedASR`、`build_vad`、
@@ -119,6 +155,12 @@ python -m venv .venv
 .venv/Scripts/python scripts/realtime_transcribe.py     # Windows
 .venv/bin/python scripts/realtime_transcribe.py          # macOS/Linux
 
+# PC内部のスピーカー（システム音声出力）から認識 -- Windows専用
+.venv\Scripts\python scripts\realtime_transcribe.py --input speaker
+
+# マイク+スピーカーを合成して同時に認識（会議の文字起こしなどに）
+.venv\Scripts\python scripts\realtime_transcribe.py --input mix
+
 # ダッシュボード + OBSオーバーレイ付き
 .venv/Scripts/python scripts/realtime_transcribe.py --serve
 # -> ブラウザで http://localhost:8833/dashboard を開く
@@ -136,7 +178,10 @@ python -m venv .venv
 |---|---|---|
 | `--wav PATH` | マイク入力 | マイクの代わりに16kHzモノラルWAVファイルからのストリーミングをシミュレート |
 | `--no-realtime` | オフ | `--wav`使用時、チャンク間でスリープしない（高速バッチ処理） |
-| `--input {mic,wav,ws}` | mic、`--wav`指定時はwav | 音声入力元。`ws`はネットワーク経由で音声を受け付ける（上記参照） |
+| `--input {mic,wav,ws,speaker,mix}` | mic、`--wav`指定時はwav | 音声入力元。`ws`はネットワーク経由で音声を受け付ける（上記参照）。`speaker`はPC内部のスピーカー（システム音声出力）をWASAPIループバックで文字起こし（Windows専用）。`mix`はマイク+スピーカーを合成した1本のストリームを文字起こし |
+| `--mic-device NAME` | システムの既定入力デバイス | `--input mic`/`mix`が録音するデバイス名の部分一致指定。`--list-audio-devices`参照 |
+| `--speaker-device NAME` | システムの既定出力デバイス | `--input speaker`/`mix`がループバックするデバイス名の部分一致指定。`--list-audio-devices`参照 |
+| `--list-audio-devices` | オフ | 利用可能な音声デバイス一覧を表示して終了 |
 | `--ws-host HOST` | `127.0.0.1` | `--input ws`の`/ingest`エンドポイントのバインドホスト。LANクライアントを受け付けるには`0.0.0.0`を指定 |
 | `--ws-port PORT` | 8766 | `--input ws`の`/ingest`エンドポイントのポート |
 | `--threads N` | 4 | モデルごとの推論スレッド数 |

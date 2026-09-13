@@ -5,6 +5,11 @@
 numpy==2.4.6
 soundfile==0.14.0
 sounddevice==0.5.6
+# WASAPI loopback capture for --input speaker/mix (records what's playing
+# on the PC's audio output, e.g. a call partner or a video). sounddevice's
+# bundled PortAudio build has no loopback support to do this with; sounddevice
+# stays the mic/--input mic path since that already works.
+soundcard==0.4.6; sys_platform == "win32"
 sherpa-onnx==1.13.6
 onnxruntime==1.29.0
 ctranslate2==4.8.1

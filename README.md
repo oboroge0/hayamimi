@@ -44,6 +44,7 @@ models -- including the languages where hayamimi loses -- is in
 | Structured events + runtime config | every stage of the pipeline (finals, translations, model loads, warnings, session summaries...) publishes to an `EventHub` an embedding app can listen to directly; `--serve` additionally exposes `GET`/`POST /config` and `POST /reset` for changing language/translation/VAD settings and resetting a session without restarting the process -- see "Embedding: runtime control and structured events" below |
 | OBS overlay + dashboard | `--serve` starts a local HTTP server with a browser-source overlay and a live dashboard |
 | Network audio input | `--input ws` accepts mic audio over a WebSocket (phone, ESP32/stackchan) and feeds it through the same pipeline, including `--serve`'s dashboard/overlay |
+| Speaker loopback input | `--input speaker` transcribes whatever is playing on the PC's audio output (WASAPI loopback, Windows only, no Stereo Mix setup needed); `--input mix` sums it with the mic into one stream (e.g. meeting transcription) |
 | Memory-bounded | LRU model eviction keeps resident models under a configurable cap (default: <2GB total) |
 | CPU-only | every model runs as quantized ONNX via sherpa-onnx; no GPU or PyTorch required |
 
@@ -92,6 +93,41 @@ until you opt in with `--ws-host 0.0.0.0` -- do that only on a network you
 trust, since `/ingest` has no authentication. The bound address is printed
 to stderr on startup either way.
 
+## Speaker (system audio) loopback input
+
+`--input speaker` transcribes whatever is playing through the PC's audio
+output -- the other side of a call, a video -- instead of the microphone;
+`--input mix` transcribes the mic and the speaker output summed into one
+stream, e.g. for meeting transcription (your voice + the call audio
+together):
+
+```bash
+.venv\Scripts\python scripts\realtime_transcribe.py --input speaker
+.venv\Scripts\python scripts\realtime_transcribe.py --input mix
+```
+
+This uses WASAPI loopback via the `soundcard` package, which taps the
+render endpoint directly -- unlike the classic "Stereo Mix" recording
+device, no opt-in is needed in Windows Sound settings, and it works even
+when the sound driver doesn't expose Stereo Mix at all. **Windows only**
+(no loopback path is wired up for other platforms yet).
+
+`mix` matches capture timestamps within roughly 48ms and clips the summed
+samples to [-1, 1]. It uses the microphone as its clock and drops old queued
+audio on both sides if decoding falls behind. A failed speaker capture is
+reported on stderr and falls back to mic-only; a failed microphone stops the
+stream. This is one mixed transcript, with no separate tracks or acoustic
+echo cancellation. Use headphones to avoid capturing the call audio twice.
+
+By default both modes use the system's default input/output device. If you
+have more than one mic or output device, `--list-audio-devices` prints what's
+available, and `--mic-device NAME` / `--speaker-device NAME` (substring
+match) pick a specific one. Over a Remote Desktop session, the PC's own
+physical mic usually can't be opened at all (Windows blocks cross-session
+access) -- enable microphone redirection in your RDP client instead (in
+`mstsc`: Show Options > Local Resources > Remote audio > Recording >
+"Record from this computer"), or run hayamimi at the local console.
+
 ## Embedding in another app
 
 `scripts/realtime_transcribe.py`'s pieces (`RoutedASR`, `build_vad`,
@@ -127,6 +163,12 @@ python -m venv .venv
 .venv/Scripts/python scripts/realtime_transcribe.py     # Windows
 .venv/bin/python scripts/realtime_transcribe.py          # macOS/Linux
 
+# From the PC's audio output instead (a call, a video) -- Windows only
+.venv\Scripts\python scripts\realtime_transcribe.py --input speaker
+
+# Mic + PC audio output together, e.g. for meeting transcription
+.venv\Scripts\python scripts\realtime_transcribe.py --input mix
+
 # With the dashboard + OBS overlay
 .venv/Scripts/python scripts/realtime_transcribe.py --serve
 # -> open http://localhost:8833/dashboard in a browser
@@ -145,7 +187,10 @@ All flags are on `scripts/realtime_transcribe.py`:
 |---|---|---|
 | `--wav PATH` | mic input | simulate streaming from a 16kHz mono WAV file instead of the microphone |
 | `--no-realtime` | off | with `--wav`, don't sleep between chunks (fast batch processing) |
-| `--input {mic,wav,ws}` | mic, or wav if `--wav` is given | audio source; `ws` accepts audio over the network (see below) |
+| `--input {mic,wav,ws,speaker,mix}` | mic, or wav if `--wav` is given | audio source; `ws` accepts audio over the network (see below); `speaker` transcribes the PC's audio output (WASAPI loopback, Windows only); `mix` sums mic + speaker into one stream |
+| `--mic-device NAME` | system default input | substring match for the input device `--input mic`/`mix` captures from; see `--list-audio-devices` |
+| `--speaker-device NAME` | system default output | substring match for the output device `--input speaker`/`mix` loops back from; see `--list-audio-devices` |
+| `--list-audio-devices` | off | print available audio devices and exit |
 | `--ws-host HOST` | `127.0.0.1` | bind host for `--input ws`'s `/ingest` endpoint; pass `0.0.0.0` to accept LAN clients |
 | `--ws-port PORT` | 8766 | port for `--input ws`'s `/ingest` endpoint |
 | `--threads N` | 4 | inference threads per model |
