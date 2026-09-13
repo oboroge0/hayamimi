@@ -114,6 +114,27 @@ def resolve_en_tier(requested: str) -> str:
         raise ValueError(f"unknown en_tier {requested!r}, must be one of {EN_TIERS}")
     return requested
 
+
+# Valid values for RoutedASR(punct_model=...) / --punct-model. "bert" (default)
+# keeps the currently shipped Mojicast BERT-char restorer (PunctuatorJa,
+# comma/period from the model + a suffix heuristic for "？", no "！" support).
+# "4class" is the opt-in punct_ja.PunctuatorJa4Class (docs/eval/punct_retrain.md)
+# -- a single model predicting 、/。/？/！ directly, MIT-licensed, but trained
+# on dense web text and measured to regress on sparse-punctuation domains
+# like TV captions (see that doc's "Results: testdata/eval_real" section).
+PUNCT_MODELS = ("bert", "4class")
+
+
+def resolve_punct_model(requested: str) -> str:
+    """Validate a --punct-model / RoutedASR(punct_model=...) value.
+
+    Pure function (no model access) so it's unit-testable without loading
+    onnxruntime or the punctuation models -- see tests/test_units.py.
+    """
+    if requested not in PUNCT_MODELS:
+        raise ValueError(f"unknown punct_model {requested!r}, must be one of {PUNCT_MODELS}")
+    return requested
+
 LID_MAX_SECONDS = 4.0  # only feed the first N seconds of a segment to the LID model
 
 # --- head-dropout retry ----------------------------------------------------
@@ -760,6 +781,7 @@ class RoutedASR:
                  ja_second_opinion: bool = False,
                  agree_threshold: float = SECOND_OPINION_THRESHOLD,
                  en_tier: str = "v3",
+                 punct_model: str = "bert",
                  on_event: "Callable[[dict], None] | None" = None):
         # on_event (GitHub issue #29): the engine's structured-event sink.
         # Set before ANY other construction step below so every model build
@@ -785,6 +807,7 @@ class RoutedASR:
         self._max_resident = max_resident
         self._en_tier = resolve_en_tier(en_tier)
         self._punctuate = punctuate
+        self._punct_model = resolve_punct_model(punct_model)
         self._punct = None
         self._ko_spacer = None
         self._ko_spacer_ok = True
@@ -994,19 +1017,45 @@ class RoutedASR:
 
     @property
     def punct(self):
-        """Japanese punctuation restorer (BERT ONNX); None if unavailable."""
+        """Japanese punctuation restorer; None if unavailable.
+
+        Builds punct_ja.PunctuatorJa4Class when punct_model="4class" was
+        requested (RoutedASR(punct_model=...) / --punct-model), defaulting
+        to punct_ja.PunctuatorJa (BERT) otherwise -- unchanged from before
+        this option existed. If "4class" was requested but its model files
+        are missing (models/punct-ja-4class-permissive/ not downloaded --
+        see scripts/download_models.py --punct-4class), this degrades to
+        the bert punctuator instead of raising, emitting a `warning` event
+        (code "punct_model_unavailable") so an embedding app without a
+        terminal to read stderr from still finds out -- matching the
+        --en-tier v2 -> v3 degrade pattern in _get_with_fallback(). Only if
+        bert ALSO fails to load does self._punctuate flip to False (the
+        pre-existing missing-model/deps behavior).
+        """
         if self._punct is None and self._punctuate:
             with self._load_lock:
                 if self._punct is None:
                     t0 = time.perf_counter()
                     self._emit({"type": "model_load", "model": "punct", "phase": "start",
                                "ms": None})
-                    try:
-                        from punct_ja import PunctuatorJa
+                    if self._punct_model == "4class":
+                        try:
+                            from punct_ja import PunctuatorJa4Class
 
-                        self._punct = PunctuatorJa()
-                    except Exception:
-                        self._punctuate = False  # missing model/deps: degrade quietly
+                            self._punct = PunctuatorJa4Class()
+                        except Exception as exc:
+                            message = (f"4-class punctuation model unavailable ({exc}); "
+                                       f"falling back to the default bert punctuator")
+                            print(f"[hayamimi] {message}", file=sys.stderr)
+                            self._emit({"type": "warning", "code": "punct_model_unavailable",
+                                       "message": message})
+                    if self._punct is None:
+                        try:
+                            from punct_ja import PunctuatorJa
+
+                            self._punct = PunctuatorJa()
+                        except Exception:
+                            self._punctuate = False  # missing model/deps: degrade quietly
                     self._emit({"type": "model_load", "model": "punct", "phase": "done",
                                "ms": (time.perf_counter() - t0) * 1000})
         return self._punct
