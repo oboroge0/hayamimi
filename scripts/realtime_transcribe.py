@@ -2189,6 +2189,16 @@ def main():
                          "opt-in en-only alternative measured lower-WER on English "
                          "(docs/eval/en_candidates.md; needs download_models.py "
                          "--en-parakeet-v2, +~660MB resident once loaded).")
+    ap.add_argument("--punct-model", choices=["bert", "4class"], default="bert",
+                    help="which model restores ja punctuation (default bert, the "
+                         "currently shipped Mojicast BERT-char restorer: comma/period "
+                         "from the model plus a suffix heuristic for '？', no '！'). "
+                         "4class is an opt-in single model predicting 、/。/？/！ "
+                         "directly, higher-F1 and faster on dense text but measured to "
+                         "regress on sparse-punctuation domains like TV captions "
+                         "(docs/eval/punct_retrain.md; needs download_models.py "
+                         "--punct-4class). Falls back to bert with a warning if the "
+                         "4class model isn't downloaded.")
     ap.add_argument("--transcript", metavar="PATH",
                     help="append refined transcript lines to this file")
     ap.add_argument("--hotwords", metavar="PATH", default="",
@@ -2391,6 +2401,7 @@ def main():
                         forced_lang=args.lang if args.mode == "single" else None,
                         ja_second_opinion=args.refine_ja_second_opinion,
                         en_tier=args.en_tier,
+                        punct_model=args.punct_model,
                         on_event=hub.publish,
                         **({"agree_threshold": args.refine_agree_threshold}
                            if args.refine_agree_threshold is not None else {}))
