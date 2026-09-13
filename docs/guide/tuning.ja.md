@@ -42,6 +42,7 @@ hayamimiの両実装について、ユーザーが触れるつまみを、既定
 | `asr_engine.LID_MAX_SECONDS` | `4.0`秒 | モジュール定数 | セグメント冒頭の何秒をLIDモデルに渡すか | [lid.md](../eval/lid.md) |
 | `--hotwords PATH` | `""` | CLIフラグ、`RoutedASR(hotwords_file=...)` | sherpa-onnxの認識器レベルのホットワード。**jaティアには効かない**（byte-BPEの`tokens.txt`と`cjkchar`のmodeling unitが非互換） | [README.ja.md](../../README.ja.md)の「既知の制限」 |
 | `asr_engine.RZ_HOTWORDS_SCORE` | `2.0` | モジュール定数 | エンコードできた場合のホットワードのスコア加算 | |
+| `--en-tier {v3,v2}` | `v3` | CLIフラグ、`RoutedASR(en_tier=...)` | `en`をどのParakeetモデルで処理するか。`v2`はオプトインの英語専用モデル（`download_models.py --en-parakeet-v2`が必要。未ダウンロードなら`v3`へ後退し`model_fallback`イベントが出る）。常駐枠のコストは上の`--max-resident`行を参照 | [en_candidates.md](../eval/en_candidates.md) |
 
 ### 発話区間の切り出し（VAD）
 
@@ -79,6 +80,7 @@ APIが無いため、検出器が発話区間の途中でないタイミング�
 | つまみ | 既定値 | 変更する場所 | 何に効くか | 根拠 |
 |---|---|---|---|---|
 | 日本語の句読点付与 | オン | `RoutedASR(punctuate=...)`、`RoutedASR.set_punctuate()`、`POST /config`の`punctuate` | ja出力への、。？の挿入 | [punct_ja.md](../design/punct_ja.md) |
+| `--punct-model {bert,4class}` | `bert` | CLIフラグ、`RoutedASR(punct_model=...)` | 句読点復元にどのモデルを使うか。`4class`はオプトインで、bertのコンマ/句点+「？」発見的規則の代わりに、、/。/？/！を1モデルで直接予測（`download_models.py --punct-4class`が必要。未ダウンロードなら`bert`へ後退し`punct_model_unavailable`警告が出る）。領域差の注意はREADMEの既知の制限を参照 | [punct_retrain.md](../eval/punct_retrain.md) |
 | `--replace PATH` | `""` | CLIフラグ、`RoutedASR.set_replacements()`、`POST /replacements` | 最後に適用する文字列置換（ja固有名詞のホットワード代替） | [benchmarks](../results/benchmarks.md) イテレーション#14 |
 | ITNの上書き | 空 | `RoutedASR.set_itn_overrides()`、`POST /itn_overrides` | CJK逆正規化（漢数字→算用数字）の例外指定 | [benchmarks](../results/benchmarks.md) イテレーション#17 |
 | `--translate [LANGS]` | オフ。フラグのみなら`en` | CLIフラグ、`POST /config`の`translate`（集合全体を置換） | ja行のリアルタイム翻訳。`en`はFuguMT、それ以外はM2M-100 | [translate.md](../design/translate.md)、[translate_m2m.md](../design/translate_m2m.md) |

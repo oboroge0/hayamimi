@@ -45,6 +45,7 @@ life of the process.
 | `asr_engine.LID_MAX_SECONDS` | `4.0` s | module constant | how much of a segment's head is fed to the LID model | [lid.md](../eval/lid.md) |
 | `--hotwords PATH` | `""` | CLI flag; `RoutedASR(hotwords_file=...)` | sherpa-onnx recognizer-level hotword biasing. **No effect on the ja tier** (byte-BPE `tokens.txt` vs. the `cjkchar` modeling unit) | [README](../../README.md), "Limitations" |
 | `asr_engine.RZ_HOTWORDS_SCORE` | `2.0` | module constant | hotword boost score where hotwords do encode | |
+| `--en-tier {v3,v2}` | `v3` | CLI flag; `RoutedASR(en_tier=...)` | which Parakeet model handles `en`; `v2` is an opt-in en-only alternative (needs `download_models.py --en-parakeet-v2`; degrades to `v3` with a `model_fallback` event if missing) -- see the `--max-resident` row above for its LRU-slot cost | [en_candidates.md](../eval/en_candidates.md) |
 
 ### Segmentation (VAD)
 
@@ -82,6 +83,7 @@ at the next moment it is not mid-segment. See [`embedding.md`](embedding.md).
 | Knob | Default | Where to change it | What it affects | Evidence |
 |---|---|---|---|---|
 | Japanese punctuation | on | `RoutedASR(punctuate=...)`; `RoutedASR.set_punctuate()`; `POST /config` `punctuate` | 、。？ insertion on ja output | [punct_ja.md](../design/punct_ja.md) |
+| `--punct-model {bert,4class}` | `bert` | CLI flag; `RoutedASR(punct_model=...)` | which model restores ja punctuation; `4class` is opt-in, adds 、/。/？/！ from one model instead of bert's comma/period + `？` heuristic (needs `download_models.py --punct-4class`; degrades to `bert` with a `punct_model_unavailable` warning if missing) -- domain caveat in the README's Limitations | [punct_retrain.md](../eval/punct_retrain.md) |
 | `--replace PATH` | `""` | CLI flag; `RoutedASR.set_replacements()`; `POST /replacements` | literal string substitutions applied last (the ja proper-noun workaround for hotwords) | [benchmarks](../results/benchmarks.md) iteration #14 |
 | ITN overrides | empty | `RoutedASR.set_itn_overrides()`; `POST /itn_overrides` | exceptions to CJK inverse text normalization (spelled-out numerals → digits) | [benchmarks](../results/benchmarks.md) iteration #17 |
 | `--translate [LANGS]` | off; `en` when the flag is bare | CLI flag; `POST /config` `translate` (replaces the whole target set) | live translation of ja lines; `en` uses FuguMT, other targets M2M-100 | [translate.md](../design/translate.md); [translate_m2m.md](../design/translate_m2m.md) |
