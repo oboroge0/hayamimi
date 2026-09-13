@@ -55,9 +55,9 @@ publishのたびに生のイベントdictを渡して同期的に呼び出すコ
 | `final` | `{"type":"final","text":str,"lang":str,"speaker":str,"latency_ms":float\|null,"tier":str,"audio_s":float,"lid_ms":float\|null,"decode_ms":float\|null,"switched":bool}` | VADのセグメントが確定したとき。`switched`は直前の確定文と`lang`が異なる場合だけtrue（セッション最初の確定文ではfalse） |
 | `translation` | `{"type":"translation","lang":str,"text":str}` | `--translate`のターゲット言語が日本語の確定文・清書行の翻訳を終えたとき |
 | `refine` | `{"type":"refine","text":str,"lang":str,"speaker":str,"audio_s":float}` | 発話群の二段目再デコード（清書）が出たとき |
-| `model_load` | `{"type":"model_load","model":str,"phase":"start"\|"done","ms":float\|null}` | 認識器/LID/句読点/翻訳モデルの読み込みが始まった・終わったとき。`model`はエンジン内部の短縮名（`rz`/`pz`/`sv`/`v3`/`omni`/`pja`/`lid`/`punct`、または`translator:<言語コード>`） |
+| `model_load` | `{"type":"model_load","model":str,"phase":"start"\|"done","ms":float\|null}` | 認識器/LID/句読点/翻訳モデルの読み込みが始まった・終わったとき。`model`はエンジン内部の短縮名（`rz`/`pz`/`sv`/`v3`/`omni`/`pja`/`lid`/`punct`、または`translator:<言語コード>`）。`punct_model=`の値に関わらず`model`は常に`"punct"`のまま -- bert/4classのどちらが読まれたかは`punct_model_unavailable`警告の有無で判別する（無ければ要求どおりのモデルが読み込まれている） |
 | `model_fallback` | `{"type":"model_fallback","requested":str,"used":str,"reason":str}` | 要求されたモデルが無く（`--minimal`インストールなど）別のティアに振り替えたとき。同じセッション内で同じ要求モデルについては1回だけ発行 |
-| `warning` | `{"type":"warning","code":str,"message":str}` | 致命的ではない劣化状態。`code`は`hotwords_unencodable`・`segmentation_vad_unavailable`・`second_opinion_unavailable`・`diarization_failed`のいずれか |
+| `warning` | `{"type":"warning","code":str,"message":str}` | 致命的ではない劣化状態。`code`は`hotwords_unencodable`・`segmentation_vad_unavailable`・`second_opinion_unavailable`・`diarization_failed`・`punct_model_unavailable`のいずれか |
 | `session_summary` | `{"type":"session_summary","stats":{...},"speakers":{...}\|null}` | プロセス終了時、およびセッションリセット直前。`stats`はコンソールの`=== session summary: ... ===`行と同じ数値、`speakers`は`--speakers`使用時のみ話者診断行と同じ内容（それ以外は`null`） |
 | `recluster` | `{"type":"recluster","time_s":float,"n_entries":int,"n_clusters":int,"mapping":{...}}` | `--speaker-global-recluster`のセッション末診断が実際に走ったとき |
 | `session_reset` | `{"type":"session_reset"}` | `POST /reset`（または`reset_live_session()`の直接呼び出し）が完了したとき |
