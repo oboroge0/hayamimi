@@ -377,13 +377,14 @@ def test_punct_property_defaults_to_bert(monkeypatch):
 def test_punct_property_builds_4class_when_selected(monkeypatch):
     built = []
     monkeypatch.setattr(punct_ja, "PunctuatorJa4Class",
-                        lambda: built.append("4class") or "4class-instance")
+                        lambda **kw: built.append(kw.get("onnx_filename")) or "4class-instance")
     monkeypatch.setattr(punct_ja, "PunctuatorJa",
                         lambda: (_ for _ in ()).throw(
                             AssertionError("bert must not be built when 4class succeeds")))
     stub = _PunctStub(punct_model="4class")
     assert stub.punct == "4class-instance"
-    assert built == ["4class"]
+    # int8 when the download shipped it, else fp32 -- either way a filename was chosen
+    assert built in ([asr_engine.PUNCT4_INT8_FILENAME], [asr_engine.PUNCT4_FP32_FILENAME])
     assert [e["type"] for e in stub.events] == ["model_load", "model_load"]
 
 
@@ -392,7 +393,7 @@ def test_punct_property_4class_missing_falls_back_to_bert_with_warning(monkeypat
     # --punct-4class) -- must degrade to bert, not raise or silently drop
     # punctuation entirely.
     monkeypatch.setattr(punct_ja, "PunctuatorJa4Class",
-                        lambda: (_ for _ in ()).throw(
+                        lambda **kw: (_ for _ in ()).throw(
                             FileNotFoundError("models/punct-ja-4class-permissive/ not found")))
     monkeypatch.setattr(punct_ja, "PunctuatorJa", lambda: "bert-instance")
     stub = _PunctStub(punct_model="4class")
@@ -408,7 +409,7 @@ def test_punct_property_disables_when_both_models_unavailable(monkeypatch):
     # (e.g. fugashi/onnxruntime missing), punctuation turns off entirely
     # rather than raising -- unchanged by adding punct_model.
     monkeypatch.setattr(punct_ja, "PunctuatorJa4Class",
-                        lambda: (_ for _ in ()).throw(FileNotFoundError("no 4class model")))
+                        lambda **kw: (_ for _ in ()).throw(FileNotFoundError("no 4class model")))
     monkeypatch.setattr(punct_ja, "PunctuatorJa",
                         lambda: (_ for _ in ()).throw(ImportError("no fugashi")))
     stub = _PunctStub(punct_model="4class")
