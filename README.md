@@ -45,6 +45,8 @@ models -- including the languages where hayamimi loses -- is in
 | OBS overlay + dashboard | `--serve` starts a local HTTP server with a browser-source overlay and a live dashboard |
 | Network audio input | `--input ws` accepts mic audio over a WebSocket (phone, ESP32/stackchan) and feeds it through the same pipeline, including `--serve`'s dashboard/overlay |
 | Speaker loopback input | `--input speaker` transcribes whatever is playing on the PC's audio output (WASAPI loopback, Windows only, no Stereo Mix setup needed); `--input mix` sums it with the mic into one stream (e.g. meeting transcription) |
+| English tier v2 (opt-in) | `--en-tier v2` swaps the default multilingual Parakeet v3 for an en-only Parakeet TDT v2 (needs `download_models.py --en-parakeet-v2`, +~660MB resident); measured FLEURS en WER 10.0% -> 6.6% (`docs/eval/en_candidates.md`) |
+| 4-class ja punctuation (opt-in) | `--punct-model 4class` swaps the default BERT restorer for a single model predicting 、/。/？/！ directly (adds real ？/！ support the default model lacks); int8 ~37MB, ~4.6ms/line on FLEURS ja, but trained on dense web text -- underperforms the default on sparse-punctuation domains like TV captions (`docs/eval/punct_retrain.md`, see Limitations). Needs `download_models.py --punct-4class` |
 | Memory-bounded | LRU model eviction keeps resident models under a configurable cap (default: <2GB total) |
 | CPU-only | every model runs as quantized ONNX via sherpa-onnx; no GPU or PyTorch required |
 
@@ -140,6 +142,19 @@ guide -- the event table, the `/config` keys, and what `POST /reset` does --
 is in [`docs/guide/embedding.md`](docs/guide/embedding.md). For Flutter/Dart,
 see [`mobile/hayamimi_core/README.md`](mobile/hayamimi_core/README.md).
 
+```python
+from asr_engine import RoutedASR
+
+# en_tier="v2" and punct_model="4class" are both opt-in (see Features above);
+# leaving either out keeps the current default (v3 / bert). Both raise
+# ValueError at construction if given an unknown value, and degrade to their
+# default with a `warning` event if the opt-in model isn't downloaded.
+with RoutedASR(en_tier="v2", punct_model="4class", on_event=hub.publish) as asr:
+    ...  # asr.transcribe(...) / asr.partial(...)
+# close() runs automatically on exit; call asr.close() yourself if you're
+# not using `with` -- see "Shutting down a pipeline" in embedding.md.
+```
+
 ## Requirements
 
 Python 3.10+ and ffmpeg on PATH. Developed and tested on **Windows 11**;
@@ -176,8 +191,11 @@ python -m venv .venv
 
 `scripts/download_models.py` pulls ~3.1GB of pretrained models into
 `models/` (git-ignored). Pass `--minimal` for a ~1.1GB ja/en-only install
-(ReazonSpeech, whisper-tiny, Silero VAD, Japanese punctuation). See
-`THIRD_PARTY_NOTICES.md` for what each model's license commits you to.
+(ReazonSpeech, whisper-tiny, Silero VAD, Japanese punctuation). Two opt-in
+flags add the tiers above: `--en-parakeet-v2` (+~460MB, `--en-tier v2`) and
+`--punct-4class` (+~40MB, `--punct-model 4class`); either combines with
+`--minimal` without being dropped. See `THIRD_PARTY_NOTICES.md` for what
+each model's license commits you to.
 
 ## CLI reference
 
@@ -209,6 +227,8 @@ All flags are on `scripts/realtime_transcribe.py`:
 | `--speakers` | off | label utterances with speaker ids (S1, S2, ...); the refine pass re-diarizes each group with pyannote segmentation-3.0 |
 | `--speaker-remap-threshold T` | 0.35 | cosine-similarity threshold for mapping the refine pass's local diarization clusters onto the session's global S{n} labels (the live fast path keeps its own 0.45 threshold) |
 | `--translate [LANGS]` | off, `en` | translate Japanese lines to these comma-separated languages. `en` uses the dedicated FuguMT module; any other M2M-100 target code (`zh`, `ko`, `es`, `fr`, ...) is accepted if the model's vocabulary supports it -- unvalidated targets (anything outside `zh`/`ko`/`es`) print a quality-not-measured note, see docs/design/translate_m2m.md |
+| `--en-tier {v3,v2}` | `v3` | which Parakeet model handles `en`; `v3` also covers the other 24 V3_LANGS European languages. `v2` is opt-in, en-only, lower WER (needs `download_models.py --en-parakeet-v2`; degrades to `v3` with a `model_fallback` event if not downloaded) -- see docs/eval/en_candidates.md |
+| `--punct-model {bert,4class}` | `bert` | which model restores ja punctuation. `bert` is the currently shipped Mojicast BERT-char restorer (comma/period from the model + a `？` suffix heuristic, no `！`); `4class` is opt-in, predicts 、/。/？/！ directly (needs `download_models.py --punct-4class`; degrades to `bert` with a `warning` event if not downloaded) -- see docs/eval/punct_retrain.md |
 
 ## Architecture
 
@@ -360,6 +380,12 @@ Headline numbers from that log:
 - **The end-to-end mic pipeline has not been independently verified beyond
   this project's own testing** -- see `docs/design/goals.md`'s remaining-work
   section. File an issue if your results differ from the numbers above.
+- **The opt-in 4-class punctuation model (`--punct-model 4class`) has a real
+  domain gap.** It's fine-tuned on dense open-web text (FineWeb-2) and beats
+  the default model on FLEURS ja (F1 +0.27), but on sparse-punctuation ja TV
+  captions (`testdata/eval_real`) the default model still wins (F1 0.62 vs.
+  0.43) -- a caption/subtitle-style source is exactly the domain this model
+  underperforms on. See `docs/eval/punct_retrain.md` for the full breakdown.
 
 ## License
 
@@ -400,6 +426,13 @@ hayamimi exists on top of, and would not exist without:
   Academy) -- the CAM++ speaker embedding model behind `--speakers`.
 - [Kiwi](https://github.com/bab2min/kiwipiepy) -- Korean morphological
   tokenizer, used to fix SenseVoice's token-spaced Korean output.
+- [SB Intuitions](https://huggingface.co/sbintuitions) --
+  [modernbert-ja-30m](https://huggingface.co/sbintuitions/modernbert-ja-30m),
+  the MIT base model behind the opt-in 4-class ja punctuation model
+  (`--punct-model 4class`).
+- [FineWeb-2](https://huggingface.co/datasets/HuggingFaceFW/fineweb-2)
+  (Hugging Face) -- the `jpn_Jpan` training text (ODC-By 1.0) that model was
+  fine-tuned on.
 
 ## Documentation
 
