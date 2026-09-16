@@ -9,7 +9,11 @@ Two model sets:
               fallback via VAD), Silero VAD, Japanese punctuation. ~1.1 GB.
   (default)   Everything the runtime routing in asr_engine.py can reach:
               minimal + zh/ko/yue/multilingual-EU/1600-language-fallback ASR,
-              speaker embeddings, and ja->en/zh/ko translation. ~3.1 GB.
+              speaker embeddings, ja->en/zh/ko translation, and the en-only
+              Parakeet v2 tier that --en-tier defaults to since v0.6 (v3, the
+              multilingual model, is also included -- it still covers the
+              other 24 V3_LANGS European languages and is the automatic
+              fallback if v2 is ever missing). ~3.6 GB.
 
 Add --eval-baselines to additionally fetch two extra models that are only
 used as comparison baselines by scripts/eval_accuracy.py and
@@ -184,11 +188,16 @@ def download_opt_ins(args) -> None:
     people to add these flags; a model that then never arrives degrades
     routing without any warning at download time).
     """
-    if args.en_parakeet_v2:
+    if args.en_parakeet_v2 and args.minimal:
+        # The non-minimal (default) path already fetches v2 unconditionally
+        # above -- it's part of the default set since v0.6, not opt-in
+        # anymore. This flag only still does something under --minimal,
+        # whose ja/en core is ReazonSpeech + v3-less, so v2 has to be asked
+        # for explicitly there.
         download_and_extract_tarbz2(
             f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
             "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
-            "Parakeet TDT 0.6B v2 (en-only, opt-in --en-tier v2)")
+            "Parakeet TDT 0.6B v2 (en-only, --en-tier v2 default)")
 
     if args.punct_4class:
         # Same layout as the local models/punct-ja-4class-permissive/ this
@@ -288,10 +297,11 @@ def main():
                           "torch/transformers, e.g. in a separate .venv-train -- see that doc's "
                           "'Environment' section) to reproduce models/<name>-ct2/.")
     ap.add_argument("--en-parakeet-v2", action="store_true",
-                     help="also download the opt-in en-only Parakeet v2 tier (~460MB, "
-                          "see docs/eval/en_candidates.md and --en-tier v2). Not part of "
-                          "--minimal or the default set -- en stays on v3 unless you "
-                          "both download this and pass --en-tier v2.")
+                     help="also download the en-only Parakeet v2 tier under --minimal "
+                          "(~460MB, see docs/eval/en_candidates.md and --en-tier, whose "
+                          "default is v2 since v0.6). The non-minimal default set already "
+                          "includes v2 -- this flag only matters combined with --minimal, "
+                          "whose ja/en core doesn't otherwise carry it.")
     ap.add_argument("--punct-4class", action="store_true",
                      help="also download the opt-in 4-class ja punctuation model "
                           "(~40MB, see docs/eval/punct_retrain.md and --punct-model "
@@ -302,8 +312,10 @@ def main():
 
     os.makedirs(MODELS_DIR, exist_ok=True)
 
-    total_gb = "~1.1GB" if args.minimal else ("~4.1GB" if args.eval_baselines else "~3.1GB")
-    if args.en_parakeet_v2:
+    # v2 (~460MB) is baked into the non-minimal totals below since v0.6 --
+    # it's no longer a separate opt-in add-on outside --minimal.
+    total_gb = "~1.1GB" if args.minimal else ("~4.6GB" if args.eval_baselines else "~3.6GB")
+    if args.en_parakeet_v2 and args.minimal:
         total_gb += " + ~460MB (--en-parakeet-v2)"
     if args.punct_4class:
         total_gb += " + ~40MB (--punct-4class)"
@@ -360,7 +372,17 @@ def main():
     download_and_extract_tarbz2(
         f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
         "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
-        "Parakeet TDT 0.6B v3 (en + 24 EU languages)")
+        "Parakeet TDT 0.6B v3 (24 EU languages; en's fallback if v2 is missing)")
+
+    # en-only tier, default since v0.6 (--en-tier defaults to "v2"; see
+    # docs/eval/en_candidates.md). Part of the default set now -- kept as a
+    # separate download from v3 above (not a replacement for it) because v3
+    # is still needed for the other 24 V3_LANGS European languages and as
+    # en's automatic fallback if this download is ever missing.
+    download_and_extract_tarbz2(
+        f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
+        "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
+        "Parakeet TDT 0.6B v2 (en-only, default --en-tier since v0.6)")
 
     # The int8 weights live in their own "-int8-" tarball upstream; the
     # plain "300M-ctc-2025-11-12" tarball is fp32 only (model.onnx, 1.3GB)
