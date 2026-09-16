@@ -1,6 +1,6 @@
 """Manim scenes for the hayamimi demo video.
 
-Render with (from H:\Programming\Whisper-faster\demo, using the dedicated venv):
+Render with (from H:\\Programming\\Whisper-faster\\demo, using the dedicated venv):
   .venv-manim/Scripts/python -m manim -qh --fps 30 --media_dir manim_media hayamimi_scenes.py Intro Arch Outro
 """
 from manim import *
