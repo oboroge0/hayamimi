@@ -23,7 +23,7 @@ from typing import Callable, NamedTuple
 import numpy as np
 import sherpa_onnx
 
-from asr_engine import ModelUnavailable, RoutedASR
+from asr_engine import ModelUnavailable, RoutedASR, _model_present
 from audio_utils import resample_linear
 # subtitle_server.py only imports stdlib modules, so this is safe to import
 # unconditionally even under .github/workflows/test.yml's CI install list
@@ -2183,12 +2183,14 @@ def main():
     ap.add_argument("--refine-agree-threshold", type=float, default=None, metavar="CER",
                     help="agreement threshold for --refine-ja-second-opinion "
                          "(mutual CER between the two hypotheses; default 0.25)")
-    ap.add_argument("--en-tier", choices=["v3", "v2"], default="v3",
-                    help="which Parakeet model handles 'en' (default v3, which also "
-                         "covers the other 24 V3_LANGS European languages). v2 is an "
-                         "opt-in en-only alternative measured lower-WER on English "
-                         "(docs/eval/en_candidates.md; needs download_models.py "
-                         "--en-parakeet-v2, +~660MB resident once loaded).")
+    ap.add_argument("--en-tier", choices=["v3", "v2"], default="v2",
+                    help="which Parakeet model handles 'en' (default v2 since v0.6, "
+                         "an en-only model measured lower-WER on English than v3 -- "
+                         "docs/eval/en_candidates.md; downloaded by default by "
+                         "download_models.py). v3 restores the pre-v0.6 behavior: "
+                         "the multilingual model that also covers the other 24 "
+                         "V3_LANGS European languages. If v2 isn't downloaded, en "
+                         "automatically falls back to v3 with a one-time warning.")
     ap.add_argument("--punct-model", choices=["bert", "4class"], default="bert",
                     help="which model restores ja punctuation (default bert, the "
                          "currently shipped Mojicast BERT-char restorer: comma/period "
@@ -2390,6 +2392,20 @@ def main():
         server = SubtitleServer(port=args.serve, hub=hub).start()
         print(f"subtitle overlay: http://localhost:{args.serve}/  (OBS browser source)",
               file=sys.stderr)
+
+    if args.en_tier == "v2" and not _model_present("v2"):
+        # Default en_tier is "v2" since v0.6; an install from before that
+        # (or a --minimal install without --en-parakeet-v2) won't have the
+        # model on disk yet. RoutedASR/_route() already degrades to v3 for
+        # this session (with its own one-time model_fallback event/warning
+        # once "en" is actually spoken) -- this is just a heads-up on how to
+        # get v2 for next time, printed once at startup rather than only
+        # after English is heard.
+        print("[hayamimi] note: English tier v2 is not downloaded (models/"
+              "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/ missing) -- this "
+              "session will use v3 for English instead. Re-run "
+              "`python scripts/download_models.py` to fetch v2 (it's part of "
+              "the default download set as of v0.6).", file=sys.stderr)
 
     print("loading models...", file=sys.stderr)
     try:
