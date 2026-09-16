@@ -286,7 +286,7 @@ t2s-normalized). Full methodology in `docs/results/scorecard.md`.
 | Language | Clips | LID accuracy | Route | Mean error | Mean RTF |
 |---|---|---|---|---|---|
 | ja | 15 | 15/15 | ReazonSpeech | 3.8% | 0.090 |
-| en | 15 | 15/15 | Parakeet v2 | 1.3% | 0.171† |
+| en | 15 | 15/15 | Parakeet v2 | 1.3% | 0.114† |
 | zh | 12 | 12/12 | Paraformer-zh | 6.6%* | 0.084 |
 | ko | 12 | 12/12 | SenseVoice | 8.1% | 0.060 |
 | yue | 12 | 12/12 | SenseVoice | 6.1% | 0.043 |
@@ -311,12 +311,10 @@ Headline numbers from that log:
   6.6%, `docs/eval/en_candidates.md`) -- reproduced here on the production
   path (LID + routing included). Pass `--en-tier v3` to go back to the
   multilingual route.
-  †en's 0.171 mean RTF was measured with other jobs competing for CPU on the
-  same host; the 2026-09-01 ja/zh/ko/yue figures above were measured on an
-  otherwise idle machine and are more representative of a standalone run --
-  see `docs/results/scorecard.md`'s 2026-09-16 note and
-  `docs/eval/en_candidates.md`'s isolated v2-vs-v3 RTF (0.099 vs 0.141) for a
-  load-independent comparison.
+  †en's 0.114 mean RTF (2026-09-16) was measured with unrelated jobs using about
+  20% of the host CPU, while the ja/zh/ko/yue figures date from an idle host
+  (2026-09-01); the load-free v2-vs-v3 comparison is the isolated 0.099 vs
+  0.141 in `docs/eval/en_candidates.md`. Error rates are unaffected by load.
 - **~100ms mean final latency** (ja, punctuated); ~236ms mean / 552ms max
   across a 5-language soak test with every feature enabled.
 - **<2GB RAM** with `--max-resident 3` (1.35GB at `--max-resident 2`).
