@@ -380,12 +380,15 @@ Headline numbers from that log:
 - **The end-to-end mic pipeline has not been independently verified beyond
   this project's own testing** -- see `docs/design/goals.md`'s remaining-work
   section. File an issue if your results differ from the numbers above.
-- **The opt-in 4-class punctuation model (`--punct-model 4class`) has a real
-  domain gap.** It's fine-tuned on dense open-web text (FineWeb-2) and beats
-  the default model on FLEURS ja (F1 +0.27), but on sparse-punctuation ja TV
-  captions (`testdata/eval_real`) the default model still wins (F1 0.62 vs.
-  0.43) -- a caption/subtitle-style source is exactly the domain this model
-  underperforms on. See `docs/eval/punct_retrain.md` for the full breakdown.
+- **The opt-in 4-class punctuation model (`--punct-model 4class`) never emits
+  `！` by default.** It's fine-tuned on dense open-web text (FineWeb-2), and
+  on speech its `！` head fires on emphatic narration as confidently as on
+  real exclamations, so a probability threshold cannot separate them. The
+  decode therefore gates `！` off (`exclaim_threshold > 1`) and gates `、` at
+  0.8. With those defaults it beats the shipped model on sparse-punctuation
+  ja TV captions too (`testdata/eval_real`: F1 0.64 vs 0.62) and on FLEURS ja
+  (0.89 vs 0.62). Pass `PunctuatorJa4Class(exclaim_threshold=0.9)` for dense
+  text where `！` matters. See `docs/eval/punct_retrain.md`, "Decode gates".
 
 ## License
 

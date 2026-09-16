@@ -368,6 +368,41 @@ historical fp32/int8/fp16 numbers published in
 eval script reimplements a fixed `strip_marks`/`marks_from_restored` and
 reuses only `build_fleurs_refs`, which was never affected.
 
+## Decode gates (added before v0.5.0, 2026-09-16)
+
+Reading the 15 `testdata/eval_real` outputs side by side (not just the F1) showed
+two habits the model brought over from dense web prose: spurious `！` on emphatic
+narration (4 of 15 clips: 「力強い走りに変わっていきます！」「高校生200人に聞きました！」…)
+and extra commas. Both are addressed at decode time, without retraining:
+`PunctuatorJa4Class(exclaim_threshold=, comma_threshold=)` gates a mark out of
+the argmax wherever its softmax probability is below the threshold (all gated
+marks are masked *before* the argmax, so a rejected comma can never hand the
+position to a weak `！`). `decode_punct4_labels()` in `scripts/punct_ja.py`;
+`scripts/eval_punct_4class.py --exclaim-threshold/--comma-threshold`.
+
+Sweep (int8, 6 threads; eval_real = 15 TV-caption clips, FLEURS n=250; exclaim
+set = 50 real exclamations):
+
+| exclaim gate | comma gate | eval_real F1 | FLEURS F1 | exclaim-set ！ P / R |
+|---|---|---|---|---|
+| argmax | argmax | 0.473 | 0.888 | 0.97 / 0.60 |
+| 0.8 | argmax | 0.482 | 0.889 | 1.00 / 0.42 |
+| 0.97 | argmax | 0.556 | 0.889 | 1.00 / 0.14 |
+| off (>1) | argmax | 0.593 | 0.889 | – / 0 |
+| 0.97 | 0.7 | 0.571 | **0.897** | 1.00 / 0.14 |
+| 0.97 | 0.8 | 0.596 | 0.893 | 1.00 / 0.14 |
+| off (>1) | 0.7 | 0.612 | **0.897** | – / 0 |
+| **off (>1)** | **0.8** | **0.638** | 0.893 | – / 0 |
+
+The spurious `！` are as confident as the real ones (p >= 0.97), so no threshold
+keeps real-exclamation recall while removing them; the `！` head is simply not
+trustworthy on speech. Defaults are therefore `exclaim_threshold=1.01` (never
+emit `！`) and `comma_threshold=0.8`. With them the model beats the shipped one on
+the TV-caption set as well (0.638 vs 0.621) instead of losing to it (0.473),
+and FLEURS improves slightly (0.888 -> 0.893; fp32 0.898). `？` recall on the
+question set stays 1.0. The `！` class remains available for dense text
+(`exclaim_threshold=0.9`); the earlier tables in this record are plain argmax.
+
 ## Adoption decision: ADOPT (all 6 criteria pass)
 
 | # | criterion | threshold | result | pass? |

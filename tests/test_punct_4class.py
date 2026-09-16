@@ -134,7 +134,10 @@ def test_restore_smoke_exclamation():
     # The permissive (round-2) model learned ！ from real web text rather
     # than the ~600 self-authored templates round 1 used; a plain
     # exclamation is the cheapest check that the class is live at all.
-    p = PunctuatorJa4Class()
+    # ！ is gated off by default (see PUNCT4_EXCLAIM_THRESHOLD); this test
+    # checks the head itself, so enable it explicitly, and pin the default too.
+    assert not PunctuatorJa4Class().restore("本当にありがとうございました").endswith("！")
+    p = PunctuatorJa4Class(exclaim_threshold=0.9)
     assert p.restore("本当にありがとうございました").endswith("！")
 
 
@@ -174,3 +177,21 @@ def test_missing_model_dir_raises_file_not_found(tmp_path):
     pytest.importorskip("tokenizers")
     with pytest.raises(FileNotFoundError):
         PunctuatorJa4Class(model_dir=tmp_path)
+
+
+def test_decode_gates_remove_weak_marks_before_argmax():
+    import numpy as np
+    from punct_ja import decode_punct4_labels, PUNCT4_LABELS
+    O, C, P, Q, E = range(5)  # O 、 。 ？ ！
+    # comma 0.52 (fails a 0.8 gate) with ！ 0.45 second: must fall to 。/O, never to ！
+    lg = np.log(np.array([[0.004, 0.523, 0.026, 0.0001, 0.448]], dtype=np.float32) + 1e-9)
+    assert decode_punct4_labels(lg, exclaim_threshold=1.01, comma_threshold=0.8) == [P]
+    # gates off -> plain argmax
+    assert decode_punct4_labels(lg, None, None) == [C]
+    # a confident ！ passes its gate
+    lg2 = np.log(np.array([[0.005, 0.005, 0.02, 0.0, 0.97]], dtype=np.float32) + 1e-9)
+    assert decode_punct4_labels(lg2, exclaim_threshold=0.9, comma_threshold=0.8) == [E]
+    assert decode_punct4_labels(lg2, exclaim_threshold=0.99, comma_threshold=0.8) == [P]
+    # O is never gated, so a row where every mark is weak yields O
+    lg3 = np.log(np.array([[0.4, 0.3, 0.1, 0.05, 0.15]], dtype=np.float32) + 1e-9)
+    assert decode_punct4_labels(lg3, exclaim_threshold=0.5, comma_threshold=0.5) == [O]
