@@ -228,3 +228,17 @@ python scripts/realtime_transcribe.py --en-tier v2 --wav testdata/eval_real/en_0
   `RoutedASR`が保持する他tier(rz/whisper-tiny LID等)込みの実測ではない。
 - v2採用後もv3は引き続き他24のV3_LANGS(欧州言語)を担当するため、v3自体は
   削除・置換していない(en_tierという分岐を追加しただけ)。
+
+## 2026-09-16 追記: v0.6 で既定化
+
+上の評価・実装内容は v0.5.0 時点の opt-in 採用の記録として原文のまま残す
+(`en_tier`の既定が`"v3"`だった当時の記述含む)。v0.6 では `--en-tier` /
+`RoutedASR(en_tier=...)` の既定値を `"v2"` に切り替え、v2 を
+`scripts/download_models.py` の既定ダウンロード集合に追加した(`--minimal`
+は対象外。`--en-parakeet-v2` フラグは`--minimal`との併用専用として残置)。
+`_PRELOAD_ORDER`も`en_tier`依存にし、既定(`en_tier="v2"`)では v2 を v3 より
+先にプリロードするよう変更(`_TIER_FALLBACK`のv2→v3後退ロジック自体は無変更)。
+本番経路(LID込み)での再計測は `docs/results/scorecard.md` の
+「2026-09-16 再計測の注記」を参照(WER 2.3%→1.3%、単独計測の10.04%→6.64%と
+同方向)。`--en-tier v3`で本ページが評価した時点の挙動(v3既定)に戻せる。
+  削除・置換していない(en_tierという分岐を追加しただけ)。

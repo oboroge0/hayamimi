@@ -33,7 +33,7 @@ hayamimiの両実装について、ユーザーが触れるつまみを、既定
 | つまみ | 既定値 | 変更する場所 | 何に効くか | 根拠 |
 |---|---|---|---|---|
 | `--threads` | `4` | CLIフラグ、`RoutedASR(threads=...)` | 各sherpa-onnx認識器に渡すintra-opスレッド数 | |
-| `--max-resident` | `3` | CLIフラグ、`RoutedASR(max_resident=...)` | 常駐するjaティア以外に何個の認識器をメモリに残すか。超えるとLRUで落とす。`--en-tier v2` では英語と欧州24言語が別の認識器（v2とv3）になるので、両方を行き来するセッションは従来より1枠多く必要（足りないと再ロードを繰り返す） | [benchmarks](../results/benchmarks.md) イテレーション#3（RAM実測）、#7（LRUアンロード） |
+| `--max-resident` | `3` | CLIフラグ、`RoutedASR(max_resident=...)` | 常駐するjaティア以外に何個の認識器をメモリに残すか。超えるとLRUで落とす。既定の`--en-tier v2`では英語と欧州24言語が別の認識器（v2とv3）になるので、両方を行き来するセッションは`--en-tier v3`のセッションより1枠多く必要（足りないと再ロードを繰り返す）。既定のプリロード順（`asr_engine._preload_order`）はv3よりv2を優先するので、既定の`--max-resident 3`予算はpz/sv/v2で埋まり、v3は欧州言語の初回発話まで遅延ロードされる | [benchmarks](../results/benchmarks.md) イテレーション#3（RAM実測）、#7（LRUアンロード） |
 | `--mode {single,balanced,fast}` | `balanced` | CLIフラグ | 言語切替ポリシーのプリセット。下の2フラグと`dual_confirm`をまとめて決める | [lid.md](../eval/lid.md) |
 | `--lang CODE` | `None` | CLIフラグ、`RoutedASR.set_forced_lang()`、`POST /config`の`lang` | 全セグメントを1言語に固定しLIDを完全に飛ばす（`--mode single`で必須） | |
 | `--lang-switch-guard SEC` | `2.0`（`balanced`）、`0.0`（`fast`）。`realtime_transcribe.py`の`mode_defaults`。`RoutedASR.min_switch_s`自体は`2.0` | CLIフラグ、`RoutedASR.set_min_switch_s()`、`POST /config`の`min_switch_s` | これより短い別言語の検出は切替の根拠に数えない | [benchmarks](../results/benchmarks.md) イテレーション#29、[lid.md](../eval/lid.md) |
@@ -42,7 +42,7 @@ hayamimiの両実装について、ユーザーが触れるつまみを、既定
 | `asr_engine.LID_MAX_SECONDS` | `4.0`秒 | モジュール定数 | セグメント冒頭の何秒をLIDモデルに渡すか | [lid.md](../eval/lid.md) |
 | `--hotwords PATH` | `""` | CLIフラグ、`RoutedASR(hotwords_file=...)` | sherpa-onnxの認識器レベルのホットワード。**jaティアには効かない**（byte-BPEの`tokens.txt`と`cjkchar`のmodeling unitが非互換） | [README.ja.md](../../README.ja.md)の「既知の制限」 |
 | `asr_engine.RZ_HOTWORDS_SCORE` | `2.0` | モジュール定数 | エンコードできた場合のホットワードのスコア加算 | |
-| `--en-tier {v3,v2}` | `v3` | CLIフラグ、`RoutedASR(en_tier=...)` | `en`をどのParakeetモデルで処理するか。`v2`はオプトインの英語専用モデル（`download_models.py --en-parakeet-v2`が必要。未ダウンロードなら`v3`へ後退し`model_fallback`イベントが出る）。常駐枠のコストは上の`--max-resident`行を参照 | [en_candidates.md](../eval/en_candidates.md) |
+| `--en-tier {v3,v2}` | `v2`（v0.6から） | CLIフラグ、`RoutedASR(en_tier=...)` | `en`をどのParakeetモデルで処理するか。`v2`は英語専用でWERが低く、既定でダウンロードされる（見つからない場合、例えば`--en-parakeet-v2`なしの`--minimal`構成では`v3`へ後退し`model_fallback`イベントが出る）。`v3`はv0.6以前の挙動に戻す選択肢で、欧州24言語も引き続き担当する。v2とv3が両方常駐する場合の枠コストは上の`--max-resident`行を参照 | [en_candidates.md](../eval/en_candidates.md) |
 
 ### 発話区間の切り出し（VAD）
 
