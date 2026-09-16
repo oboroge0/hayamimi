@@ -244,7 +244,7 @@ def test_expected_language_homes():
     assert "zh" in asr_engine.PARA_LANGS
 
 
-# ---- opt-in en-only tier (en_tier="v2", docs/eval/en_candidates.md) --------
+# ---- en-only tier, default since v0.6 (en_tier="v2", docs/eval/en_candidates.md) --
 
 def test_resolve_en_tier_accepts_known_values():
     assert asr_engine.resolve_en_tier("v3") == "v3"
@@ -266,17 +266,23 @@ class _RouteStub:
         return (f"{name}-recognizer", name)
 
 
-def test_route_en_stays_on_v3_by_default():
-    # en_tier defaults to "v3" everywhere (RoutedASR.__init__, --en-tier) --
-    # V3_LANGS itself is untouched by the opt-in tier (test_expected_language_homes
-    # above), so this is the behavior every existing caller keeps getting.
-    _, tier = asr_engine.RoutedASR._route(_RouteStub("v3"), "en")
-    assert tier == "v3"
+def test_route_en_uses_v2_by_default():
+    # en_tier defaults to "v2" since v0.6 (RoutedASR.__init__, --en-tier) --
+    # V3_LANGS membership itself is untouched (test_expected_language_homes
+    # above still finds "en" there), so this is _route()'s en branch, not the
+    # routing table, doing the work.
+    import inspect
 
-
-def test_route_en_switches_to_v2_when_opted_in():
+    assert inspect.signature(asr_engine.RoutedASR.__init__).parameters["en_tier"].default == "v2"
     _, tier = asr_engine.RoutedASR._route(_RouteStub("v2"), "en")
     assert tier == "v2"
+
+
+def test_route_en_falls_back_to_v3_with_en_tier_v3():
+    # --en-tier v3 restores the pre-v0.6 behavior: "en" stays on the
+    # multilingual model alongside the other V3_LANGS.
+    _, tier = asr_engine.RoutedASR._route(_RouteStub("v3"), "en")
+    assert tier == "v3"
 
 
 def test_route_other_v3_langs_unaffected_by_en_tier():
@@ -309,10 +315,11 @@ class _FallbackStub:
 
 
 def test_route_en_v2_missing_degrades_to_v3_not_rz():
-    # --en-tier v2 on a default install (no v2 tarball) must fall back to v3,
-    # the tier en is homed on by default. The generic fallback chain starts
-    # with rz (ReazonSpeech), whose English output is unpunctuated ALL-CAPS,
-    # so landing there would be a silent quality regression.
+    # en_tier="v2" on an install that doesn't have the v2 tarball yet (one
+    # from before v0.6, or a --minimal install without --en-parakeet-v2)
+    # must fall back to v3. The generic fallback chain starts with rz
+    # (ReazonSpeech), whose English output is unpunctuated ALL-CAPS, so
+    # landing there would be a silent quality regression.
     stub = _FallbackStub(present={"rz", "sv", "v3", "omni"})
     _, tier = stub._route("en")
     assert tier == "v3"
@@ -325,6 +332,23 @@ def test_route_en_v2_present_uses_v2():
     _, tier = stub._route("en")
     assert tier == "v2"
     assert stub.events == []
+
+
+def test_preload_order_puts_v2_ahead_of_v3_when_en_tier_is_v2():
+    # en_tier="v2" (the v0.6 default): v2 is en's actual tier, so with a
+    # tight max_resident budget it must be preloaded ahead of v3.
+    order = asr_engine._preload_order("v2")
+    assert "v2" in order and "v3" in order
+    assert order.index("v2") < order.index("v3")
+
+
+def test_preload_order_omits_v2_when_en_tier_is_v3():
+    # --en-tier v3: en doesn't route to v2 in this session (test_route_en_
+    # falls_back_to_v3_with_en_tier_v3 above), so preloading it would waste
+    # the residency budget on a tier nothing asks for.
+    order = asr_engine._preload_order("v3")
+    assert "v2" not in order
+    assert "v3" in order
 
 
 def test_get_with_fallback_generic_chain_unchanged():
