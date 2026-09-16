@@ -7,6 +7,7 @@ routing table consistency).
 """
 import os
 import sys
+import threading
 
 import numpy as np
 import pytest
@@ -16,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from realtime_transcribe import (AudioHistory, PartialPrinter, PREROLL_S, Refiner,
                                  digits_consistent, translate_by_sentence)
 import asr_engine
+import punct_ja
 import translate_candidates
 import translate_m2m
 
@@ -330,6 +332,89 @@ def test_get_with_fallback_generic_chain_unchanged():
     stub = _FallbackStub(present={"rz"})
     _, tier = stub._get_with_fallback("pz")
     assert tier == "rz"
+
+
+# ---- opt-in 4-class ja punctuation model (punct_model="4class") -----------
+
+def test_resolve_punct_model_accepts_known_values():
+    assert asr_engine.resolve_punct_model("bert") == "bert"
+    assert asr_engine.resolve_punct_model("4class") == "4class"
+
+
+def test_resolve_punct_model_rejects_unknown_value():
+    with pytest.raises(ValueError):
+        asr_engine.resolve_punct_model("bert2")
+
+
+class _PunctStub:
+    """Drives the real RoutedASR.punct property with fake punctuator
+    classes patched onto the punct_ja module -- no onnxruntime, no models
+    on disk."""
+
+    def __init__(self, punct_model="bert"):
+        self._punct_model = punct_model
+        self._punctuate = True
+        self._punct = None
+        self._load_lock = threading.Lock()
+        self.events = []
+
+    def _emit(self, event):
+        self.events.append(event)
+
+    punct = asr_engine.RoutedASR.punct
+
+
+def test_punct_property_defaults_to_bert(monkeypatch):
+    built = []
+    monkeypatch.setattr(punct_ja, "PunctuatorJa",
+                        lambda: built.append("bert") or "bert-instance")
+    stub = _PunctStub(punct_model="bert")
+    assert stub.punct == "bert-instance"
+    assert built == ["bert"]
+    assert [e["type"] for e in stub.events] == ["model_load", "model_load"]
+
+
+def test_punct_property_builds_4class_when_selected(monkeypatch):
+    built = []
+    monkeypatch.setattr(punct_ja, "PunctuatorJa4Class",
+                        lambda **kw: built.append(kw.get("onnx_filename")) or "4class-instance")
+    monkeypatch.setattr(punct_ja, "PunctuatorJa",
+                        lambda: (_ for _ in ()).throw(
+                            AssertionError("bert must not be built when 4class succeeds")))
+    stub = _PunctStub(punct_model="4class")
+    assert stub.punct == "4class-instance"
+    # int8 when the download shipped it, else fp32 -- either way a filename was chosen
+    assert built in ([asr_engine.PUNCT4_INT8_FILENAME], [asr_engine.PUNCT4_FP32_FILENAME])
+    assert [e["type"] for e in stub.events] == ["model_load", "model_load"]
+
+
+def test_punct_property_4class_missing_falls_back_to_bert_with_warning(monkeypatch):
+    # models/punct-ja-4class-permissive/ not downloaded (download_models.py
+    # --punct-4class) -- must degrade to bert, not raise or silently drop
+    # punctuation entirely.
+    monkeypatch.setattr(punct_ja, "PunctuatorJa4Class",
+                        lambda **kw: (_ for _ in ()).throw(
+                            FileNotFoundError("models/punct-ja-4class-permissive/ not found")))
+    monkeypatch.setattr(punct_ja, "PunctuatorJa", lambda: "bert-instance")
+    stub = _PunctStub(punct_model="4class")
+    assert stub.punct == "bert-instance"
+    assert stub._punctuate is True  # degraded to bert, punctuation stays on
+    warnings = [e for e in stub.events if e["type"] == "warning"]
+    assert len(warnings) == 1
+    assert warnings[0]["code"] == "punct_model_unavailable"
+
+
+def test_punct_property_disables_when_both_models_unavailable(monkeypatch):
+    # Pre-existing degrade-quietly behavior: if bert ALSO fails to load
+    # (e.g. fugashi/onnxruntime missing), punctuation turns off entirely
+    # rather than raising -- unchanged by adding punct_model.
+    monkeypatch.setattr(punct_ja, "PunctuatorJa4Class",
+                        lambda **kw: (_ for _ in ()).throw(FileNotFoundError("no 4class model")))
+    monkeypatch.setattr(punct_ja, "PunctuatorJa",
+                        lambda: (_ for _ in ()).throw(ImportError("no fugashi")))
+    stub = _PunctStub(punct_model="4class")
+    assert stub.punct is None
+    assert stub._punctuate is False
 
 
 # ---- script correction matrix ----------------------------------------------
@@ -1276,3 +1361,11 @@ def test_tier_fallback_table_only_names_known_tiers():
         assert opt_in in asr_engine._BUILDERS
         for d in defaults:
             assert d in asr_engine._BUILDERS
+
+
+def test_punct4_prefers_int8_when_present(tmp_path):
+    (tmp_path / "punct_4class.onnx").write_bytes(b"x")
+    assert asr_engine._punct4_onnx_filename(tmp_path) == asr_engine.PUNCT4_FP32_FILENAME
+    (tmp_path / "quantized_ort").mkdir()
+    (tmp_path / "quantized_ort" / "punct_4class.int8.onnx").write_bytes(b"x")
+    assert asr_engine._punct4_onnx_filename(tmp_path) == asr_engine.PUNCT4_INT8_FILENAME

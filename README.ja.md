@@ -40,6 +40,8 @@ Whisper系・クラウドSTT API・他のローカルモデルとの比較（hay
 | OBSオーバーレイ+ダッシュボード | `--serve`でローカルHTTPサーバーを起動、ブラウザソースオーバーレイとライブダッシュボードを提供 |
 | ネットワーク音声入力 | `--input ws`でWebSocket経由のマイク音声（スマホ、ESP32/スタックチャン等）を受け付け、`--serve`のダッシュボード/オーバーレイにもそのまま流れる |
 | スピーカーループバック入力 | `--input speaker`でPC内部のスピーカー（システム音声出力）をWASAPIループバックで文字起こし（Windows専用、Stereo Mixの有効化は不要）。`--input mix`はマイクとスピーカー音声を合成した1本のストリームとして文字起こし（会議の文字起こしなどに） |
+| 英語v2ティア（オプトイン） | `--en-tier v2`で既定の多言語Parakeet v3から英語専用のParakeet TDT v2に切り替え（`download_models.py --en-parakeet-v2`が必要、常駐+約660MB）。FLEURS enでWER 10.0%→6.6%を実測（`docs/eval/en_candidates.md`） |
+| 4クラス日本語句読点（オプトイン） | `--punct-model 4class`で既定のBERT復元器から、、/。/？/！を直接予測する単一モデルに切り替え（既定モデルにない？/！への本格対応）。int8で約37MB、FLEURS jaで約4.6ms/行だが、密なWebテキストで学習しているためTV字幕のような疎な句読点領域では既定モデルに劣る（`docs/eval/punct_retrain.md`、既知の制限参照）。`download_models.py --punct-4class`が必要 |
 | メモリ上限管理 | LRUモデル退避で常駐モデルを上限内（既定<2GB）に制御 |
 | CPUのみ | すべてのモデルがsherpa-onnx経由の量子化ONNXとして動作。GPU・PyTorch不要 |
 
@@ -132,6 +134,18 @@ RDPクライアント側でマイクリダイレクトを有効にするか（`m
 [`docs/guide/embedding.ja.md`](docs/guide/embedding.ja.md)にあります。
 Flutter/Dart側は[`mobile/hayamimi_core/README.md`](mobile/hayamimi_core/README.md)。
 
+```python
+from asr_engine import RoutedASR
+
+# en_tier="v2"、punct_model="4class"はどちらもオプトイン（上の「機能」参照）。
+# 省略すれば従来どおり（v3 / bert）。未知の値はコンストラクタでValueErrorになり、
+# 未ダウンロードのオプトインモデルは既定モデルへ自動で後退し`warning`イベントが出る。
+with RoutedASR(en_tier="v2", punct_model="4class", on_event=hub.publish) as asr:
+    ...  # asr.transcribe(...) / asr.partial(...)
+# `with`を抜けると自動でclose()が呼ばれる。使わない場合は自分でasr.close()を
+# 呼ぶこと -- 詳細はembedding.ja.mdの「パイプラインの終了」を参照。
+```
+
 ## 動作環境
 
 Python 3.10以上と、PATHの通ったffmpegが必要です。開発と検証は**Windows 11**で行いました。
@@ -167,8 +181,10 @@ python -m venv .venv
 ```
 
 `scripts/download_models.py`は約3.1GB分のモデルを`models/`（git管理外）にダウンロードします。
-`--minimal`を付けると日本語と英語だけの約1.1GB構成になります。
-各モデルのライセンスは`THIRD_PARTY_NOTICES.md`にまとめてあります。
+`--minimal`を付けると日本語と英語だけの約1.1GB構成になります。上記2つのオプトイン
+ティアは個別のフラグで追加します: `--en-parakeet-v2`（+約460MB、`--en-tier v2`用）と
+`--punct-4class`（+約40MB、`--punct-model 4class`用）。どちらも`--minimal`と併用でき、
+省略されません。各モデルのライセンスは`THIRD_PARTY_NOTICES.md`にまとめてあります。
 
 ## CLIリファレンス
 
@@ -200,6 +216,8 @@ python -m venv .venv
 | `--speakers` | オフ | 発話に話者ID（S1, S2, ...）をラベル付け。清書パスでpyannote segmentation-3.0による再分離をかけ直す |
 | `--speaker-remap-threshold T` | 0.35 | 清書パスの分離結果をセッション全体のS{n}ラベルへ対応付ける際のコサイン類似度閾値（速報パスは従来の0.45のまま） |
 | `--translate [LANGS]` | オフ、`en` | 日本語行をカンマ区切りの言語に翻訳。`en`は専用のFuguMTモジュール、それ以外（`zh`/`ko`/`es`/`fr`など）はモデルの語彙が対応していれば受け付ける。`zh`/`ko`/`es`以外は品質未実測の旨をnoteで表示、詳細はdocs/design/translate_m2m.md |
+| `--en-tier {v3,v2}` | `v3` | `en`をどのParakeetモデルで処理するか。`v3`は他の欧州24言語（V3_LANGS）も兼ねる。`v2`はオプトインの英語専用モデルでWERが低い（`download_models.py --en-parakeet-v2`が必要。未ダウンロードなら`v3`へ後退し`model_fallback`イベントが出る）。詳細は`docs/eval/en_candidates.md` |
+| `--punct-model {bert,4class}` | `bert` | 日本語の句読点復元にどのモデルを使うか。`bert`は現行のMojicast BERT-char復元器（モデルはコンマ/句点のみ予測し「？」はサフィックスの発見的規則で付与、「！」は非対応）。`4class`はオプトインで、、/。/？/！を直接予測する（`download_models.py --punct-4class`が必要。未ダウンロードなら`bert`へ後退し`warning`イベントが出る）。詳細は`docs/eval/punct_retrain.md` |
 
 ## アーキテクチャ
 
@@ -319,7 +337,13 @@ python -m venv .venv
   clip-324系）と、落ちた量が少なくて文字数が正常に見えてしまう場合です。
 - **作者の環境以外での検証はまだ多くありません。** 手元で数値が再現しない場合は
   Issueで教えてもらえると助かります。
-
+- **opt-in の4クラス句読点モデル（`--punct-model 4class`）は既定で「！」を出しません。**
+  密な Web 文（FineWeb-2）で学習したため、話し言葉では強調気味の語りにも実際の感嘆文と同じ
+  確信度で「！」を打ってしまい、閾値では分離できませんでした。そのためデコードで「！」を
+  無効（`exclaim_threshold > 1`）、読点を 0.8 でゲートしています。この既定なら、疎な句読点の
+  ja TV 字幕（`testdata/eval_real`）でも既定モデルを上回り（F1 0.64 対 0.62）、FLEURS ja では
+  0.89 対 0.62 です。「！」が要る密なテキストでは `PunctuatorJa4Class(exclaim_threshold=0.9)` を
+  渡してください。`docs/eval/punct_retrain.md` の「Decode gates」を参照。
 ## ライセンス
 
 ソースコードはMITライセンスです（`LICENSE`）。モデルの重みはこのリポジトリに含まれておらず、
@@ -350,6 +374,11 @@ hayamimiは次のプロジェクトの成果を借りて動いています。
 - [3D-Speaker](https://github.com/modelscope/3D-Speaker)（Alibaba DAMO Academy）:
   `--speakers`で使う話者埋め込みモデル。
 - [Kiwi](https://github.com/bab2min/kiwipiepy): 韓国語の分かち書きを直す形態素解析器。
+- [SB Intuitions](https://huggingface.co/sbintuitions):
+  [modernbert-ja-30m](https://huggingface.co/sbintuitions/modernbert-ja-30m)、
+  オプトインの4クラス日本語句読点モデル（`--punct-model 4class`）が使うMITベースモデル。
+- [FineWeb-2](https://huggingface.co/datasets/HuggingFaceFW/fineweb-2)（Hugging Face）:
+  そのモデルのファインチューニングに使った`jpn_Jpan`学習テキスト（ODC-By 1.0）。
 
 ## ドキュメント
 

@@ -105,3 +105,18 @@ def test_minimal_with_en_parakeet_v2_downloads_v2(monkeypatch):
     download_models.main()
     assert "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8" in calls
     assert "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8" not in calls
+
+
+def test_minimal_with_punct_4class_downloads_it(monkeypatch):
+    """--punct-4class must not be silently dropped when combined with
+    --minimal, matching --en-parakeet-v2's guarantee above."""
+    hf_calls = []
+    monkeypatch.setattr(download_models, "download_and_extract_tarbz2", lambda *a, **k: None)
+    monkeypatch.setattr(download_models, "download_file", lambda *a, **k: None)
+    monkeypatch.setattr(download_models, "download_hf_repo",
+                        lambda repo, dest_dir, *a, **k: hf_calls.append((repo, dest_dir)))
+    monkeypatch.setattr(download_models, "extract_members_only", lambda *a, **k: None)
+    monkeypatch.setattr(download_models.os, "makedirs", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", ["download_models.py", "--minimal", "--punct-4class"])
+    download_models.main()
+    assert ("oboroge0/hayamimi-punct-ja-4class", "punct-ja-4class-permissive") in hf_calls

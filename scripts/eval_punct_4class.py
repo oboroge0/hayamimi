@@ -109,7 +109,7 @@ def punct_cer(ref: str, hyp: str):
     return (dist / len(r) if r else 0.0), dist, len(r)
 
 
-def build_punctuator(variant, model_dir, num_threads):
+def build_punctuator(variant, model_dir, num_threads, exclaim_threshold="default", comma_threshold="default"):
     """Return a `.restore(text) -> punctuated text` callable for `variant`.
 
     fp32/int8 both go through PunctuatorJa4Class -- the same class callers
@@ -128,8 +128,12 @@ def build_punctuator(variant, model_dir, num_threads):
 
     onnx_filename = FP32_ONNX_NAME if variant == "fp32" else INT8_ONNX_NAME
     print(f"[model] {os.path.join(model_dir, onnx_filename)}")
+    kw = {}
+    if exclaim_threshold != "default": kw["exclaim_threshold"] = exclaim_threshold
+    if comma_threshold != "default": kw["comma_threshold"] = comma_threshold
     p = PunctuatorJa4Class(model_dir=model_dir, onnx_filename=onnx_filename,
-                           num_threads=num_threads)
+                           num_threads=num_threads, **kw)
+    print(f"[model] exclaim_threshold={p.exclaim_threshold} comma_threshold={p.comma_threshold}")
     return p.restore
 
 
@@ -308,13 +312,20 @@ def main():
     ap.add_argument("--exclaim-set", action="store_true",
                      help="evaluate ！ on a self-authored exclamation set (quality note, "
                           "not an acceptance criterion -- see build_exclaim_set)")
+    ap.add_argument("--comma-threshold", type=float, default=None,
+                    help="softmax probability 、 must reach to be emitted (default: class default; negative = argmax)")
+    ap.add_argument("--exclaim-threshold", type=float, default=None,
+                    help="softmax probability ！ must reach to be emitted (default: the class default; "
+                         "negative = plain argmax, no threshold)")
     ap.add_argument("--threads", type=int, default=2,
                      help="onnxruntime intra_op_num_threads (default 2 -- other eval "
                           "tracks run in parallel on this CPU)")
     args = ap.parse_args()
 
     model_dir = os.path.abspath(args.model_dir)
-    restore = build_punctuator(args.variant, model_dir, args.threads)
+    thr = "default" if args.exclaim_threshold is None else (None if args.exclaim_threshold < 0 else args.exclaim_threshold)
+    cthr = "default" if args.comma_threshold is None else (None if args.comma_threshold < 0 else args.comma_threshold)
+    restore = build_punctuator(args.variant, model_dir, args.threads, exclaim_threshold=thr, comma_threshold=cthr)
 
     if args.exclaim_set:
         texts = build_exclaim_set()

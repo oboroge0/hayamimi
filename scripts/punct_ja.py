@@ -228,6 +228,17 @@ PUNCT4_DEFAULT_MODEL_DIR = SCRIPT_DIR.parent / "models" / "punct-ja-4class-permi
 PUNCT4_ONNX_FILENAME = "punct_4class.onnx"
 PUNCT4_MAX_CHARS = 450
 PUNCT4_INTRA_OP_NUM_THREADS = 2  # other eval tracks run in parallel on this CPU
+# Decode gates (docs/eval/punct_retrain.md, "Decode gates" section). The model
+# was trained on dense web prose; on speech it over-uses two marks:
+#  - "！": at plain argmax it put 4 spurious ！ on 15 TV-caption clips, and the
+#    spurious ones are as confident (p >= 0.97) as the real ones, so a threshold
+#    cannot separate them (real-！ recall 0.60 -> 0.14 at 0.97 while some
+#    spurious ones survive). Disabled by default: a value > 1 means "never emit
+#    ！"; None means plain argmax; 0.9 is a reasonable setting for dense text.
+#  - "、": gated at 0.8, which raises both the TV-caption F1 (0.59 -> 0.64,
+#    above the shipped model's 0.62) and FLEURS ja F1 (0.888 -> 0.893).
+PUNCT4_EXCLAIM_THRESHOLD: "float | None" = 1.01
+PUNCT4_COMMA_THRESHOLD: "float | None" = 0.8
 
 
 class PunctuatorJa4Class:
@@ -261,6 +272,8 @@ class PunctuatorJa4Class:
         onnx_filename: str = PUNCT4_ONNX_FILENAME,
         max_chars: int = PUNCT4_MAX_CHARS,
         num_threads: int = PUNCT4_INTRA_OP_NUM_THREADS,
+        exclaim_threshold: "float | None" = PUNCT4_EXCLAIM_THRESHOLD,
+        comma_threshold: "float | None" = PUNCT4_COMMA_THRESHOLD,
     ):
         import onnxruntime as ort
 
@@ -284,6 +297,9 @@ class PunctuatorJa4Class:
             )
 
         self.max_chars = max_chars
+
+        self.exclaim_threshold = exclaim_threshold
+        self.comma_threshold = comma_threshold
         self.tokenizer = Tokenizer.from_file(str(tokenizer_path))
 
         so = ort.SessionOptions()
@@ -316,9 +332,33 @@ class PunctuatorJa4Class:
         logits = self.session.run(
             ["logits"], {"input_ids": ids_np, "attention_mask": mask_np}
         )[0][0]  # -> (seq_len, 5)
-        preds = logits.argmax(-1).tolist()
+        preds = decode_punct4_labels(logits, self.exclaim_threshold, self.comma_threshold)
 
         return reconstruct_punct4_text(text, enc.offsets, preds)
+
+
+def decode_punct4_labels(logits, exclaim_threshold: "float | None" = PUNCT4_EXCLAIM_THRESHOLD,
+                         comma_threshold: "float | None" = PUNCT4_COMMA_THRESHOLD,
+                         labels=PUNCT4_LABELS) -> list:
+    """argmax over the (seq_len, n_labels) logits, except that "！" and "、" are
+    only eligible where their softmax probability clears their threshold.
+
+    Every gated mark is removed from the candidate set BEFORE the argmax, so a
+    comma that fails its gate can never hand the position to a weak "！" (the
+    sequential apply-one-gate-then-the-next version did exactly that). "O" is
+    never gated, so a candidate always remains. Pure numpy, unit-tested."""
+    logits = np.asarray(logits, dtype=np.float32)
+    gates = [(mark, thr) for mark, thr in (("！", exclaim_threshold), ("、", comma_threshold))
+             if thr is not None and mark in labels]
+    if not gates:
+        return logits.argmax(-1).tolist()
+    z = logits - logits.max(-1, keepdims=True)
+    probs = np.exp(z); probs /= probs.sum(-1, keepdims=True)
+    masked = logits.copy()
+    for mark, thr in gates:
+        k = labels.index(mark)
+        masked[probs[:, k] < thr, k] = -np.inf
+    return masked.argmax(-1).tolist()
 
 
 def reconstruct_punct4_text(text: str, offsets, label_ids, labels=PUNCT4_LABELS) -> str:

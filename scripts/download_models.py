@@ -175,7 +175,8 @@ def download_hf_repo(repo: str, dest_dir: str, label: str, ignore_patterns=None)
 
 
 def download_opt_ins(args) -> None:
-    """Opt-in downloads (--en-parakeet-v2, --eval-baselines, --lid-candidates, --translate-candidates).
+    """Opt-in downloads (--en-parakeet-v2, --punct-4class, --eval-baselines,
+    --lid-candidates, --translate-candidates).
 
     Called from BOTH the --minimal early return and the end of the full run:
     an opt-in flag must never be silently ignored just because it was
@@ -188,6 +189,16 @@ def download_opt_ins(args) -> None:
             f"{GITHUB_RELEASES}/{ASR_TAG}/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
             "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
             "Parakeet TDT 0.6B v2 (en-only, opt-in --en-tier v2)")
+
+    if args.punct_4class:
+        # Same layout as the local models/punct-ja-4class-permissive/ this
+        # was trained into (punct_4class.onnx, quantized_ort/*.int8.onnx,
+        # hf/tokenizer.json, README.md, SHA256SUMS) -- train_log.jsonl is
+        # not part of the published repo. See docs/eval/punct_retrain.md.
+        download_hf_repo(
+            "oboroge0/hayamimi-punct-ja-4class",
+            "punct-ja-4class-permissive",
+            "4-class ja punctuation model (opt-in --punct-model 4class, MIT)")
 
     if args.eval_baselines:
         download_and_extract_tarbz2(
@@ -281,6 +292,12 @@ def main():
                           "see docs/eval/en_candidates.md and --en-tier v2). Not part of "
                           "--minimal or the default set -- en stays on v3 unless you "
                           "both download this and pass --en-tier v2.")
+    ap.add_argument("--punct-4class", action="store_true",
+                     help="also download the opt-in 4-class ja punctuation model "
+                          "(~40MB, see docs/eval/punct_retrain.md and --punct-model "
+                          "4class). Not part of --minimal or the default set -- ja "
+                          "punctuation stays on the bert model unless you both "
+                          "download this and pass --punct-model 4class.")
     args = ap.parse_args()
 
     os.makedirs(MODELS_DIR, exist_ok=True)
@@ -288,6 +305,8 @@ def main():
     total_gb = "~1.1GB" if args.minimal else ("~4.1GB" if args.eval_baselines else "~3.1GB")
     if args.en_parakeet_v2:
         total_gb += " + ~460MB (--en-parakeet-v2)"
+    if args.punct_4class:
+        total_gb += " + ~40MB (--punct-4class)"
     print(f"hayamimi model download: this will fetch {total_gb} into {MODELS_DIR}")
     print("(see THIRD_PARTY_NOTICES.md for each model's license)\n")
 
