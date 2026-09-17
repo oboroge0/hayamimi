@@ -40,7 +40,7 @@ Whisper系・クラウドSTT API・他のローカルモデルとの比較（hay
 | OBSオーバーレイ+ダッシュボード | `--serve`でローカルHTTPサーバーを起動、ブラウザソースオーバーレイとライブダッシュボードを提供 |
 | ネットワーク音声入力 | `--input ws`でWebSocket経由のマイク音声（スマホ、ESP32/スタックチャン等）を受け付け、`--serve`のダッシュボード/オーバーレイにもそのまま流れる |
 | スピーカーループバック入力 | `--input speaker`でPC内部のスピーカー（システム音声出力）をWASAPIループバックで文字起こし（Windows専用、Stereo Mixの有効化は不要）。`--input mix`はマイクとスピーカー音声を合成した1本のストリームとして文字起こし（会議の文字起こしなどに） |
-| 英語v2ティア（オプトイン） | `--en-tier v2`で既定の多言語Parakeet v3から英語専用のParakeet TDT v2に切り替え（`download_models.py --en-parakeet-v2`が必要、常駐+約660MB）。FLEURS enでWER 10.0%→6.6%を実測（`docs/eval/en_candidates.md`） |
+| 英語v2ティア（v0.6から既定） | `en`は英語専用のParakeet TDT v2モデルへルーティングされる。旧来の多言語Parakeet v3ルートよりWERが低い（FLEURS enでWER 10.0%→6.6%を実測、`docs/eval/en_candidates.md`）。`--en-tier v3`で多言語モデルに戻せる（欧州24言語は引き続きこちらが担当し、v2未ダウンロード時の自動フォールバック先でもある） |
 | 4クラス日本語句読点（オプトイン） | `--punct-model 4class`で既定のBERT復元器から、、/。/？/！を直接予測する単一モデルに切り替え（既定モデルにない？/！への本格対応）。int8で約37MB、FLEURS jaで約4.6ms/行だが、密なWebテキストで学習しているためTV字幕のような疎な句読点領域では既定モデルに劣る（`docs/eval/punct_retrain.md`、既知の制限参照）。`download_models.py --punct-4class`が必要 |
 | メモリ上限管理 | LRUモデル退避で常駐モデルを上限内（既定<2GB）に制御 |
 | CPUのみ | すべてのモデルがsherpa-onnx経由の量子化ONNXとして動作。GPU・PyTorch不要 |
@@ -137,9 +137,10 @@ Flutter/Dart側は[`mobile/hayamimi_core/README.md`](mobile/hayamimi_core/README
 ```python
 from asr_engine import RoutedASR
 
-# en_tier="v2"、punct_model="4class"はどちらもオプトイン（上の「機能」参照）。
-# 省略すれば従来どおり（v3 / bert）。未知の値はコンストラクタでValueErrorになり、
-# 未ダウンロードのオプトインモデルは既定モデルへ自動で後退し`warning`イベントが出る。
+# en_tierの既定は"v2"（v0.6以降、上の「機能」参照）、punct_modelの既定は"bert"。
+# "v3" / "4class"を渡すとそちらへ切り替えられる。未知の値はコンストラクタで
+# ValueErrorになり、未ダウンロードのモデルを要求した場合は既定モデル（v3 / bert）
+# へ自動で後退し`warning`/`model_fallback`イベントが出る。
 with RoutedASR(en_tier="v2", punct_model="4class", on_event=hub.publish) as asr:
     ...  # asr.transcribe(...) / asr.partial(...)
 # `with`を抜けると自動でclose()が呼ばれる。使わない場合は自分でasr.close()を
@@ -180,10 +181,12 @@ python -m venv .venv
 # -> ブラウザで http://localhost:8833/dashboard を開く
 ```
 
-`scripts/download_models.py`は約3.1GB分のモデルを`models/`（git管理外）にダウンロードします。
-`--minimal`を付けると日本語と英語だけの約1.1GB構成になります。上記2つのオプトイン
-ティアは個別のフラグで追加します: `--en-parakeet-v2`（+約460MB、`--en-tier v2`用）と
-`--punct-4class`（+約40MB、`--punct-model 4class`用）。どちらも`--minimal`と併用でき、
+`scripts/download_models.py`は約3.6GB分のモデルを`models/`（git管理外）にダウンロードします。
+これには英語の両ティア（v0.6から既定のv2と、その自動フォールバック兼欧州24言語担当のv3）が
+含まれます。`--minimal`を付けると日本語と英語だけの約1.1GB構成になりますが、この構成では
+英語はReazonSpeechの全角大文字出力のままになります（`--en-parakeet-v2`（+約460MB）を
+併用して`--en-tier v2`を有効化するか、v3を別途取得しない限り）。`--punct-4class`
+（+約40MB、`--punct-model 4class`用）は別のオプトインで、こちらも`--minimal`と併用でき
 省略されません。各モデルのライセンスは`THIRD_PARTY_NOTICES.md`にまとめてあります。
 
 ## CLIリファレンス
@@ -216,7 +219,7 @@ python -m venv .venv
 | `--speakers` | オフ | 発話に話者ID（S1, S2, ...）をラベル付け。清書パスでpyannote segmentation-3.0による再分離をかけ直す |
 | `--speaker-remap-threshold T` | 0.35 | 清書パスの分離結果をセッション全体のS{n}ラベルへ対応付ける際のコサイン類似度閾値（速報パスは従来の0.45のまま） |
 | `--translate [LANGS]` | オフ、`en` | 日本語行をカンマ区切りの言語に翻訳。`en`は専用のFuguMTモジュール、それ以外（`zh`/`ko`/`es`/`fr`など）はモデルの語彙が対応していれば受け付ける。`zh`/`ko`/`es`以外は品質未実測の旨をnoteで表示、詳細はdocs/design/translate_m2m.md |
-| `--en-tier {v3,v2}` | `v3` | `en`をどのParakeetモデルで処理するか。`v3`は他の欧州24言語（V3_LANGS）も兼ねる。`v2`はオプトインの英語専用モデルでWERが低い（`download_models.py --en-parakeet-v2`が必要。未ダウンロードなら`v3`へ後退し`model_fallback`イベントが出る）。詳細は`docs/eval/en_candidates.md` |
+| `--en-tier {v3,v2}` | `v2` | `en`をどのParakeetモデルで処理するか。`v2`（v0.6から既定）は英語専用モデルでWERが低い（詳細は`docs/eval/en_candidates.md`）。既定でダウンロードされ、見つからない場合（例: `--en-parakeet-v2`なしの`--minimal`構成）は`v3`へ後退し`model_fallback`イベントが出る。`v3`は他の欧州24言語（V3_LANGS）も兼ねる |
 | `--punct-model {bert,4class}` | `bert` | 日本語の句読点復元にどのモデルを使うか。`bert`は現行のMojicast BERT-char復元器（モデルはコンマ/句点のみ予測し「？」はサフィックスの発見的規則で付与、「！」は非対応）。`4class`はオプトインで、、/。/？/！を直接予測する（`download_models.py --punct-4class`が必要。未ダウンロードなら`bert`へ後退し`warning`イベントが出る）。詳細は`docs/eval/punct_retrain.md` |
 
 ## アーキテクチャ
@@ -268,11 +271,11 @@ python -m venv .venv
 
 | 言語 | クリップ数 | LID正解率 | ルート | 平均誤り率 | 平均RTF |
 |---|---|---|---|---|---|
-| ja | 15 | 15/15 | ReazonSpeech | 7.5% | 0.071 |
-| en | 15 | 15/15 | Parakeet v3 | 2.3% | 0.109 |
-| zh | 12 | 12/12 | Paraformer-zh | 5.3% | 0.102 |
-| ko | 12 | 12/12 | SenseVoice | 8.1% | 0.062 |
-| yue | 12 | 12/12 | SenseVoice | 6.1% | 0.061 |
+| ja | 15 | 15/15 | ReazonSpeech | 3.8% | 0.090 |
+| en | 15 | 15/15 | Parakeet v2 | 1.3% | 0.114† |
+| zh | 12 | 12/12 | Paraformer-zh | 6.6%* | 0.084 |
+| ko | 12 | 12/12 | SenseVoice | 8.1% | 0.060 |
+| yue | 12 | 12/12 | SenseVoice | 6.1% | 0.043 |
 
 どの言語もCPU単体で実時間の9〜16倍の速さです。開発中に何を試して何を捨てたかは、
 30回分の改善記録ごと`docs/results/benchmarks.md`に残してあります。
@@ -280,6 +283,11 @@ python -m venv .venv
 主な実測値:
 
 - **日本語CER 3.8%**。同じ実放送音声で`whisper-large-v3-turbo`は13.8%。オプションの清書時二段照合（`--refine-ja-second-opinion`）は別の実放送50分セットで4.0%。
+- *zhの6.6%には、数字の表記ズレによる約1.3ptが含まれます。パイプラインは「1000」のようにアラビア数字で書くのに対し、参照文の一部は「一千」と漢数字で書かれているためで、採点上の表記の不一致であって誤認識ではありません。
+- **英語 2.3%→1.3%**（v0.6）: `--en-tier`の既定が`v2`（英語専用モデル）に変わり、単独計測（FLEURS: WER 10.0%→6.6%、`docs/eval/en_candidates.md`）と同方向の改善が本番経路(LID+ルーティング込み)でも確認できた。`--en-tier v3`で従来の多言語ルートに戻せる。
+  †enの平均RTF 0.114（2026-09-16）は、無関係なジョブがホストCPUの約20%を使っている状態での計測値。
+  ja/zh/ko/yueは2026-09-01のアイドル状態での値。負荷の影響を受けないv2対v3の比較は
+  `docs/eval/en_candidates.md`の単独計測（0.099対0.141）を参照。誤り率は負荷の影響を受けない。
 - **確定までの平均が約100ms**（日本語、句読点込み）。5言語混在で全機能を有効にしても平均236ms。
 - **メモリ2GB未満**（`--max-resident 3`のとき）。`--max-resident 2`なら1.35GB。
 

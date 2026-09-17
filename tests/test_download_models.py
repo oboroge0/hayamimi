@@ -93,6 +93,41 @@ def test_minimal_still_runs_opt_in_downloads(monkeypatch):
     assert not any(name == "sherpa-onnx-paraformer-zh-int8-2025-10-07" for _, name in calls)
 
 
+def test_default_install_downloads_v2_and_v3(monkeypatch):
+    """v0.6: --en-tier defaults to v2, so the non-minimal (default) download
+    set must include the v2 tarball alongside v3 -- v3 stays too, since it's
+    en's automatic fallback and still covers the other 24 V3_LANGS European
+    languages."""
+    calls = []
+    monkeypatch.setattr(download_models, "download_and_extract_tarbz2",
+                        lambda *a, **k: calls.append(a[1]))
+    monkeypatch.setattr(download_models, "download_file", lambda *a, **k: None)
+    monkeypatch.setattr(download_models, "download_hf_repo", lambda *a, **k: None)
+    monkeypatch.setattr(download_models, "extract_members_only", lambda *a, **k: None)
+    monkeypatch.setattr(download_models.os, "makedirs", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", ["download_models.py"])
+    download_models.main()
+    assert "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8" in calls
+    assert "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8" in calls
+
+
+def test_minimal_without_flag_does_not_download_v2(monkeypatch):
+    """--minimal alone (no --en-parakeet-v2) must NOT pull v2 -- minimal's
+    ja/en core is ReazonSpeech, matching --minimal's own docstring claim
+    that it skips the multilingual/v3/v2 ASR tiers."""
+    calls = []
+    monkeypatch.setattr(download_models, "download_and_extract_tarbz2",
+                        lambda *a, **k: calls.append(a[1]))
+    monkeypatch.setattr(download_models, "download_file", lambda *a, **k: None)
+    monkeypatch.setattr(download_models, "download_hf_repo", lambda *a, **k: None)
+    monkeypatch.setattr(download_models, "extract_members_only", lambda *a, **k: None)
+    monkeypatch.setattr(download_models.os, "makedirs", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", ["download_models.py", "--minimal"])
+    download_models.main()
+    assert "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8" not in calls
+    assert "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8" not in calls
+
+
 def test_minimal_with_en_parakeet_v2_downloads_v2(monkeypatch):
     calls = []
     monkeypatch.setattr(download_models, "download_and_extract_tarbz2",

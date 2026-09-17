@@ -6,11 +6,13 @@ each audio segment to the best model for that language.
   tier 0  ja                   -> ReazonSpeech k2 zipformer (best real-speech ja, fastest)
   tier 1  zh                   -> Paraformer-zh (best real-speech zh)
   tier 1  ko/yue               -> SenseVoice small
-  tier 2  en + 24 EU langs     -> Parakeet TDT v3 (casing + punctuation)
-          en (opt-in, en_tier="v2") -> Parakeet TDT v2 (en-only, lower WER
-                                        than v3 on en -- docs/eval/en_candidates.md;
-                                        default stays v3, which also covers the
-                                        other 24 V3_LANGS)
+  tier 2  en                   -> Parakeet TDT v2 (en-only, default since v0.6 --
+                                   lower WER than v3 on en, docs/eval/en_candidates.md;
+                                   pass en_tier="v3" / --en-tier v3 to fall back to
+                                   the multilingual model below; RoutedASR also
+                                   degrades there automatically if v2 isn't downloaded)
+          24 EU langs          -> Parakeet TDT v3 (casing + punctuation; also
+                                   handles en when en_tier="v3")
   tier 3  everything else      -> Omnilingual ASR 300M CTC (1600+ languages)
 
 Models are loaded lazily on first use and, when `max_resident` is set, the
@@ -34,12 +36,15 @@ from lid_preprocessing import trim_lid_clip  # noqa: F401 (re-exported as asr_en
 
 MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models")
 V3_MODEL_DIR = os.path.join(MODELS_DIR, "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8")
-# en-only alternative to v3 for the "en" language, opt-in via RoutedASR(en_tier="v2")
-# / realtime_transcribe.py's --en-tier v2. See docs/eval/en_candidates.md: FLEURS en
-# WER 6.64% vs v3's 10.04%, real-speech (LibriSpeech) WER 1.33% vs v3's 2.26%, both
-# well inside the eval track's adoption thresholds. Kept opt-in (default stays v3)
-# because v3 also carries the other 24 V3_LANGS European languages that v2 doesn't
-# cover at all, and because it costs an extra ~660MB resident once loaded.
+# en-only alternative to v3 for the "en" language, and the default English tier
+# since v0.6 (RoutedASR(en_tier="v2") / realtime_transcribe.py's --en-tier,
+# both default to "v2"). See docs/eval/en_candidates.md: FLEURS en WER 6.64% vs
+# v3's 10.04%, real-speech (LibriSpeech) WER 1.33% vs v3's 2.26%, both well
+# inside the eval track's adoption thresholds. v3 stays available (--en-tier
+# v3) because it also carries the other 24 V3_LANGS European languages that
+# v2 doesn't cover at all; with the default en_tier="v2" a session that
+# touches both en and a V3_LANGS European language ends up with both
+# recognizers resident (an extra ~660MB beyond v3 alone).
 V2_MODEL_DIR = os.path.join(MODELS_DIR, "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8")
 SV_MODEL_DIR = os.path.join(MODELS_DIR, "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17")
 OMNI_MODEL_DIR = os.path.join(MODELS_DIR, "omnilingual-300m-ctc-int8")
@@ -95,12 +100,14 @@ V3_LANGS = {
 # unlikely to be what a caller setting --lang/--mode single intended.
 ROUTABLE_LANGS = RZ_LANGS | PARA_LANGS | SV_LANGS | V3_LANGS
 
-# Valid values for RoutedASR(en_tier=...) / --en-tier. "v3" (default) keeps
-# "en" on the multilingual Parakeet TDT v3 model alongside the other
-# V3_LANGS. "v2" is the opt-in en-only tier (docs/eval/en_candidates.md) --
-# it does not touch V3_LANGS membership, so tests and callers that only look
-# at the routing sets keep seeing "en" homed on v3 unless en_tier="v2" is
-# passed explicitly.
+# Valid values for RoutedASR(en_tier=...) / --en-tier. "v2" (default since
+# v0.6) is the en-only tier (docs/eval/en_candidates.md); "v3" keeps "en" on
+# the multilingual Parakeet TDT v3 model alongside the other V3_LANGS
+# instead. Neither value touches V3_LANGS membership itself -- "en" stays in
+# V3_LANGS regardless, so tests and callers that only look at the routing
+# sets keep seeing "en" as a V3_LANGS member even though _route() sends it to
+# v2 by default (see _route()'s "en" branch, checked before the V3_LANGS
+# membership test).
 EN_TIERS = ("v3", "v2")
 
 
@@ -346,8 +353,9 @@ def _build_v3_recognizer(threads: int):
 
 
 def _build_v2_recognizer(threads: int):
-    # en-only tier, opt-in (see V2_MODEL_DIR / EN_TIERS above). Same NeMo
-    # TDT transducer export shape as v3, just a different model directory.
+    # en-only tier, default since v0.6 (see V2_MODEL_DIR / EN_TIERS above).
+    # Same NeMo TDT transducer export shape as v3, just a different model
+    # directory.
     return sherpa_onnx.OfflineRecognizer.from_transducer(
         encoder=_find(V2_MODEL_DIR, "encoder*.onnx"),
         decoder=_find(V2_MODEL_DIR, "decoder*.onnx"),
@@ -761,16 +769,37 @@ _BUILDERS = {
     "pja": _build_parakeet_ja,
 }
 
-# preload priority when a residency cap is in effect. "v2" is deliberately
-# absent here, same as "pja": both are opt-in models that most sessions never
-# touch (en_tier defaults to "v3", ja_second_opinion defaults to False), so
-# they lazy-load on first use via _get() instead of paying their load cost
-# on every session regardless of whether the opt-in feature is on.
-_PRELOAD_ORDER = ("pz", "sv", "v3", "omni")
+# preload priority when a residency cap is in effect, keyed by the session's
+# en_tier so the tier "en" actually routes to (see _route()) is prefetched
+# before the one it doesn't. "pja" stays absent from both orders: it's the
+# opt-in ja second-opinion model (ja_second_opinion defaults to False), which
+# most sessions never touch, so it lazy-loads on first use via _get() instead
+# of paying its load cost on every session regardless.
+#
+# en_tier="v2" (the v0.6 default): v2 is en's actual home now, so it's
+# preloaded ahead of v3 -- with the default max_resident=3, pz/sv/v2 fill the
+# budget and v3 (needed only for the other 24 V3_LANGS European languages)
+# lazy-loads on that first non-en European utterance instead.
+#
+# en_tier="v3": unchanged from pre-v0.6 -- v2 isn't en's tier in this session,
+# so it stays out of preload and lazy-loads only if something explicitly asks
+# for it (it can't, via _route(), while en_tier="v3"; _TIER_FALLBACK also
+# never routes v3 -> v2).
+_PRELOAD_ORDER_BY_EN_TIER: dict[str, tuple[str, ...]] = {
+    "v2": ("pz", "sv", "v2", "v3", "omni"),
+    "v3": ("pz", "sv", "v3", "omni"),
+}
 
-# Opt-in tiers that are strict alternatives to a default tier, and the default
-# they must degrade to when missing (consulted by _get_with_fallback before the
-# generic chain). Register every future opt-in tier here.
+
+def _preload_order(en_tier: str) -> tuple[str, ...]:
+    return _PRELOAD_ORDER_BY_EN_TIER.get(en_tier, _PRELOAD_ORDER_BY_EN_TIER["v3"])
+
+# Tiers that are strict alternatives to another tier, and the fallback they
+# must degrade to when missing from disk (consulted by _get_with_fallback
+# before the generic chain). "v2" is here because it's the default en_tier
+# since v0.6 but isn't guaranteed to be on disk -- an install that predates
+# v0.6 and hasn't re-run download_models.py falls back to v3. Register every
+# future tier-with-a-required-fallback here.
 _TIER_FALLBACK: dict[str, tuple[str, ...]] = {"v2": ("v3",)}
 
 
@@ -797,7 +826,7 @@ class RoutedASR:
                  forced_lang: str | None = None,
                  ja_second_opinion: bool = False,
                  agree_threshold: float = SECOND_OPINION_THRESHOLD,
-                 en_tier: str = "v3",
+                 en_tier: str = "v2",
                  punct_model: str = "bert",
                  on_event: "Callable[[dict], None] | None" = None):
         # on_event (GitHub issue #29): the engine's structured-event sink.
@@ -1020,7 +1049,7 @@ class RoutedASR:
         self.ko_spacer  # cheap (~1s); fixes SenseVoice's over-split Korean
         silence = np.zeros(16000, dtype=np.float32)
         budget = None if self._max_resident is None else self._max_resident
-        for name in _PRELOAD_ORDER:
+        for name in _preload_order(self._en_tier):
             if self._closed:
                 break
             if budget is not None and budget <= 0:
@@ -1455,13 +1484,14 @@ class RoutedASR:
         if lang in SV_LANGS:
             return self._get_with_fallback("sv")
         if lang == "en" and self._en_tier == "v2":
-            # opt-in en-only tier (docs/eval/en_candidates.md); deliberately
-            # checked before the V3_LANGS membership test below rather than
-            # by removing "en" from V3_LANGS, so V3_LANGS/ROUTABLE_LANGS stay
-            # accurate for every session that leaves en_tier at its "v3"
-            # default.
-            # A missing v2 (not in the default download set) lands on v3 via
-            # _TIER_FALLBACK, never on the generic chain's rz.
+            # en-only tier, default since v0.6 (docs/eval/en_candidates.md);
+            # deliberately checked before the V3_LANGS membership test below
+            # rather than by removing "en" from V3_LANGS, so V3_LANGS/
+            # ROUTABLE_LANGS stay accurate for every session -- including one
+            # that opts back into en_tier="v3" via --en-tier v3.
+            # A missing v2 (e.g. an install from before v0.6 that hasn't
+            # re-run download_models.py) lands on v3 via _TIER_FALLBACK,
+            # never on the generic chain's rz.
             return self._get_with_fallback("v2")
         if lang in V3_LANGS:
             return self._get_with_fallback("v3")
