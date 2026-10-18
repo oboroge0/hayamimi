@@ -340,7 +340,14 @@ def wav_chunks(samples: np.ndarray, sample_rate: int, realtime: bool):
 
 
 MIC_QUEUE_TIMEOUT_S = 0.1  # how often the generator wakes up to check stop_event
-LOOPBACK_BLOCK_SIZE = WINDOW_SIZE * 4  # SoundCard recommends > record(numframes)
+# SoundCard passes blocksize straight to IAudioClient::Initialize as the
+# WASAPI capture *buffer duration*, so it bounds how long the capture thread
+# may go without calling record() before the device overruns ("data
+# discontinuity in recording" = dropped audio).  128ms (WINDOW_SIZE * 4) was
+# routinely exceeded when ASR/diarization held the GIL during a meeting.  A
+# larger shared-mode capture buffer adds no latency: record() still returns as
+# soon as each device period's packet is available.
+LOOPBACK_BLOCK_SIZE = SAMPLE_RATE * 2  # 2s of headroom; must be > record(numframes)
 MIX_QUEUE_MAXLEN = 64  # ~2.0s, bounded symmetrically for both hardware clocks
 CAPTURE_CHUNK_NS = int(WINDOW_SIZE / SAMPLE_RATE * 1_000_000_000)
 MIX_SYNC_TOLERANCE_NS = int(1.5 * CAPTURE_CHUNK_NS)
